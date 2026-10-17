@@ -1,0 +1,2179 @@
+{
+  "capturedAt": "2026-10-15T04:42:59.426782Z",
+  "identities": {
+    "build:hive-ci-deployer": [
+      {
+        "binding": "ClusterRoleBinding",
+        "bindingName": "hive-ci-ns-reader",
+        "bindingNamespace": "",
+        "roleKind": "ClusterRole",
+        "roleName": "hive-ci-ns-reader",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "namespaces"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "origin-ci-plat6638-netpol-create",
+        "bindingNamespace": "ai-models",
+        "roleKind": "Role",
+        "roleName": "origin-ci-plat6638-netpol-create",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "hive-ci-admin",
+        "bindingNamespace": "build",
+        "roleKind": "ClusterRole",
+        "roleName": "admin",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "dataimportcrons",
+              "datasources",
+              "datavolumes",
+              "volumeclonesources",
+              "volumeimportsources",
+              "volumeuploadsources"
+            ],
+            "verbs": [
+              "*"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "datavolumes/source"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "uploadtokenrequests"
+            ],
+            "verbs": [
+              "*"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "openstackvolumepopulators",
+              "ovirtvolumepopulators"
+            ],
+            "verbs": [
+              "*"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstances/console",
+              "virtualmachineinstances/filesystemlist",
+              "virtualmachineinstances/guestosinfo",
+              "virtualmachineinstances/objectgraph",
+              "virtualmachineinstances/portforward",
+              "virtualmachineinstances/sev/fetchcertchain",
+              "virtualmachineinstances/sev/querylaunchmeasurement",
+              "virtualmachineinstances/usbredir",
+              "virtualmachineinstances/userlist",
+              "virtualmachineinstances/vnc",
+              "virtualmachineinstances/vnc/screenshot",
+              "virtualmachines/objectgraph"
+            ],
+            "verbs": [
+              "get"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstances/addvolume",
+              "virtualmachineinstances/evacuate/cancel",
+              "virtualmachineinstances/freeze",
+              "virtualmachineinstances/pause",
+              "virtualmachineinstances/removevolume",
+              "virtualmachineinstances/reset",
+              "virtualmachineinstances/sev/injectlaunchsecret",
+              "virtualmachineinstances/sev/setupsession",
+              "virtualmachineinstances/softreboot",
+              "virtualmachineinstances/unfreeze",
+              "virtualmachineinstances/unpause"
+            ],
+            "verbs": [
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachines/expand-spec",
+              "virtualmachines/portforward"
+            ],
+            "verbs": [
+              "get"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachines/addvolume",
+              "virtualmachines/evacuate/cancel",
+              "virtualmachines/memorydump",
+              "virtualmachines/removevolume",
+              "virtualmachines/restart",
+              "virtualmachines/start",
+              "virtualmachines/stop"
+            ],
+            "verbs": [
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "expand-vm-spec"
+            ],
+            "verbs": [
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancepresets",
+              "virtualmachineinstancereplicasets",
+              "virtualmachineinstances",
+              "virtualmachines"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancemigrations"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinerestores",
+              "virtualmachinesnapshotcontents",
+              "virtualmachinesnapshots"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinebackups",
+              "virtualmachinebackuptrackers"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineexports"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclones"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclusterinstancetypes",
+              "virtualmachineclusterpreferences",
+              "virtualmachineinstancetypes",
+              "virtualmachinepreferences"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinepools"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "kubevirts"
+            ],
+            "verbs": [
+              "get",
+              "list"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "migrationpolicies"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods/attach",
+              "pods/exec",
+              "pods/portforward",
+              "pods/proxy",
+              "secrets",
+              "services/proxy"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "serviceaccounts"
+            ],
+            "verbs": [
+              "impersonate"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods",
+              "pods/attach",
+              "pods/exec",
+              "pods/portforward",
+              "pods/proxy"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods/eviction"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "configmaps",
+              "events",
+              "persistentvolumeclaims",
+              "replicationcontrollers",
+              "replicationcontrollers/scale",
+              "secrets",
+              "serviceaccounts",
+              "services",
+              "services/proxy"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "serviceaccounts/token"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "daemonsets",
+              "deployments",
+              "deployments/rollback",
+              "deployments/scale",
+              "replicasets",
+              "replicasets/scale",
+              "statefulsets",
+              "statefulsets/scale"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "horizontalpodautoscalers"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "cronjobs",
+              "jobs"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "daemonsets",
+              "deployments",
+              "deployments/rollback",
+              "deployments/scale",
+              "ingresses",
+              "networkpolicies",
+              "replicasets",
+              "replicasets/scale",
+              "replicationcontrollers/scale"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "poddisruptionbudgets"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "ingresses",
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "leases"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "resourceclaims",
+              "resourceclaimtemplates"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "nodes",
+              "pods"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "cdiconfigs",
+              "dataimportcrons",
+              "datasources",
+              "datavolumes",
+              "objecttransfers",
+              "storageprofiles",
+              "volumeclonesources",
+              "volumeimportsources",
+              "volumeuploadsources"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "openstackvolumepopulators",
+              "ovirtvolumepopulators"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstances/filesystemlist",
+              "virtualmachineinstances/guestosinfo",
+              "virtualmachineinstances/objectgraph",
+              "virtualmachineinstances/sev/fetchcertchain",
+              "virtualmachineinstances/sev/querylaunchmeasurement",
+              "virtualmachineinstances/userlist",
+              "virtualmachines/expand-spec",
+              "virtualmachines/objectgraph"
+            ],
+            "verbs": [
+              "get"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancemigrations",
+              "virtualmachineinstancepresets",
+              "virtualmachineinstancereplicasets",
+              "virtualmachineinstances",
+              "virtualmachines"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinerestores",
+              "virtualmachinesnapshotcontents",
+              "virtualmachinesnapshots"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinebackups",
+              "virtualmachinebackuptrackers"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineexports"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclones"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclusterinstancetypes",
+              "virtualmachineclusterpreferences",
+              "virtualmachineinstancetypes",
+              "virtualmachinepreferences"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinepools"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "configmaps",
+              "endpoints",
+              "persistentvolumeclaims",
+              "persistentvolumeclaims/status",
+              "pods",
+              "replicationcontrollers",
+              "replicationcontrollers/scale",
+              "serviceaccounts",
+              "services",
+              "services/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "bindings",
+              "events",
+              "limitranges",
+              "namespaces/status",
+              "pods/log",
+              "pods/status",
+              "replicationcontrollers/status",
+              "resourcequotas",
+              "resourcequotas/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "namespaces"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "endpointslices"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "controllerrevisions",
+              "daemonsets",
+              "daemonsets/status",
+              "deployments",
+              "deployments/scale",
+              "deployments/status",
+              "replicasets",
+              "replicasets/scale",
+              "replicasets/status",
+              "statefulsets",
+              "statefulsets/scale",
+              "statefulsets/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "horizontalpodautoscalers",
+              "horizontalpodautoscalers/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "cronjobs",
+              "cronjobs/status",
+              "jobs",
+              "jobs/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "daemonsets",
+              "daemonsets/status",
+              "deployments",
+              "deployments/scale",
+              "deployments/status",
+              "ingresses",
+              "ingresses/status",
+              "networkpolicies",
+              "replicasets",
+              "replicasets/scale",
+              "replicasets/status",
+              "replicationcontrollers/scale"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "poddisruptionbudgets",
+              "poddisruptionbudgets/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "ingresses",
+              "ingresses/status",
+              "networkpolicies"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "resourceclaims",
+              "resourceclaims/status",
+              "resourceclaimtemplates"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancepresets",
+              "virtualmachineinstancereplicasets",
+              "virtualmachineinstances",
+              "virtualmachines"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinerestores",
+              "virtualmachinesnapshotcontents",
+              "virtualmachinesnapshots"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinebackups",
+              "virtualmachinebackuptrackers"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineexports"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclones"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclusterinstancetypes",
+              "virtualmachineclusterpreferences",
+              "virtualmachineinstancetypes",
+              "virtualmachinepreferences"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinepools"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "kubevirts"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "localsubjectaccessreviews"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "rolebindings",
+              "roles"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "hive-ci-kura-read",
+        "bindingNamespace": "kura",
+        "roleKind": "Role",
+        "roleName": "kura-config-reader",
+        "rules": [
+          {
+            "resourceNames": [
+              "kura-config"
+            ],
+            "resources": [
+              "configmaps"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "origin-ci-plat6638-netpol-create",
+        "bindingNamespace": "kura",
+        "roleKind": "Role",
+        "roleName": "origin-ci-plat6638-netpol-create",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "origin-ci-plat6638-netpol-create",
+        "bindingNamespace": "mail-edge",
+        "roleKind": "Role",
+        "roleName": "origin-ci-plat6638-netpol-create",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "origin-ci-plat6638-netpol-create",
+        "bindingNamespace": "monitoring",
+        "roleKind": "Role",
+        "roleName": "origin-ci-plat6638-netpol-create",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "hive-ci-job-runner",
+        "bindingNamespace": "origin",
+        "roleKind": "Role",
+        "roleName": "hive-ci-job-runner",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "jobs"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "configmaps",
+              "pods",
+              "pods/log"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods/status"
+            ],
+            "verbs": [
+              "get"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "origin-ci-plat6638-netpol-create",
+        "bindingNamespace": "origin",
+        "roleKind": "Role",
+        "roleName": "origin-ci-plat6638-netpol-create",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "hive-ci-deployer-shizuha-home-rollout",
+        "bindingNamespace": "shizuha",
+        "roleKind": "Role",
+        "roleName": "hive-ci-deployer-shizuha-home-rollout",
+        "rules": [
+          {
+            "resourceNames": [
+              "shizuha-home-frontend"
+            ],
+            "resources": [
+              "deployments"
+            ],
+            "verbs": [
+              "get",
+              "patch",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods"
+            ],
+            "verbs": [
+              "get",
+              "list"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "hive-ci-admin",
+        "bindingNamespace": "staging",
+        "roleKind": "ClusterRole",
+        "roleName": "admin",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "dataimportcrons",
+              "datasources",
+              "datavolumes",
+              "volumeclonesources",
+              "volumeimportsources",
+              "volumeuploadsources"
+            ],
+            "verbs": [
+              "*"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "datavolumes/source"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "uploadtokenrequests"
+            ],
+            "verbs": [
+              "*"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "openstackvolumepopulators",
+              "ovirtvolumepopulators"
+            ],
+            "verbs": [
+              "*"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstances/console",
+              "virtualmachineinstances/filesystemlist",
+              "virtualmachineinstances/guestosinfo",
+              "virtualmachineinstances/objectgraph",
+              "virtualmachineinstances/portforward",
+              "virtualmachineinstances/sev/fetchcertchain",
+              "virtualmachineinstances/sev/querylaunchmeasurement",
+              "virtualmachineinstances/usbredir",
+              "virtualmachineinstances/userlist",
+              "virtualmachineinstances/vnc",
+              "virtualmachineinstances/vnc/screenshot",
+              "virtualmachines/objectgraph"
+            ],
+            "verbs": [
+              "get"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstances/addvolume",
+              "virtualmachineinstances/evacuate/cancel",
+              "virtualmachineinstances/freeze",
+              "virtualmachineinstances/pause",
+              "virtualmachineinstances/removevolume",
+              "virtualmachineinstances/reset",
+              "virtualmachineinstances/sev/injectlaunchsecret",
+              "virtualmachineinstances/sev/setupsession",
+              "virtualmachineinstances/softreboot",
+              "virtualmachineinstances/unfreeze",
+              "virtualmachineinstances/unpause"
+            ],
+            "verbs": [
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachines/expand-spec",
+              "virtualmachines/portforward"
+            ],
+            "verbs": [
+              "get"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachines/addvolume",
+              "virtualmachines/evacuate/cancel",
+              "virtualmachines/memorydump",
+              "virtualmachines/removevolume",
+              "virtualmachines/restart",
+              "virtualmachines/start",
+              "virtualmachines/stop"
+            ],
+            "verbs": [
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "expand-vm-spec"
+            ],
+            "verbs": [
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancepresets",
+              "virtualmachineinstancereplicasets",
+              "virtualmachineinstances",
+              "virtualmachines"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancemigrations"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinerestores",
+              "virtualmachinesnapshotcontents",
+              "virtualmachinesnapshots"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinebackups",
+              "virtualmachinebackuptrackers"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineexports"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclones"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclusterinstancetypes",
+              "virtualmachineclusterpreferences",
+              "virtualmachineinstancetypes",
+              "virtualmachinepreferences"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinepools"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "kubevirts"
+            ],
+            "verbs": [
+              "get",
+              "list"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "migrationpolicies"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods/attach",
+              "pods/exec",
+              "pods/portforward",
+              "pods/proxy",
+              "secrets",
+              "services/proxy"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "serviceaccounts"
+            ],
+            "verbs": [
+              "impersonate"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods",
+              "pods/attach",
+              "pods/exec",
+              "pods/portforward",
+              "pods/proxy"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "pods/eviction"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "configmaps",
+              "events",
+              "persistentvolumeclaims",
+              "replicationcontrollers",
+              "replicationcontrollers/scale",
+              "secrets",
+              "serviceaccounts",
+              "services",
+              "services/proxy"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "serviceaccounts/token"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "daemonsets",
+              "deployments",
+              "deployments/rollback",
+              "deployments/scale",
+              "replicasets",
+              "replicasets/scale",
+              "statefulsets",
+              "statefulsets/scale"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "horizontalpodautoscalers"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "cronjobs",
+              "jobs"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "daemonsets",
+              "deployments",
+              "deployments/rollback",
+              "deployments/scale",
+              "ingresses",
+              "networkpolicies",
+              "replicasets",
+              "replicasets/scale",
+              "replicationcontrollers/scale"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "poddisruptionbudgets"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "ingresses",
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "leases"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "resourceclaims",
+              "resourceclaimtemplates"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "patch",
+              "update"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "nodes",
+              "pods"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "cdiconfigs",
+              "dataimportcrons",
+              "datasources",
+              "datavolumes",
+              "objecttransfers",
+              "storageprofiles",
+              "volumeclonesources",
+              "volumeimportsources",
+              "volumeuploadsources"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "openstackvolumepopulators",
+              "ovirtvolumepopulators"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstances/filesystemlist",
+              "virtualmachineinstances/guestosinfo",
+              "virtualmachineinstances/objectgraph",
+              "virtualmachineinstances/sev/fetchcertchain",
+              "virtualmachineinstances/sev/querylaunchmeasurement",
+              "virtualmachineinstances/userlist",
+              "virtualmachines/expand-spec",
+              "virtualmachines/objectgraph"
+            ],
+            "verbs": [
+              "get"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancemigrations",
+              "virtualmachineinstancepresets",
+              "virtualmachineinstancereplicasets",
+              "virtualmachineinstances",
+              "virtualmachines"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinerestores",
+              "virtualmachinesnapshotcontents",
+              "virtualmachinesnapshots"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinebackups",
+              "virtualmachinebackuptrackers"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineexports"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclones"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclusterinstancetypes",
+              "virtualmachineclusterpreferences",
+              "virtualmachineinstancetypes",
+              "virtualmachinepreferences"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinepools"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "configmaps",
+              "endpoints",
+              "persistentvolumeclaims",
+              "persistentvolumeclaims/status",
+              "pods",
+              "replicationcontrollers",
+              "replicationcontrollers/scale",
+              "serviceaccounts",
+              "services",
+              "services/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "bindings",
+              "events",
+              "limitranges",
+              "namespaces/status",
+              "pods/log",
+              "pods/status",
+              "replicationcontrollers/status",
+              "resourcequotas",
+              "resourcequotas/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "namespaces"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "endpointslices"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "controllerrevisions",
+              "daemonsets",
+              "daemonsets/status",
+              "deployments",
+              "deployments/scale",
+              "deployments/status",
+              "replicasets",
+              "replicasets/scale",
+              "replicasets/status",
+              "statefulsets",
+              "statefulsets/scale",
+              "statefulsets/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "horizontalpodautoscalers",
+              "horizontalpodautoscalers/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "cronjobs",
+              "cronjobs/status",
+              "jobs",
+              "jobs/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "daemonsets",
+              "daemonsets/status",
+              "deployments",
+              "deployments/scale",
+              "deployments/status",
+              "ingresses",
+              "ingresses/status",
+              "networkpolicies",
+              "replicasets",
+              "replicasets/scale",
+              "replicasets/status",
+              "replicationcontrollers/scale"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "poddisruptionbudgets",
+              "poddisruptionbudgets/status"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "ingresses",
+              "ingresses/status",
+              "networkpolicies"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "resourceclaims",
+              "resourceclaims/status",
+              "resourceclaimtemplates"
+            ],
+            "verbs": [
+              "get",
+              "list",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineinstancepresets",
+              "virtualmachineinstancereplicasets",
+              "virtualmachineinstances",
+              "virtualmachines"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinerestores",
+              "virtualmachinesnapshotcontents",
+              "virtualmachinesnapshots"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinebackups",
+              "virtualmachinebackuptrackers"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineexports"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclones"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachineclusterinstancetypes",
+              "virtualmachineclusterpreferences",
+              "virtualmachineinstancetypes",
+              "virtualmachinepreferences"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "virtualmachinepools"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "kubevirts"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "localsubjectaccessreviews"
+            ],
+            "verbs": [
+              "create"
+            ]
+          },
+          {
+            "resourceNames": [],
+            "resources": [
+              "rolebindings",
+              "roles"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "deletecollection",
+              "get",
+              "list",
+              "patch",
+              "update",
+              "watch"
+            ]
+          }
+        ]
+      },
+      {
+        "binding": "RoleBinding",
+        "bindingName": "origin-ci-plat6638-netpol-create",
+        "bindingNamespace": "staging",
+        "roleKind": "Role",
+        "roleName": "origin-ci-plat6638-netpol-create",
+        "rules": [
+          {
+            "resourceNames": [],
+            "resources": [
+              "networkpolicies"
+            ],
+            "verbs": [
+              "create",
+              "delete",
+              "get",
+              "list",
+              "patch",
+              "update"
+            ]
+          }
+        ]
+      }
+    ],
+    "build:origin-ci-deployer": []
+  },
+  "schema": "shizuha.rbac-drift-baseline.v1"
+}

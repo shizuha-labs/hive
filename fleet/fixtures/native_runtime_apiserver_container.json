@@ -1,0 +1,334 @@
+{
+  "agent": {
+    "agent_id": "native-sara-id",
+    "agent_username": "native-sara",
+    "display_name": "Fixture Engineer",
+    "role": "Architect",
+    "model": "cortex/GLM-5.3-Flash",
+    "reasoning_effort": "max",
+    "context_prompt": "Fixture engineering context.",
+    "model_overrides": {},
+    "personality_traits": {
+      "focus": "innovation",
+      "style": "explores-alternatives",
+      "approach": "creative"
+    },
+    "env": {
+      "GITHUB_IDENTITY": "sara2574",
+      "PLAYWRIGHT_BROWSERS_PATH": "/workspace/.ms-playwright",
+      "SHIZUHA_IDLE_HEARTBEAT_MS": "1800000",
+      "SHIZUHA_FIRST_HEARTBEAT_MS": "8000",
+      "SHIZUHA_HEARTBEAT_DEBOUNCE_MS": "1800000",
+      "SHIZUHA_EXPENSIVE_TURN_MIN_TURNS": "8",
+      "SHIZUHA_EXPENSIVE_TURN_WINDOW_MS": "120000",
+      "SHIZUHA_EXPENSIVE_TURN_BACKOFF_MS": "180000",
+      "SHIZUHA_EXPENSIVE_TURN_MAX_BACKOFF_MS": "600000"
+    },
+    "mcp_config": {
+      "execution_method": "shizuha",
+      "enabled_mcp_server_ids": [
+        "admin",
+        "admin:shizuha-digital",
+        "connect",
+        "connect:shizuha-digital",
+        "id",
+        "id:shizuha-digital",
+        "pulse",
+        "pulse:shizuha-digital",
+        "wiki",
+        "wiki:shizuha-digital"
+      ]
+    },
+    "image": "localhost:30500/shizuha-agent-runtime:harness-202608112020",
+    "platform_url": "http://192.168.0.123",
+    "resource_overrides": {},
+    "resource_profile": "standard",
+    "image_pull_policy": "IfNotPresent",
+    "http_port": 8016,
+    "workspace_mount_path": "/home/agent/.shizuha",
+    "shared_workspace": false,
+    "hostplane_ssh": false
+  },
+  "container": {
+    "command": [
+      "sh",
+      "-c",
+      "until curl -fsS --unix-socket /run/shizuha/mcp-auth-proxy/proxy.sock http://localhost/readyz >/dev/null 2>&1; do echo waiting-for-broker-readyz; sleep 1; done; context_prompt_file=; if [ -n \"${CONTEXT_PROMPT:-}\" ]; then context_prompt_file=$(umask 077; mktemp \"${TMPDIR:-/tmp}/shizuha-context.XXXXXX\") || exit 1; if ! printf %s \"$CONTEXT_PROMPT\" > \"$context_prompt_file\"; then rm -f \"$context_prompt_file\"; exit 1; fi; fi; exec /usr/bin/tini -- /usr/local/bin/agent-runtime-entrypoint.sh gateway --agent-id \"$AGENT_ID\" --agent-name \"${AGENT_NAME:-$AGENT_USERNAME}\" --agent-username \"$AGENT_USERNAME\" --port \"${PORT:-8080}\" --cwd /home/agent/.shizuha ${MODEL:+--model \"$MODEL\"} ${REASONING_EFFORT:+--effort \"$REASONING_EFFORT\"} ${context_prompt_file:+--context-prompt-file \"$context_prompt_file\"}"
+    ],
+    "env": [
+      {
+        "name": "AGENT_ID",
+        "value": "native-sara-id"
+      },
+      {
+        "name": "AGENT_USERNAME",
+        "value": "native-sara"
+      },
+      {
+        "name": "AGENT_NAME",
+        "value": "Fixture Engineer"
+      },
+      {
+        "name": "SHIZUHA_PLATFORM_URL",
+        "value": "http://shizuha-nginx.shizuha.svc.cluster.local"
+      },
+      {
+        "name": "BACKEND_URL",
+        "value": "http://shizuha-nginx.shizuha.svc.cluster.local"
+      },
+      {
+        "name": "SHIZUHA_AGENT_ID",
+        "value": "native-sara-id"
+      },
+      {
+        "name": "SHIZUHA_AGENT_USERNAME",
+        "value": "native-sara"
+      },
+      {
+        "name": "SHIZUHA_CACHE_TTL",
+        "value": "30m"
+      },
+      {
+        "name": "GITHUB_IDENTITY",
+        "value": "sara2574"
+      },
+      {
+        "name": "PLAYWRIGHT_BROWSERS_PATH",
+        "value": "/workspace/.ms-playwright"
+      },
+      {
+        "name": "SHIZUHA_EXPENSIVE_TURN_MIN_TURNS",
+        "value": "8"
+      },
+      {
+        "name": "SHIZUHA_EXPENSIVE_TURN_WINDOW_MS",
+        "value": "120000"
+      },
+      {
+        "name": "SHIZUHA_EXPENSIVE_TURN_BACKOFF_MS",
+        "value": "180000"
+      },
+      {
+        "name": "SHIZUHA_EXPENSIVE_TURN_MAX_BACKOFF_MS",
+        "value": "600000"
+      },
+      {
+        "name": "OPENAI_API_KEY",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "CORTEX_API_KEY",
+            "name": "native-sara-agent-creds",
+            "optional": false
+          }
+        }
+      },
+      {
+        "name": "VLLM_API_KEY",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "CORTEX_API_KEY",
+            "name": "native-sara-agent-creds",
+            "optional": false
+          }
+        }
+      },
+      {
+        "name": "CORTEX_API_KEY",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "CORTEX_API_KEY",
+            "name": "native-sara-agent-creds",
+            "optional": false
+          }
+        }
+      },
+      {
+        "name": "GOOGLE_API_KEY",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "GOOGLE_API_KEY",
+            "name": "cortex-fleet-key",
+            "optional": true
+          }
+        }
+      },
+      {
+        "name": "GEMINI_API_KEY",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "GOOGLE_API_KEY",
+            "name": "cortex-fleet-key",
+            "optional": true
+          }
+        }
+      },
+      {
+        "name": "FORGEJO_TOKEN",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "FORGEJO_TOKEN",
+            "name": "native-sara-agent-creds",
+            "optional": true
+          }
+        }
+      },
+      {
+        "name": "ORIGIN_TOKEN",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "FORGEJO_TOKEN",
+            "name": "native-sara-agent-creds",
+            "optional": true
+          }
+        }
+      },
+      {
+        "name": "MCP_AUTH_PROXY_SOCKET",
+        "value": "/run/shizuha/mcp-auth-proxy/proxy.sock"
+      },
+      {
+        "name": "AGENT_PASSWORD",
+        "valueFrom": {
+          "secretKeyRef": {
+            "key": "AGENT_PASSWORD",
+            "name": "agent-native-sara-identity",
+            "optional": false
+          }
+        }
+      },
+      {
+        "name": "CLAUDE_BRIDGE_REQUIRE_BROKER_MODEL_TOKEN",
+        "value": "1"
+      },
+      {
+        "name": "CODEX_BRIDGE_REQUIRE_BROKER_MODEL_TOKEN",
+        "value": "1"
+      },
+      {
+        "name": "VLLM_STREAM_WITH_TOOLS",
+        "value": "1"
+      },
+      {
+        "name": "AGENT_ROLE",
+        "value": "Architect"
+      },
+      {
+        "name": "MODEL",
+        "value": "cortex/GLM-5.3-Flash"
+      },
+      {
+        "name": "REASONING_EFFORT",
+        "value": "max"
+      },
+      {
+        "name": "CONTEXT_PROMPT",
+        "value": "Fixture engineering context."
+      },
+      {
+        "name": "PERSONALITY_TRAITS",
+        "value": "{\"focus\": \"innovation\", \"style\": \"explores-alternatives\", \"approach\": \"creative\"}"
+      },
+      {
+        "name": "SHIZUHA_IDLE_HEARTBEAT_MS",
+        "value": "90000"
+      },
+      {
+        "name": "SHIZUHA_FIRST_HEARTBEAT_MS",
+        "value": "8000"
+      },
+      {
+        "name": "SHIZUHA_HEARTBEAT_DEBOUNCE_MS",
+        "value": "90000"
+      },
+      {
+        "name": "AGENT_EFFECTIVE_MCP_SERVICES",
+        "value": "admin,admin:shizuha-digital,connect,connect:shizuha-digital,id,id:shizuha-digital,pulse,pulse:shizuha-digital,wiki,wiki:shizuha-digital"
+      },
+      {
+        "name": "SHIZUHA_MCP_SERVICES",
+        "value": "admin,admin:shizuha-digital,connect,connect:shizuha-digital,id,id:shizuha-digital,pulse,pulse:shizuha-digital,wiki,wiki:shizuha-digital"
+      }
+    ],
+    "image": "localhost:30500/shizuha-agent-runtime@sha256:db14ca020ce0db770c2774724477c17a1a43df19baef25ed6b5a0627313addfa",
+    "imagePullPolicy": "IfNotPresent",
+    "name": "agent",
+    "ports": [
+      {
+        "containerPort": 8016,
+        "name": "http",
+        "protocol": "TCP"
+      },
+      {
+        "containerPort": 9103,
+        "name": "metrics",
+        "protocol": "TCP"
+      }
+    ],
+    "readinessProbe": {
+      "exec": {
+        "command": [
+          "sh",
+          "-c",
+          "curl -fsS --unix-socket /run/shizuha/mcp-auth-proxy/proxy.sock http://localhost/readyz"
+        ]
+      },
+      "failureThreshold": 6,
+      "initialDelaySeconds": 5,
+      "periodSeconds": 10,
+      "successThreshold": 1,
+      "timeoutSeconds": 5
+    },
+    "resources": {
+      "limits": {
+        "cpu": "2",
+        "memory": "6Gi"
+      },
+      "requests": {
+        "cpu": "250m",
+        "memory": "512Mi"
+      }
+    },
+    "securityContext": {
+      "allowPrivilegeEscalation": false,
+      "capabilities": {
+        "drop": [
+          "ALL"
+        ]
+      },
+      "runAsNonRoot": true,
+      "runAsUser": 1000
+    },
+    "terminationMessagePath": "/dev/termination-log",
+    "terminationMessagePolicy": "File",
+    "volumeMounts": [
+      {
+        "mountPath": "/home/agent/.shizuha",
+        "name": "workspace"
+      },
+      {
+        "mountPath": "/run/shizuha/mcp-auth-proxy",
+        "name": "broker-sock"
+      },
+      {
+        "mountPath": "/run/shizuha/mcp-projection",
+        "name": "mcp-projection-keyring",
+        "readOnly": true
+      }
+    ]
+  },
+  "platform_url": "http://shizuha-nginx.shizuha.svc.cluster.local",
+  "coordinator_enabled": true,
+  "provenance": {
+    "source": "Kubernetes GET agent container after API defaulting, 2026-09-13",
+    "sanitization": "Identity and context replaced; env contains secretKeyRef names only, never credentials.",
+    "compared_fields": [
+      "ports",
+      "readinessProbe",
+      "volumeMounts",
+      "env",
+      "resources",
+      "command"
+    ],
+    "api_defaults_reference": "https://github.com/kubernetes/kubernetes/blob/v1.35.0/pkg/apis/core/v1/defaults.go"
+  }
+}

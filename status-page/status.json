@@ -1,0 +1,25 @@
+{
+  "overall": "operational",
+  "updated_at": "2026-07-03T12:00:00+05:30",
+  "components": [
+    { "name": "Shizuha ID (Auth)", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Pulse (Tasks)", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Wiki (Docs)", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Connect (Social)", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Drive (Storage)", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Notes", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Mail", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Admin", "status": "operational", "label": "Operational" },
+    { "name": "Cortex (Inference)", "status": "operational", "label": "Operational" },
+    { "name": "Agent Runtime", "status": "operational", "label": "Operational" },
+    { "name": "Shizuha Books", "status": "maintenance", "label": "Offline" },
+    { "name": "Shizuha HR", "status": "maintenance", "label": "Offline" },
+    { "name": "Shizuha Time", "status": "maintenance", "label": "Offline" }
+  ],
+  "incidents": [],
+  "uptime": {
+    "org": "not yet measured",
+    "team": "not yet measured",
+    "assistant": "N/A"
+  }
+}

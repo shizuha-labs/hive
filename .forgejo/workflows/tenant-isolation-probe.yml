@@ -1,0 +1,39 @@
+name: Tenant isolation probe
+
+on:
+  push:
+    paths:
+      - 'security/**'
+      - 'claws/management/commands/check_hosted_claw_wan_egress.py'
+      - '.forgejo/workflows/tenant-isolation-probe.yml'
+  pull_request:
+    paths:
+      - 'security/**'
+      - 'claws/management/commands/check_hosted_claw_wan_egress.py'
+      - '.forgejo/workflows/tenant-isolation-probe.yml'
+  workflow_dispatch:
+
+jobs:
+  tenant-isolation-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit-test probe harness
+        run: python -m unittest security.tests.test_tenant_isolation_probe -v
+      - name: Unit-test hosted-claw WAN egress smoke harness
+        run: python -m unittest security.tests.test_hosted_claw_wan_egress_probe -v
+      - name: Optional live tenant-isolation probe
+        env:
+          TENANT_PROBE_ORG_A_ID: ${{ secrets.TENANT_PROBE_ORG_A_ID }}
+          TENANT_PROBE_ORG_B_ID: ${{ secrets.TENANT_PROBE_ORG_B_ID }}
+          TENANT_PROBE_TOKEN_A: ${{ secrets.TENANT_PROBE_TOKEN_A }}
+          TENANT_PROBE_TOKEN_B: ${{ secrets.TENANT_PROBE_TOKEN_B }}
+          TENANT_PROBE_PULSE_ORG_B_MARKER: ${{ secrets.TENANT_PROBE_PULSE_ORG_B_MARKER }}
+          TENANT_PROBE_WIKI_ORG_B_MARKER: ${{ secrets.TENANT_PROBE_WIKI_ORG_B_MARKER }}
+          TENANT_PROBE_CONNECT_ORG_B_MARKER: ${{ secrets.TENANT_PROBE_CONNECT_ORG_B_MARKER }}
+          TENANT_PROBE_DRIVE_ORG_B_MARKER: ${{ secrets.TENANT_PROBE_DRIVE_ORG_B_MARKER }}
+          TENANT_PROBE_BOOKS_ORG_B_MARKER: ${{ secrets.TENANT_PROBE_BOOKS_ORG_B_MARKER }}
+        run: python -m security.tenant_isolation_probe

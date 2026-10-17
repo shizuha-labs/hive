@@ -1,0 +1,40 @@
+{
+  "registry_version": "2026-09-29.1",
+  "snapshot_source": "scli-grok-voice-omni:scli-0.1.0.20260817",
+  "runtime_release_id": "scli-0.1.0.20260817",
+  "methods": {
+    "codex_app_server": {
+      "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.3-codex-spark"],
+      "credential_capabilities": ["codex.oauth"]
+    },
+    "openclaw_app_server": {
+      "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.3-codex-spark"],
+      "credential_capabilities": ["provider.api:openai"]
+    },
+    "claude_code_server": {
+      "models": ["claude-opus-4.6", "claude-opus-4-6", "claude-opus-4.6-thinking", "claude-fable-5", "claude-opus-5", "claude-opus-4", "claude-opus-4-8", "claude-sonnet-4", "claude-sonnet-4-6", "claude-haiku-4-5"],
+      "credential_capabilities": ["provider.api:anthropic"]
+    },
+    "antigravity_server": {
+      "models": ["claude-opus-4.6", "claude-opus-4-6", "claude-opus-4.6-thinking", "claude-fable-5", "claude-opus-5", "claude-opus-4", "claude-sonnet-4-6", "gemini-2.5-pro", "gemini-2.5-flash", "cortex/gemini-2.5-pro"],
+      "credential_capabilities": ["provider.api:google", "provider.api:anthropic"]
+    },
+    "grok_build": {
+      "models": ["grok-4.7", "xai:grok-4.7", "cortex/grok-4.7", "cortex/xai/grok-4.7", "grok-4.5", "xai:grok-4.5", "cortex/grok-4.5", "cortex/xai/grok-4.5"],
+      "credential_capabilities": ["provider.api:xai"]
+    },
+    "shizuha": {
+      "model_prefixes": ["cortex/"],
+      "credential_capabilities": []
+    }
+  },
+  "families": [
+    {"lane_id": "openai-codex", "provider": "openai", "models": ["gpt-5.6-sol", "gpt-5.5", "gpt-5.3-codex-spark"], "allowed_methods": ["codex_app_server", "openclaw_app_server"], "canonical_method": "codex_app_server"},
+    {"lane_id": "openai-astra", "provider": "openai", "models": ["gpt-6-astra"], "allowed_methods": ["shizuha", "codex_app_server", "openclaw_app_server"], "canonical_method": "codex_app_server"},
+    {"lane_id": "anthropic-claude", "provider": "anthropic", "models": ["claude-opus-4.6", "claude-opus-4-6", "claude-opus-4.6-thinking", "claude-fable-5", "claude-opus-5", "claude-opus-4", "claude-opus-4-8", "claude-sonnet-4", "claude-sonnet-4-6", "claude-haiku-4-5"], "allowed_methods": ["claude_code_server", "antigravity_server"], "canonical_method": "claude_code_server"},
+    {"lane_id": "google-antigravity", "provider": "google", "models": ["gemini-2.5-pro", "gemini-2.5-flash", "cortex/gemini-2.5-pro"], "allowed_methods": ["antigravity_server"], "canonical_method": "antigravity_server"},
+    {"lane_id": "xai-grok", "provider": "xai", "models": ["grok-4.7", "xai:grok-4.7", "cortex/grok-4.7", "cortex/xai/grok-4.7", "grok-4.5", "xai:grok-4.5", "cortex/grok-4.5", "cortex/xai/grok-4.5"], "allowed_methods": ["grok_build", "shizuha"], "canonical_method": "grok_build"},
+    {"lane_id": "xai-grok-voice", "provider": "xai", "models": ["grok-voice-think-fast-2.0", "grok-voice-latest", "grok-voice-think-fast-1.0", "cortex/grok-voice-think-fast-2.0", "cortex/grok-voice-latest", "cortex/grok-voice-think-fast-1.0", "xai:grok-voice-think-fast-2.0", "xai:grok-voice-latest", "cortex/xai/grok-voice-think-fast-2.0", "cortex/xai/grok-voice-latest"], "allowed_methods": ["shizuha"], "canonical_method": "shizuha"},
+    {"lane_id": "cortex-managed", "provider": "cortex", "model_prefixes": ["cortex/"], "allowed_methods": ["shizuha", "antigravity_server"], "canonical_method": "shizuha"}
+  ]
+}

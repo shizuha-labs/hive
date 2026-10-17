@@ -1,0 +1,124 @@
+# Codex-refresh as a SEPARATE Deployment (operator 2026-07-28).
+#
+# Previously this was a sidecar on the hive API pods. The image was often
+# single-arch (amd64), so pods scheduled on arm64 GB10 nodes stayed 1/2 Ready
+# (exec format error) and HA rolling deploys stalled or left Available=False.
+#
+# Sidecars that are not multi-arch MUST NOT share a Pod with the Hive API
+# readiness path. Run this loop separately so /hive/api stays up on any arch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive-codex-refresh
+  namespace: shizuha-hive
+  labels:
+    app: hive-codex-refresh
+    # app.kubernetes.io/name=hive admits this workload through
+    # platform-db-primary-ingress (PLAT-5234 allowlist). Keep app=hive-codex-refresh
+    # so it never becomes a Hive Service endpoint (selector is app=hive + component=backend).
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: codex-refresh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hive-codex-refresh
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: hive-codex-refresh
+        app.kubernetes.io/name: hive
+        app.kubernetes.io/component: codex-refresh
+    spec:
+      serviceAccountName: hive-controller
+      # Pin to s1 (amd64 workstation) so we can hostPath-mount the live
+      # Antigravity quota file written by shizuha-agy-quota-proxy.service.
+      # fetch_google_usage reads /tmp/shizuha-host/shizuha-agy-quota.json;
+      # without this, Google/Antigravity snapshots fell back to fake 100%
+      # bars (operator 2026-07-28). codex_refresh_loop already polls every
+      # 5m with --quota-stale-after 600 — only the data path was missing.
+      nodeSelector:
+        kubernetes.io/hostname: s1
+      tolerations:
+        - effect: NoSchedule
+          key: node.shizuha/workstation
+          operator: Equal
+          value: "true"
+        - effect: NoSchedule
+          key: operator
+          operator: Equal
+          value: unschedulable
+      volumes:
+        - name: host-tmp
+          hostPath:
+            path: /tmp
+            type: Directory
+      containers:
+        - name: codex-refresh
+          image: localhost:30500/shizuha-hive:hive-75c7c1b
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - manage.py
+            - codex_refresh_loop
+            - --loop
+            - --interval
+            - "300"
+            - --quota-stale-after
+            - "600"
+          volumeMounts:
+            - name: host-tmp
+              mountPath: /tmp/shizuha-host
+          env:
+            # Applied separately from the API Deployment, so this worker must
+            # carry the same native authority activation in its own template.
+            - name: HIVE_NATIVE_RUNTIME_RELEASE_ENABLED
+              value: "true"
+            - name: HIVE_NATIVE_RUNTIME_RELEASE_NAMESPACE
+              value: shizuha-hive
+            - name: DEBUG
+              value: "False"
+            - name: DB_NAME
+              value: shizuha_hive
+            - name: DB_USER
+              value: postgres
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: shizuha-infra-postgresql
+                  key: postgres-password
+            - name: DB_HOST
+              value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: jwt-secret
+            - name: HIVE_TOKEN_COORDINATOR_KEK
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: HIVE_TOKEN_COORDINATOR_KEK
+            - name: HIVE_TOKEN_COORDINATOR_KEK_ID
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: HIVE_TOKEN_COORDINATOR_KEK_ID
+            - name: REDIS_URL
+              value: redis://shizuha-redis-ha-master.shizuha.svc.cluster.local:6379/5
+            - name: CACHE_REDIS_URL
+              value: redis://shizuha-redis-ha-master.shizuha.svc.cluster.local:6379/6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

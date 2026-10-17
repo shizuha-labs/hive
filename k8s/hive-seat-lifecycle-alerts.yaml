@@ -1,0 +1,32 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-seat-lifecycle
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: seat-lifecycle
+spec:
+  groups:
+    - name: hive-seat-lifecycle
+      rules:
+        - alert: HiveSeatLossTeamOutage
+          expr: sum by (seat) (increase(hive_seat_lifecycle_transitions_total{to_status="hibernated"}[24h])) >= 2
+          for: 0m
+          labels:
+            severity: critical
+            owner_group: engineering
+          annotations:
+            summary: "Seat {{ $labels.seat }} lost twice in 24h (Team-Outage signal)"
+            description: "PLAT-8834: seat {{ $labels.seat }} transitioned to hibernated >= 2 times in 24h — the second-loss threshold from the PLAT-8788 model-lease governance cascade verdict. Check the seat's hibernation_reason, Cortex model-lease board (lease_start_pending_reason), and the seat-lifecycle runbook before re-provisioning; a second loss right after resume usually means the lease invariant is bouncing the start."
+            runbook_url: "https://wiki.shizuha.com/OPS-Alert-Runbooks/hive-seat-loss"
+        - alert: HiveSeatStoppedOperatorKill
+          expr: sum by (seat) (increase(hive_seat_lifecycle_transitions_total{to_status="stopped"}[1h])) > 0
+          for: 0m
+          labels:
+            severity: warning
+            owner_group: engineering
+          annotations:
+            summary: "Seat {{ $labels.seat }} explicitly stopped (operator kill switch)"
+            description: "PLAT-8834: seat {{ $labels.seat }} received an explicit operator stop (to_status=stopped). Informational for the seat-loss audit trail — STOPPED is the kill-switch state, not auto-resumable hibernation."
+            runbook_url: "https://wiki.shizuha.com/OPS-Alert-Runbooks/hive-seat-loss"

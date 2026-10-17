@@ -1,0 +1,45 @@
+{
+  "_comment": "security-ci suppressions for shizuha-labs/hive. Entries identify accepted false positives with accountable owner and reason. See wiki Findings Ledger \u2014 hive.",
+  "allowlist": [
+    {
+      "source_id": "security-ci:4b76dc7aa5391a255e922ed7",
+      "tool": "deps",
+      "rule": "pkg:shizuha-labs/hive:PyPI:pyjwt",
+      "path_contains": "deps/PyPI/pyjwt",
+      "owner": "engineering@shizuha.com",
+      "reason": "Accepted false positive (PLAT-6725): pyjwt 2.13.0 is clean at OSV (scanner range artifact); no advisory applies at the resolved version."
+    },
+    {
+      "source_id": "security-ci:dbbdaf64e970cefc400b59f9",
+      "tool": "deps",
+      "rule": "pkg:shizuha-labs/hive:PyPI:idna",
+      "path_contains": "deps/PyPI/idna",
+      "owner": "engineering@shizuha.com",
+      "reason": "Accepted false positive (PLAT-6725): idna 3.18 is clean at OSV; no advisory applies at the resolved version."
+    },
+    {
+      "source_id": "security-ci:a018c828f1ff2e9a6066462f",
+      "tool": "deps",
+      "rule": "pkg:shizuha-labs/hive:PyPI:python-multipart",
+      "path_contains": "deps/PyPI/python-multipart",
+      "owner": "engineering@shizuha.com",
+      "reason": "Accepted false positive (PLAT-6725): python-multipart is not a hive dependency at head (absent from pyproject.toml/requirements/uv.lock); scanner projection artifact."
+    },
+    {
+      "source_id": "security-ci:03e3af55bd89b1b70c4da4fa",
+      "tool": "bandit",
+      "rule": "B501",
+      "path_contains": "claws/quota_fetchers.py",
+      "owner": "engineering@shizuha.com",
+      "reason": "Accepted false positive (PLAT-6725): B501 verify=False on requests.post to https://127.0.0.1:{port}/.../RetrieveUserQuotaSummary — loopback-only local language-server call, no host boundary crossing."
+    },
+    {
+      "source_id": "security-ci:8b33a91a351d0481f2cc8c3e",
+      "tool": "bandit",
+      "rule": "B501",
+      "path_contains": "claws/quota_fetchers.py",
+      "owner": "security",
+      "reason": "Accepted false positive (re-keyed from 03e3af55bd89b1b70c4da4fa, PLAT-5184/PLAT-5590/PLAT-5840 class). verify=False on requests.post targets loopback-only https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary — the local language-server port probe never crosses a host boundary, so disabling TLS verification exposes no remote MITM surface. Line moved 965->1143; re-keyed to this bounded per-source_id entry."
+    }
+  ]
+}

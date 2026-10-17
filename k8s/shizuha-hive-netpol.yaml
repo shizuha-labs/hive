@@ -1,0 +1,367 @@
+# PLAT-2695 — Data-isolation NetworkPolicies for ns `shizuha-hive`.
+# Source: PLAT-1324 infra security posture audit (2026-07-03). Mirrors the live
+# reference pattern in `claws/provisioner.py` + `k8s/fleet/10-networkpolicy-fleet.yaml`.
+#
+# POSTURE: default-deny INGRESS (PLAT-2695) + default-deny EGRESS (PLAT-2894,
+#   policies 5-13 below). hive-api is control-plane: it calls the kube-apiserver
+#   to provision claws/fleet and reaches cross-ns postgres/redis/nginx/id/pulse/
+#   admin/connect (ns shizuha), cortex :8040, the runtime-fleet API :8016
+#   (rt-fleet), the team-throughput exporter on s1 :9101, and external HTTPS
+#   (FCM/GitHub). Every one of those paths has an explicit allow below — an
+#   egress default-deny that missed any of them would break provisioning.
+#
+# ⚠ hostNetwork LESSON (2026-07-04 cortex incident, PLAT-2894): the rt-fleet
+#   runtime pods (shizuha-runtime-fleet + control/readonly proxies) are
+#   hostNetwork on s1, so hive's egress to :8016 terminates at the NODE IP
+#   (100.64.0.3, tailnet) — a namespaceSelector alone NEVER matches hostNetwork
+#   targets. allow-rt-fleet-egress therefore carries node-CIDR ipBlocks
+#   alongside the namespaceSelector. Same for the s1 exporter :9101.
+#
+# NOTE: hive's primary DB is NOT in this namespace (it is the shared
+# shizuha-infra-postgresql in ns `shizuha`), so this policy set establishes the
+# default-deny ingress posture for the hive control-plane pods and allows only
+# the legitimate inbound paths; the shared DB is isolated by ns `shizuha`'s own
+# netpol scope, not here.
+#
+# ── APPLY / VERIFY RUNBOOK (operator with kubectl; live, high-blast-radius) ──
+#   1. Confirm node InternalIP / CNI probe source (see cortex-netpol runbook).
+#      hive-api uses localhost exec probes so its health does not depend on CNI
+#      source-NAT behavior. hive-frontend still uses httpGet probes, so the
+#      `allow-node-healthchecks` rule below must cover the kubelet source.
+#   2. Apply:  kubectl apply -f k8s/shizuha-hive-netpol.yaml
+#   3. Verify within 60s: `kubectl get pods -n shizuha-hive` all Ready; the hive
+#      dashboard (k3s.s1.tail.shizuha.com) loads; a claw provisioning action
+#      still works (hive-api -> kube-apiserver unaffected: egress not restricted);
+#      claws can still reach hive-api:8030 (their platform-egress target).
+#   4. Rollback: kubectl delete -f k8s/shizuha-hive-netpol.yaml
+---
+# 1) Default-deny ALL ingress for every pod in shizuha-hive.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+    shizuha.io/task: plat-2695
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+# 2) Allow ordinary app ports INTRA-namespace (hive-api <-> hive-frontend and
+#    self-calls). Do not make this all-port: HIVE-725 reserves 8031 exclusively
+#    for the exact Connect workload selected below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - { protocol: TCP, port: 8030 }
+        - { protocol: TCP, port: 80 }
+---
+# 3) Allow kubelet health probes from the node plane only to the declared health
+#    listener ports. An all-port node allow would also admit HIVE-725's 8031
+#    delivery listener and nullify its exact-workload boundary.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-node-healthchecks
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 100.64.0.0/10 }   # tailnet — k3s node InternalIP (s1)
+        - ipBlock: { cidr: 10.200.10.0/24 }  # gx10 cluster mgmt LAN
+      ports:
+        - { protocol: TCP, port: 8030 }
+        - { protocol: TCP, port: 80 }
+
+---
+# 3a) HIVE-725 — privileged Connect delivery listener. Both selectors are
+# required: namespace identity alone is insufficient because many unrelated
+# platform workloads share ns `shizuha`.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-connect-delivery-ingress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: connect-delivery-isolation
+    shizuha.io/task: hive-725
+spec:
+  podSelector:
+    matchLabels:
+      app: hive
+      app.kubernetes.io/component: backend
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shizuha
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: shizuha-connect
+              app.kubernetes.io/component: backend
+      ports:
+        - { protocol: TCP, port: 8031 }
+---
+# 4) Allow the app service ports — hive-api (8030) and hive-frontend (80) — from
+#    any namespace + the cluster/private source ranges. Claws reach hive-api:8030
+#    (their platform-egress target), the ingress-nginx path serves the dashboard,
+#    and svclb/node sources are covered. Any non-service ports on hive pods stay
+#    default-denied cross-namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-app-service-ports
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+        - ipBlock: { cidr: 10.0.0.0/8 }
+        - ipBlock: { cidr: 172.16.0.0/12 }
+        - ipBlock: { cidr: 192.168.0.0/16 }
+        - ipBlock: { cidr: 100.64.0.0/10 }
+      ports:
+        - { protocol: TCP, port: 8030 }      # hive-api
+        - { protocol: TCP, port: 80 }        # hive-frontend
+---
+# ═══════════════════════════════════════════════════════════════════════════
+# EGRESS HARDENING (PLAT-2894). Read the hostNetwork lesson in the header
+# before editing any allow below.
+# ═══════════════════════════════════════════════════════════════════════════
+# 5) Default-deny ALL egress for every pod in the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+    shizuha.io/task: plat-2894
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+# 6) DNS to CoreDNS only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# 7) Intra-namespace egress (hive-api <-> hive-frontend, self-calls on :8030).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {}
+---
+# 8) kube-apiserver — claw/fleet provisioning (ClusterRole). ClusterIP
+#    10.43.0.1:443 plus the real endpoints (kube-router evaluates post-DNAT;
+#    current apiserver endpoints are 10.200.10.15/.5/.6:6443).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kube-apiserver-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 10.43.0.1/32 }
+      ports:
+        - { protocol: TCP, port: 443 }
+    - to:
+        - ipBlock: { cidr: 10.200.10.0/24 }
+      ports:
+        - { protocol: TCP, port: 6443 }
+---
+# 9) Platform services in ns `shizuha`: nginx (80), shared postgres (5432),
+#    redis-ha (6379), shizuha-id (8001), pulse (8002), admin (8003),
+#    connect (8019). Explicit port allowlist, least privilege.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: shizuha }
+      ports:
+        - { protocol: TCP, port: 80 }
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 6379 }
+        - { protocol: TCP, port: 8001 }
+        - { protocol: TCP, port: 8002 }
+        - { protocol: TCP, port: 8003 }
+        - { protocol: TCP, port: 8019 }
+    # Public ID/Hive URLs resolve to the LAN edge. kube-router checks the
+    # endpoint AFTER DNAT; an internet-only 443 rule excludes that private pod.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: shizuha }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: shizuha-edge }
+      ports:
+        - { protocol: TCP, port: 443 }
+    # Retain the exact VIP form for the pre-DNAT path. Adjacent/private targets
+    # remain excluded by the existing external HTTPS rule.
+    - to:
+        - ipBlock: { cidr: 192.168.0.250/32 }
+        - ipBlock: { cidr: 192.168.88.250/32 }
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# 10) Cortex inference API (VLLM_BASE_URL / CORTEX_PUBLIC_BASE_URL).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cortex-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: shizuha-cortex }
+      ports:
+        - { protocol: TCP, port: 8040 }
+---
+# 11) Runtime-fleet API (RUNTIME_FLEET_API_URL / RUNTIME_FLEET_CONTROL_URL,
+#     service port :8016). ⚠ Two post-DNAT gotchas verified live (2026-07-05):
+#     (a) these pods are hostNetwork on s1, so the ipBlocks are the load-bearing
+#     lines — a namespaceSelector never matches (2026-07-04 cortex incident);
+#     (b) kube-router evaluates AFTER kube-proxy DNAT, and the rt-fleet services
+#     target node ports 8017 (readonly proxy) / 8018 (control proxy), so those
+#     ports MUST be allowed — an :8016-only allow breaks fleet provisioning
+#     with "connection refused". 8016 kept for the direct daemon/socat path.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rt-fleet-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: rt-fleet }
+        - ipBlock: { cidr: 100.64.0.0/10 }    # s1 tailnet node IP (hostNetwork)
+        - ipBlock: { cidr: 10.200.10.0/24 }   # gx10 nodes (future placement)
+      ports:
+        - { protocol: TCP, port: 8016 }       # daemon (socat/direct)
+        - { protocol: TCP, port: 8017 }       # readonly proxy (svc targetPort)
+        - { protocol: TCP, port: 8018 }       # control proxy (svc targetPort)
+---
+# 12) team-throughput exporter on s1 (TEAM_THROUGHPUT_EXPORTER_URL,
+#     http://100.64.0.3:9101) — host service, node IP only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-exporter-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: { cidr: 100.64.0.0/10 }
+      ports:
+        - { protocol: TCP, port: 9101 }
+---
+# 13) External HTTPS (FCM push, GitHub) — public internet only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-external-https-egress
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - { protocol: TCP, port: 443 }

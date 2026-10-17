@@ -1,0 +1,39 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-recovery-actions
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: recovery-actions
+spec:
+  groups:
+    - name: hive-recovery-actions
+      rules:
+        - alert: HiveRecoveryActionDeniedOrFailed
+          expr: sum by (action_type, status) (hive_recovery_actions_total{mode="apply",status=~"denied|failed"}) > 0
+          for: 5m
+          labels:
+            severity: warning
+            owner_group: engineering
+          annotations:
+            summary: "Hive recovery auto-apply action {{ $labels.action_type }} {{ $labels.status }}"
+            description: "A HIVE-277 apply-mode recovery action is denied or failed. Roll back the action allowlist/denylist and inspect the AgentRecoveryAction audit row."
+        - alert: HiveRecoveryActionStale
+          expr: hive_recovery_actions_stale_total > 0
+          for: 15m
+          labels:
+            severity: warning
+            owner_group: engineering
+          annotations:
+            summary: "Hive recovery actions are stale"
+            description: "Pending or sent recovery actions have exceeded their TTL without daemon results. Roll back auto-apply and inspect daemon-link health."
+        - alert: HiveRecoverySecretRejection
+          expr: increase(hive_recovery_secret_rejections_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            owner_group: security
+          annotations:
+            summary: "Hive rejected secret material in a recovery payload"
+            description: "A recovery action payload or daemon result attempted to carry plaintext credential material. Hive rejected/redacted it; inspect the recovery path before re-enabling auto-apply."

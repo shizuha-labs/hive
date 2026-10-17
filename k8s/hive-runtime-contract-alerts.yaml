@@ -1,0 +1,33 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-runtime-contract
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: hive-runtime-contract
+      rules:
+        # PLAT-4683 / PLAT-1254: a sleeping native agent must never scale from a
+        # stale credential/runtime template. The write path records a durable
+        # FleetAgentEvent and this alert routes the failure to DevOps through
+        # the standard Alertmanager→Connect DM lane.
+        - alert: HiveFleetRuntimeContractReconcileFailed
+          expr: increase(hive_fleet_runtime_contract_reconcile_failed_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: devops
+            owner_group: devops
+            service: shizuha-hive
+          annotations:
+            summary: "Hive native-agent pre-wake reconcile failed ({{ $labels.stage }})"
+            description: >-
+              Hive aborted a native agent wake before scale because runtime
+              contract reconciliation failed at stage {{ $labels.stage }}.
+              Inspect the agent's runtime_contract_reconcile_failed event and
+              status_message, then repair Kubernetes API access/template drift
+              before retrying enable. No credential values are included.
+            runbook_url: "https://wiki.shizuha.com/501362a3-4633-4218-8ccf-b0f4e15f37ce"

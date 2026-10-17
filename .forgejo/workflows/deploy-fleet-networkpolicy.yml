@@ -1,0 +1,491 @@
+name: deploy-fleet-networkpolicy
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '.forgejo/workflows/deploy-fleet-networkpolicy.yml'
+      - 'k8s/fleet/30-fleet-isolation-netpol.yaml'
+  # The canary also verifies host-firewall and cache dependencies owned by
+  # other repositories; allow an exact-current-ref recovery run after they roll.
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-fleet-networkpolicy
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: deploy-lane
+    steps:
+      - name: Checkout exact release
+        env:
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+
+      - name: Install pinned kubectl
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m); case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; esac
+          case "$KUBECTL_ARCH" in
+            amd64) KUBECTL_SHA=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+            arm64) KUBECTL_SHA=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+          esac
+          # anonymous-fetch: sanctioned — adding Authorization can turn this public package fetch into 401 (ORIG-144)
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL \
+            -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "$KUBECTL_SHA  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Reconcile fleet isolation policy
+        run: |
+          set -euo pipefail
+          MANIFEST=k8s/fleet/30-fleet-isolation-netpol.yaml
+          kubectl apply --dry-run=server -f "$MANIFEST" >/dev/null
+          kubectl apply -f "$MANIFEST"
+
+          PORTS="$(kubectl -n shizuha-fleet get networkpolicy fleet-agent-allow-egress \
+            -o jsonpath='{range .spec.egress[*].ports[*]}{.port}{"\n"}{end}')"
+          for port in 22 80 443 3000 3142 4873 5000 8001 8080 8090 18102; do
+            grep -qx "$port" <<<"$PORTS" || {
+              echo "::error::fleet-agent-allow-egress missing required port $port"
+              exit 1
+            }
+          done
+          PACKAGE_CACHE_RULES="$(kubectl -n shizuha-fleet get networkpolicy fleet-agent-allow-egress \
+            -o jsonpath='{range .spec.egress[*]}{range .to[*]}{.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name}{"\t"}{.podSelector.matchLabels.app}{"\t"}{end}{range .ports[*]}{.port}{" "}{end}{"\n"}{end}')"
+          grep -Eq '^registry[[:space:]]+pip-cache[[:space:]]+80[[:space:]]*$' <<<"$PACKAGE_CACHE_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact registry/app=pip-cache TCP 80 rule"
+            exit 1
+          }
+          grep -Eq '^registry[[:space:]]+apt-cache[[:space:]]+3142[[:space:]]*$' <<<"$PACKAGE_CACHE_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact registry/app=apt-cache TCP 3142 rule"
+            exit 1
+          }
+          grep -Eq '^registry[[:space:]]+npm-cache[[:space:]]+4873[[:space:]]*$' <<<"$PACKAGE_CACHE_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact registry/app=npm-cache TCP 4873 rule (PLAT-5022)"
+            exit 1
+          }
+          grep -Eq '^registry[[:space:]]+apk-cache[[:space:]]+80[[:space:]]*$' <<<"$PACKAGE_CACHE_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact registry/app=apk-cache TCP 80 rule (PLAT-4692)"
+            exit 1
+          }
+          grep -Eq '^registry[[:space:]]+git-raw-cache[[:space:]]+80[[:space:]]*$' <<<"$PACKAGE_CACHE_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact registry/app=git-raw-cache TCP 80 rule (PLAT-4692)"
+            exit 1
+          }
+          # PLAT-6007: NetworkPolicy is evaluated post-DNAT and shizuha-search is
+          # Service :80 -> targetPort 8090, so a port-80-only search rule matches
+          # no real packet. Assert BOTH ports so the next edit cannot silently
+          # drop 8090 and re-break every agent's SEARCH_BASE_URL.
+          grep -Eq '^search[[:space:]]+80[[:space:]]+8090[[:space:]]*$' <<<"$PACKAGE_CACHE_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact search TCP 80+8090 rule (PLAT-6007)"
+            exit 1
+          }
+          # PLAT-4729 / PLAT-6041 (SDR 74b498f3): the restored host-plane SSH
+          # egress class must stay a tailnet node SET enumerated as /32s on
+          # TCP/22 only. Assert the shape live so a later edit cannot widen it to
+          # 100.64.0.0/10 (explicitly rejected), add a second port, or replace an
+          # ipBlock with a selector, without this gate failing the deploy.
+          SSH_POLICY=fleet-allow-hostplane-ssh-egress-v2
+          SSH_SELECTOR="$(kubectl -n shizuha-fleet get networkpolicy "$SSH_POLICY" \
+            -o jsonpath='{.spec.podSelector.matchLabels.shizuha\.io/agent-role}')"
+          [[ "$SSH_SELECTOR" == devops-ssh ]] || {
+            echo "::error::${SSH_POLICY} podSelector must be shizuha.io/agent-role=devops-ssh (got '${SSH_SELECTOR}')"
+            exit 1
+          }
+          SSH_PORTS="$(kubectl -n shizuha-fleet get networkpolicy "$SSH_POLICY" \
+            -o jsonpath='{range .spec.egress[*].ports[*]}{.protocol}/{.port}{"\n"}{end}' | sort -u)"
+          [[ "$SSH_PORTS" == TCP/22 ]] || {
+            echo "::error::${SSH_POLICY} must allow TCP/22 only (got '${SSH_PORTS//$'\n'/,}')"
+            exit 1
+          }
+          SSH_PEERS="$(kubectl -n shizuha-fleet get networkpolicy "$SSH_POLICY" \
+            -o jsonpath='{range .spec.egress[*]}{range .to[*]}{.ipBlock.cidr}{"|"}{.namespaceSelector}{"|"}{.podSelector}{"\n"}{end}{end}')"
+          [[ -n "$SSH_PEERS" ]] || {
+            echo "::error::${SSH_POLICY} has no egress peers; an empty node set silently denies all host-plane SSH"
+            exit 1
+          }
+          while IFS='|' read -r cidr ns_sel pod_sel; do
+            [[ -n "$cidr" ]] || {
+              echo "::error::${SSH_POLICY} peer is not an ipBlock (namespaceSelector='${ns_sel}' podSelector='${pod_sel}')"
+              exit 1
+            }
+            [[ -z "${ns_sel}${pod_sel}" ]] || {
+              echo "::error::${SSH_POLICY} peer ${cidr} also carries a selector; host-plane peers are ipBlock-only"
+              exit 1
+            }
+            [[ "$cidr" == */32 ]] || {
+              echo "::error::${SSH_POLICY} peer ${cidr} is not a /32; the tailnet node set is enumerated per node (100.64.0.0/10 is rejected by SDR 74b498f3)"
+              exit 1
+            }
+          done <<<"$SSH_PEERS"
+
+          # PLAT-5022: the internal image registry (registry/shizuha-registry
+          # component=registry TCP 5000) was approved+premerge-green but never
+          # merged, so policed agent pods could not pull via registry:5000.
+          # Assert the exact rule shape so a later revert is caught at deploy.
+          REGISTRY_RULES="$(kubectl -n shizuha-fleet get networkpolicy fleet-agent-allow-egress \
+            -o jsonpath='{range .spec.egress[*]}{range .to[*]}{.namespaceSelector.matchLabels.kubernetes\.io/metadata\.name}{"\t"}{.podSelector.matchLabels.app\.kubernetes\.io/name}{"\t"}{.podSelector.matchLabels.app\.kubernetes\.io/component}{"\t"}{end}{range .ports[*]}{.port}{" "}{end}{"\n"}{end}')"
+          grep -Eq '^registry[[:space:]]+shizuha-registry[[:space:]]+registry[[:space:]]+5000[[:space:]]*$' <<<"$REGISTRY_RULES" || {
+            echo "::error::fleet-agent-allow-egress missing exact registry/shizuha-registry component=registry TCP 5000 rule (PLAT-5022)"
+            exit 1
+          }
+          kubectl -n shizuha-fleet get networkpolicy \
+            fleet-agent-default-deny fleet-agent-allow-egress fleet-agent-allow-platform-ingress \
+            "$SSH_POLICY"
+
+      - name: Verify arbitrary-gx outer and nested cache paths
+        run: |
+          set -euo pipefail
+          # PLAT-5598 / ADR-0067: the deployer must never gain interactive exec
+          # into live fleet agents. A disposable, non-privileged Job carries two
+          # explicit clients instead: an init container records the outer proof,
+          # then the main container independently records the nested proof. Both
+          # are selected by the real shizuha.io/agent NetworkPolicies, and Job
+          # logs are the only evidence channel.
+          require_yes() {
+            local description=$1
+            shift
+            [[ "$(kubectl auth can-i "$@")" == yes ]] || {
+              echo "::error::fleet netpol canary RBAC denied: ${description}"
+              exit 20
+            }
+          }
+          require_no() {
+            local description=$1
+            shift
+            [[ "$(kubectl auth can-i "$@" 2>/dev/null || true)" == no ]] || {
+              echo "::error::fleet netpol canary RBAC overbroad: ${description}"
+              exit 21
+            }
+          }
+          require_yes 'create bounded Job' create jobs.batch -n shizuha-fleet
+          for verb in get list watch; do
+            require_yes "${verb} canary Pod metadata" "$verb" pods -n shizuha-fleet
+          done
+          require_yes 'read canary Pod logs' get pods --subresource=log -n shizuha-fleet
+          require_no 'fleet Pod exec must stay forbidden' create pods --subresource=exec -n shizuha-fleet
+          require_no 'fleet Secret reads must stay forbidden' get secrets -n shizuha-fleet
+          # PLAT-5354 intentionally grants cluster-wide read-only PVC discovery
+          # to the backup-tier reconciler. Preserve that contract while proving
+          # the network-policy canary cannot mutate fleet claims.
+          for verb in get list; do
+            require_yes "${verb} fleet PVC metadata for backup discovery" \
+              "$verb" persistentvolumeclaims -n shizuha-fleet
+          done
+          for verb in patch delete; do
+            require_no "${verb} fleet PVCs must stay forbidden" \
+              "$verb" persistentvolumeclaims -n shizuha-fleet
+          done
+
+          # PLAT-6154: registry Pod reads must stay forbidden. The canary reads
+          # cache-node topology from EndpointAddress.nodeName / Service metadata
+          # (allowed); a Pod read in the registry namespace would require the
+          # deliberately absent origin-ci-deployer grant that PLAT-4692/PLAT-5595
+          # once granted overbroad. Assert the negative so a re-grant fails here.
+          require_no 'registry Pod reads must stay forbidden' get pods -n registry
+
+          # EndpointAddress.nodeName is the canonical cache-node source. Reading
+          # a registry Pod would require a deliberately absent permission.
+          APT_ENDPOINT="$(kubectl -n registry get endpoints apt-cache \
+            -o jsonpath='{.subsets[0].addresses[0].ip}')"
+          APT_NODE="$(kubectl -n registry get endpoints apt-cache \
+            -o jsonpath='{.subsets[0].addresses[0].nodeName}')"
+          APT_CLUSTER_IP="$(kubectl -n registry get svc apt-cache -o jsonpath='{.spec.clusterIP}')"
+          APT_NODE_PORT="$(kubectl -n registry get svc apt-cache -o jsonpath='{.spec.ports[0].nodePort}')"
+          S1_IP="$(kubectl get node s1 -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')"
+
+          # Use Ready fleet placement only as a schedulable-node inventory; the
+          # canary never enters or mutates the selected agent Pod. Prefer a node
+          # different from apt-cache and state honestly when topology prevents it.
+          CANARY_NODE=''
+          FALLBACK_NODE=''
+          while IFS=$'\t' read -r node ready; do
+            [[ "$node" == gx10-* && "$ready" == *True* ]] || continue
+            [[ -n "$FALLBACK_NODE" ]] || FALLBACK_NODE="$node"
+            if [[ -n "$APT_NODE" && "$node" != "$APT_NODE" ]]; then
+              CANARY_NODE="$node"
+              break
+            fi
+          done < <(kubectl -n shizuha-fleet get pods -l shizuha.io/agent \
+            -o jsonpath='{range .items[*]}{.spec.nodeName}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.status}{end}{"\n"}{end}')
+          CROSS_NODE=yes
+          [[ -n "$CANARY_NODE" ]] || CROSS_NODE=no
+          CANARY_NODE="${CANARY_NODE:-$FALLBACK_NODE}"
+          [[ -n "$CANARY_NODE" ]] || {
+            echo '::error::no Ready gx fleet placement available for the NetworkPolicy canary'
+            exit 1
+          }
+          if [[ "$CROSS_NODE" == yes ]]; then
+            printf 'CROSS_NODE=yes canary_node=%s apt_node=%s apt_endpoint=%s\n' \
+              "$CANARY_NODE" "$APT_NODE" "$APT_ENDPOINT"
+          else
+            printf '::warning::CROSS_NODE_UNAVAILABLE canary_node=%s apt_node=%s apt_endpoint=%s; reachability is still asserted\n' \
+              "$CANARY_NODE" "${APT_NODE:-<unreadable>}" "$APT_ENDPOINT"
+          fi
+
+          JOB=fleet-netpol-canary
+          RUN_ID='${{ github.run_id }}'
+          JOB_MANIFEST="$(mktemp)"
+          cat >"$JOB_MANIFEST" <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: shizuha-fleet
+            labels:
+              app.kubernetes.io/name: fleet-netpol-canary
+              shizuha.io/canary: fleet-netpol
+              shizuha.io/canary-run: "${RUN_ID}"
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 90
+            ttlSecondsAfterFinished: 15
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: fleet-netpol-canary
+                  shizuha.io/agent: fleet-netpol-canary
+                  shizuha.io/canary: fleet-netpol
+                  shizuha.io/canary-run: "${RUN_ID}"
+              spec:
+                automountServiceAccountToken: false
+                enableServiceLinks: false
+                nodeName: ${CANARY_NODE}
+                restartPolicy: Never
+                securityContext:
+                  seccompProfile:
+                    type: RuntimeDefault
+                initContainers:
+                - name: outer
+                  image: python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    capabilities: {drop: [ALL]}
+                    readOnlyRootFilesystem: true
+                    runAsNonRoot: true
+                    runAsUser: 65532
+                  env:
+                  - {name: PROBE_MODE, value: outer}
+                  - {name: APT_ENDPOINT, value: "${APT_ENDPOINT}"}
+                  - {name: APT_CLUSTER_IP, value: "${APT_CLUSTER_IP}"}
+                  - {name: S1_IP, value: "${S1_IP}"}
+                  - {name: APT_NODE_PORT, value: "${APT_NODE_PORT}"}
+                  command: [/bin/sh, -ec]
+                  args:
+                  - |
+                    python3 - <<'PY'
+                    import os
+                    import socket
+
+                    mode = os.environ["PROBE_MODE"]
+                    checks = (
+                        ("apt-dns", "apt-cache.registry.svc.cluster.local", 3142),
+                        ("apt-clusterip", os.environ["APT_CLUSTER_IP"], 3142),
+                        ("apt-endpoint", os.environ["APT_ENDPOINT"], 3142),
+                        ("npm-dns", "npm-cache.registry.svc.cluster.local", 4873),
+                        ("pip-dns", "pip-cache.registry.svc.cluster.local", 80),
+                        ("apk-dns", "apk-cache.registry.svc.cluster.local", 80),
+                        ("git-raw-dns", "git-raw-cache.registry.svc.cluster.local", 80),
+                    )
+                    for name, host, port in checks:
+                        with socket.create_connection((host, port), 5):
+                            print(f"{mode} {name}=connect", flush=True)
+                    # PLAT-5734 AC-3: prove node-IP destinations are governed across
+                    # >=3 consecutive fresh-pod attempts (the single-attempt shape hid
+                    # the non-deterministic NodePort reachability).
+                    def assert_denied(label, host, port, attempts=3):
+                        for i in range(attempts):
+                            try:
+                                socket.create_connection((host, port), 3)
+                            except OSError:
+                                continue
+                            raise SystemExit(
+                                f"{mode} {label} unexpectedly reachable (attempt {i + 1})"
+                            )
+                        print(f"{mode} {label}=denied x{attempts}", flush=True)
+
+                    assert_denied("s1-ssh", os.environ["S1_IP"], 22)
+                    assert_denied(
+                        "apt-nodeport", os.environ["S1_IP"], int(os.environ["APT_NODE_PORT"])
+                    )
+                    PY
+                  resources:
+                    requests: {cpu: 10m, memory: 24Mi}
+                    limits: {cpu: 250m, memory: 96Mi}
+                containers:
+                - name: nested
+                  image: python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                    capabilities: {drop: [ALL]}
+                    readOnlyRootFilesystem: true
+                    runAsNonRoot: true
+                    runAsUser: 65532
+                  env:
+                  - {name: PROBE_MODE, value: nested}
+                  - {name: APT_ENDPOINT, value: "${APT_ENDPOINT}"}
+                  - {name: APT_CLUSTER_IP, value: "${APT_CLUSTER_IP}"}
+                  - {name: S1_IP, value: "${S1_IP}"}
+                  - {name: APT_NODE_PORT, value: "${APT_NODE_PORT}"}
+                  command: [/bin/sh, -ec]
+                  args:
+                  - |
+                    python3 - <<'PY'
+                    import os
+                    import socket
+
+                    mode = os.environ["PROBE_MODE"]
+                    checks = (
+                        ("apt-dns", "apt-cache.registry.svc.cluster.local", 3142),
+                        ("apt-clusterip", os.environ["APT_CLUSTER_IP"], 3142),
+                        ("apt-endpoint", os.environ["APT_ENDPOINT"], 3142),
+                        ("npm-dns", "npm-cache.registry.svc.cluster.local", 4873),
+                        ("pip-dns", "pip-cache.registry.svc.cluster.local", 80),
+                        ("apk-dns", "apk-cache.registry.svc.cluster.local", 80),
+                        ("git-raw-dns", "git-raw-cache.registry.svc.cluster.local", 80),
+                    )
+                    for name, host, port in checks:
+                        with socket.create_connection((host, port), 5):
+                            print(f"{mode} {name}=connect", flush=True)
+                    # PLAT-5734 AC-3: prove node-IP destinations are governed across
+                    # >=3 consecutive fresh-pod attempts (the single-attempt shape hid
+                    # the non-deterministic NodePort reachability).
+                    def assert_denied(label, host, port, attempts=3):
+                        for i in range(attempts):
+                            try:
+                                socket.create_connection((host, port), 3)
+                            except OSError:
+                                continue
+                            raise SystemExit(
+                                f"{mode} {label} unexpectedly reachable (attempt {i + 1})"
+                            )
+                        print(f"{mode} {label}=denied x{attempts}", flush=True)
+
+                    assert_denied("s1-ssh", os.environ["S1_IP"], 22)
+                    assert_denied(
+                        "apt-nodeport", os.environ["S1_IP"], int(os.environ["APT_NODE_PORT"])
+                    )
+                    PY
+                  resources:
+                    requests: {cpu: 10m, memory: 24Mi}
+                    limits: {cpu: 250m, memory: 96Mi}
+          YAML
+
+          # The fixed name is part of the audit boundary. A prior interrupted
+          # run self-terminates via activeDeadlineSeconds and TTL; wait for that
+          # bounded cleanup rather than requesting Job delete authority.
+          created=no
+          for _ in $(seq 1 50); do
+            if create_output="$(kubectl create -f "$JOB_MANIFEST" 2>&1)"; then
+              printf '%s\n' "$create_output"
+              created=yes
+              break
+            fi
+            if grep -Fq 'AlreadyExists' <<<"$create_output"; then
+              echo '::warning::waiting for prior fleet-netpol-canary TTL cleanup'
+              sleep 3
+              continue
+            fi
+            printf '%s\n' "$create_output" >&2
+            exit 1
+          done
+          [[ "$created" == yes ]] || {
+            echo '::error::prior fleet-netpol-canary did not self-clean within 150s'
+            exit 1
+          }
+
+          SELECTOR="shizuha.io/canary-run=${RUN_ID}"
+          POD=''
+          collect_canary_logs() {
+            # kubectl --all-containers fails the whole request while the regular
+            # container is still PodInitializing, hiding a terminated init
+            # container's decisive stderr. Always capture the outer probe first
+            # and request nested logs only after that container has started.
+            kubectl -n shizuha-fleet logs "$POD" -c outer \
+              --prefix=true --tail=-1 || true
+            nested_id="$(kubectl -n shizuha-fleet get pod "$POD" \
+              -o jsonpath='{.status.containerStatuses[?(@.name=="nested")].containerID}' \
+              2>/dev/null || true)"
+            if [[ -n "$nested_id" ]]; then
+              kubectl -n shizuha-fleet logs "$POD" -c nested \
+                --prefix=true --tail=-1 || true
+            else
+              nested_reason="$(kubectl -n shizuha-fleet get pod "$POD" \
+                -o jsonpath='{.status.containerStatuses[?(@.name=="nested")].state.waiting.reason}' \
+                2>/dev/null || true)"
+              printf 'nested logs unavailable: container never started (state=%s)\n' \
+                "${nested_reason:-unknown}"
+            fi
+          }
+          deadline=$((SECONDS + 150))
+          while (( SECONDS < deadline )); do
+            POD="$(kubectl -n shizuha-fleet get pods -l "$SELECTOR" \
+              -o jsonpath='{.items[0].metadata.name}')"
+            if [[ -z "$POD" ]]; then
+              sleep 2
+              continue
+            fi
+            waiting="$(kubectl -n shizuha-fleet get pod "$POD" \
+              -o jsonpath='{range .status.initContainerStatuses[*]}{.state.waiting.reason}{"\n"}{end}{range .status.containerStatuses[*]}{.state.waiting.reason}{"\n"}{end}')"
+            if grep -Eq '^(ErrImagePull|ImagePullBackOff|InvalidImageName)$' <<<"$waiting"; then
+              echo "::error::fleet netpol canary image admission failed: ${waiting//$'\n'/,}"
+              kubectl -n shizuha-fleet describe pod "$POD" || true
+              exit 1
+            fi
+            phase="$(kubectl -n shizuha-fleet get pod "$POD" -o jsonpath='{.status.phase}')"
+            case "$phase" in
+              Succeeded) break ;;
+              Failed)
+                collect_canary_logs
+                kubectl -n shizuha-fleet describe pod "$POD" || true
+                echo '::error::fleet netpol canary Job failed'
+                exit 1
+                ;;
+            esac
+            sleep 2
+          done
+          [[ -n "$POD" ]] || { echo '::error::fleet netpol canary Pod was not created'; exit 1; }
+          [[ "$(kubectl -n shizuha-fleet get pod "$POD" -o jsonpath='{.status.phase}')" == Succeeded ]] || {
+            collect_canary_logs
+            kubectl -n shizuha-fleet describe pod "$POD" || true
+            echo '::error::fleet netpol canary timed out'
+            exit 1
+          }
+          ACTUAL_NODE="$(kubectl -n shizuha-fleet get pod "$POD" -o jsonpath='{.spec.nodeName}')"
+          [[ "$ACTUAL_NODE" == "$CANARY_NODE" ]] || {
+            echo "::error::canary node drift: expected=${CANARY_NODE} actual=${ACTUAL_NODE}"
+            exit 1
+          }
+          CANARY_LOG="$(collect_canary_logs)"
+          printf '%s\n' "$CANARY_LOG"
+          for mode in outer nested; do
+            for check in apt-dns apt-clusterip apt-endpoint npm-dns pip-dns apk-dns git-raw-dns; do
+              grep -F "${mode} ${check}=connect" <<<"$CANARY_LOG" >/dev/null || {
+                echo "::error::missing ${mode} ${check} evidence"
+                exit 1
+              }
+            done
+            grep -F "${mode} apt-nodeport=denied" <<<"$CANARY_LOG" >/dev/null || {
+              echo "::error::missing ${mode} NodePort-deny evidence"
+              exit 1
+            }
+            grep -F "${mode} s1-ssh=denied" <<<"$CANARY_LOG" >/dev/null || {
+              echo "::error::missing ${mode} s1-ssh-deny evidence (PLAT-5734 AC-3)"
+              exit 1
+            }
+          done
+          printf 'FLEET_NETPOL_CANARY=passed pod=%s node=%s cross_node=%s\n' \
+            "$POD" "$ACTUAL_NODE" "$CROSS_NODE"

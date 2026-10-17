@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+/db/
+media/
+staticfiles/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Coverage / tests
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+dist*
+
+# Local environments, caches, and editor scratch (never commit)
+.mypy_cache/
+.ruff_cache/
+.claude/
+
+# Generated verification captures belong in private CI artifacts.
+agents-org-labels-verify.png
+docs/evidence/*.png
+docs/evidence/HIVE-729-63fe9a2-dark-assertions.json
+docs/evidence/HIVE-729-63fe9a2-light-assertions.json
+docs/evidence/HIVE-729-review2-assertions.json

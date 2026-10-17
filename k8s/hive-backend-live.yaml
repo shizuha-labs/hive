@@ -1,0 +1,200 @@
+# Durable manifest for the live Hive backend deployment.
+#
+# Keep this in sync with the actual production object deploy/hive in namespace
+# shizuha-hive. Older k8s/shizuha-hive.yaml still contains legacy hive-api
+# resources; this manifest captures the backend object that nginx and hive-direct
+# route to today.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive
+  namespace: shizuha-hive
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: hive
+  template:
+    metadata:
+      labels:
+        app: hive
+        app.kubernetes.io/name: hive
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: hive-controller
+      # Production invariant: do not schedule Hive backend on s1. On 2026-06-28
+      # s1 accepted the pod but left it stuck before image pull
+      # (PodReadyToStartContainers=False). CI/manual deploys must preserve this
+      # placement until s1's kubelet/container-start path has a separate fix and
+      # burn-in.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: shizuha.io/platform
+                    operator: In
+                    values: ["true"]
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values: ["s1", "i9-ws"]
+      tolerations:
+        - key: node.shizuha/workstation
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: hive
+          image: localhost:30500/shizuha-hive:hive-pulse-roster-grouping-744bf09-202606281820
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8030
+              name: http
+            - containerPort: 8031
+              name: connect-delivery
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import urllib.request; response = urllib.request.urlopen('http://127.0.0.1:8030/api/health/', timeout=5); raise SystemExit(0 if response.status == 200 else 1)"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          # PLAT-4210 (ni 2026-07-12): a hung ASGI worker (event loop wedged on a
+          # large /fleet/agents/ request colliding with a shizuha-id timeout) made
+          # /api/health/ stop responding — readiness dropped the pod from the
+          # Service (0 endpoints → every broker got connection-refused on :8030 →
+          # fleet-wide model-token starvation), but with NO liveness probe the
+          # container was never restarted and sat wedged ~7.5h. Liveness restarts a
+          # truly-hung worker. Conservative (6×15s = ~90s sustained failure) so a
+          # transient slow health check never triggers a restart storm.
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import urllib.request; response = urllib.request.urlopen('http://127.0.0.1:8030/api/health/', timeout=5); raise SystemExit(0 if response.status == 200 else 1)"
+            initialDelaySeconds: 40
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+          env:
+            # HIVE-725/HIVE-613 final desired state.  Connect references the
+            # same name/key in its namespace; the fleet rollout compares the
+            # two secret values before starting the verifier phase.
+            - name: HIVE_CONNECT_HMAC_SECRET
+              valueFrom: {secretKeyRef: {name: hive-connect-hmac, key: secret}}
+            - name: HIVE_CONNECT_ENFORCE_DEDICATED_LISTENER
+              value: "true"
+            - name: HIVE_TOKEN_COORDINATOR_KEK
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: HIVE_TOKEN_COORDINATOR_KEK}}
+            - name: HIVE_TOKEN_COORDINATOR_KEK_ID
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: HIVE_TOKEN_COORDINATOR_KEK_ID}}
+            - name: HIVE_ID_FLEET_PROVISIONER_TOKEN
+              valueFrom: {secretKeyRef: {name: fleet-provisioner-token, key: token}}
+            - name: DB_NAME
+              value: shizuha_hive
+            - name: DB_USER
+              value: postgres
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: shizuha-infra-postgresql, key: postgres-password}}
+            - name: DB_HOST
+              value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: JWT_SECRET_KEY
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+            - name: SHIZUHA_JWT_SIGNING_KEY
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+            - name: SHIZUHA_PLATFORM_URL
+              value: http://shizuha-nginx.shizuha.svc.cluster.local
+            - name: SHIZUHA_CONNECT_INTERNAL_URL
+              value: http://shizuha-connect.shizuha.svc.cluster.local:8019
+            - name: HIVE_PUBLIC_PLATFORM_URL
+              value: https://shizuha.com
+            - name: DEBUG
+              value: "False"
+            - name: VLLM_BASE_URL
+              value: http://cortex.shizuha-cortex.svc.cluster.local:8040
+            - name: CORTEX_PUBLIC_BASE_URL
+              value: http://cortex.shizuha-cortex.svc.cluster.local:8040/v1
+            - name: CORTEX_API_KEY
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: CORTEX_API_KEY}}
+            # Model-lease scheduler credential. Cortex grants fleet-service
+            # identity ONLY to a key equal to its own CORTEX_API_KEY; hive-secrets'
+            # CORTEX_API_KEY is a different (customer-tier) key and 403s on
+            # /v1/admin/model-leases/. Without this the scheduler can never grant,
+            # the board stays empty, and the gate sees `no_holder` and allows
+            # everything — leasing looks enabled while being a silent no-op.
+            - name: HIVE_CORTEX_LEASE_API_KEY
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: HIVE_CORTEX_LEASE_API_KEY}}
+            - name: HIVE_CORTEX_DEFAULT_MODEL
+              value: "DeepSeek-V4-Flash"
+            # GLM stays the shared fleet pool. Qwen3.8-27B is the single 5090
+            # seat (max_concurrent=1): one holder, idle release at 3 minutes
+            # so an empty inbox cannot park the GPU.
+            - name: HIVE_CORTEX_LEASED_MODELS
+              value: "GLM-5.3-Flash,Qwen3.8-27B"
+            - name: HIVE_CLAW_IMAGE
+              value: localhost:30500/openclaw:2026.6.11-multiarch
+            - name: HIVE_SCLI_IMAGE
+              value: localhost:30500/shizuha-runtime:latest
+            - name: HIVE_HERMES_OPENCLAW_COMPAT
+              value: "true"
+            - name: HIVE_CLAW_IMAGE_PULL_POLICY
+              value: IfNotPresent
+            - name: RUNTIME_STORAGE_CLASS
+              value: local-path
+            - name: FLEET_AGENT_IMAGE
+              value: localhost:30500/shizuha-agent-runtime:k3s-browserfix-202607040756
+            - name: FLEET_AGENT_MODEL
+              value: ""
+            - name: RUNTIME_FLEET_API_URL
+              value: http://shizuha-runtime-fleet.rt-fleet.svc.cluster.local:8016
+            - name: FLEET_BROKER_IMAGE
+              value: localhost:30500/mcp-auth-proxy:src-3a0a1b6a159c
+            - name: FLEET_BROWSER_IMAGE
+              value: localhost:30500/shizuha-browser:s260606x-b9669f4
+            - name: FLEET_COORDINATOR_MODEL_TOKEN_URL
+              value: http://hive-direct.shizuha-hive.svc.cluster.local:8030/hive/api/v1/coordinator/model-token
+            - name: FLEET_COORDINATOR_TOKEN_SECRET_NAME
+              value: hive-coordinator-broker-token
+            - name: FLEET_COORDINATOR_OAUTH_SECRET_NAME
+              value: hive-coordinator-broker-oauth
+            - name: HIVE_INTERNAL_AUTH_TOKEN
+              valueFrom: {secretKeyRef: {name: hive-secrets, key: internal-auth-token}}
+            - name: COMPANY_STATE_READ_TOKEN
+              valueFrom: {secretKeyRef: {name: hive-company-state-read, key: token, optional: false}}
+            - name: HIVE_CAPABILITY_EVIDENCE_AUTH_TOKEN
+              valueFrom: {secretKeyRef: {name: hive-capability-evidence-client-auth, key: token}}
+            - name: HIVE_CAPABILITY_EVIDENCE_PRIVATE_KEY_PEM
+              valueFrom: {secretKeyRef: {name: hive-capability-evidence-signer, key: private-key.pem, optional: true}}
+            - name: HIVE_CAPABILITY_EVIDENCE_KID
+              valueFrom: {secretKeyRef: {name: hive-capability-evidence-signer, key: kid, optional: true}}
+            - name: HIVE_CAPABILITY_EVIDENCE_SERVICE_ACCOUNT
+              value: hive-controller
+            - name: TEAM_THROUGHPUT_EXPORTER_URL
+              value: http://100.64.0.3:9101
+            - name: RUNTIME_FLEET_CONTROL_URL
+              value: http://shizuha-runtime-fleet-control.rt-fleet.svc.cluster.local:8016
+            - name: RUNTIME_FLEET_API_TIMEOUT
+              value: "15"
+            - name: AGENT_HEARTBEAT_REDIS_URL
+              value: redis://shizuha-redis-ha-master.shizuha.svc.cluster.local:6379/1
+            - name: REDIS_URL
+              value: redis://shizuha-redis-ha-master.shizuha.svc.cluster.local:6379/5
+            - name: CACHE_REDIS_URL
+              value: redis://shizuha-redis-ha-master.shizuha.svc.cluster.local:6379/6
+            - name: RUNTIME_FLEET_CONTROL_SECRET
+              valueFrom: {secretKeyRef: {name: runtime-fleet-control-secret, key: secret}}
+        # codex-refresh: see hive-codex-refresh-deploy.yaml (not a sidecar).

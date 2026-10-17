@@ -1,0 +1,46 @@
+# HIVE-725 pre-rollout policy narrowing. Apply before any pod exposes 8031.
+# Atomic rollout slice of the two pre-existing broad policies narrowed in
+# shizuha-hive-netpol.yaml. Keep these definitions byte-for-byte equivalent to
+# the canonical policy file; the manifest regression test enforces parity.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - { protocol: TCP, port: 8030 }
+        - { protocol: TCP, port: 80 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-node-healthchecks
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 100.64.0.0/10 }
+        - ipBlock: { cidr: 10.200.10.0/24 }
+        # Transition guard: the running backend may still use kubelet httpGet
+        # probes when this pre-rollout policy is applied. K3s network-policy
+        # observes that traffic within the pod CIDR on this fleet. The release
+        # switches Hive to localhost exec probes, then immediately applies the
+        # post-rollout policy that removes this temporary source.
+        - ipBlock: { cidr: 10.42.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 8030 }
+        - { protocol: TCP, port: 80 }

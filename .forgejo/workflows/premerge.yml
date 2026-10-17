@@ -1,0 +1,374 @@
+# ORIG-18: PR-gating test job. Byte-identical to deploy.yml's `test` job but
+# triggered on pull_request, so Forgejo branch protection can require the
+# context `premerge / test (pull_request)` before any merge to the default
+# branch — the platform-native fix for the PR-merge gate-bypass hole
+# (PLAT-4516; three deploy-ring wedges in three days via stale-branch merges).
+# Keep the test job in sync with deploy.yml when it changes.
+name: premerge
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    # HIVE deploy red streak: keep short main-branch gate off shared ubuntu-latest.
+    runs-on: deploy-lane
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m); case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; esac
+          case "$KUBECTL_ARCH" in
+            amd64) KUBECTL_SHA=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+            arm64) KUBECTL_SHA=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+          esac
+          # anonymous-fetch: sanctioned — adding Authorization can turn this public package fetch into 401 (ORIG-144)
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL \
+            -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "$KUBECTL_SHA  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          # Empty-kubeconfig preflight (HIVE-2853, 2026-10-07): a
+          # pull_request run received secrets.KUBE_CONFIG_B64 as EMPTY —
+          # kubectl then refuses on localhost:8080 and the gate goes opaque
+          # red in seconds. Fail loud and attributed instead: for FORK-head
+          # PRs this is expected (Forgejo does not hand repo/org secrets to
+          # pull_request runs from forks — run premerge from a same-repo
+          # branch); for same-repo PRs an empty secret means the secret
+          # itself must be re-minted before cluster legs can run.
+          if [ ! -s "$HOME/.kube/config" ]; then
+            echo "::error::KUBE_CONFIG_B64 decoded to a zero-byte kubeconfig — fork-head PRs get no repo/org secrets by design; re-run premerge from a same-repo branch. For same-repo runs, re-mint the secret before cluster legs can run."
+            exit 1
+          fi
+      - name: PLAT-187 migration-approval gate (early, fail-fast)  # HIVE-665
+        env:
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # HIVE-665: enforce the PLAT-187 migration-approval-doc requirement HERE,
+          # in the pipeline-gating `test` job, so a flagged migration merged without
+          # its approval doc fails THIS author's run — loud and attributed — instead
+          # of silently fail-closing the post-merge deploy-staging INV-D gate and
+          # wedging the whole hive ring for hours (root cause: fleet.0027 / HIVE-661).
+          # Scope is the unreleased delta only (anchor...HEAD), so the 11 grandfathered
+          # pre-anchor flagged migrations are never re-litigated.
+          LAST_SHA="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.metadata.annotations.last-successful-sha}' 2>/dev/null || true)"
+          if ! [[ "$LAST_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "HIVE-665: no valid last-successful-sha anchor yet — approval gate deferred to the post-merge staging exercise"
+            exit 0
+          fi
+          workdir="$(mktemp -d)"; cd "$workdir"
+          git init -q .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags --depth=200 origin "${{ github.sha }}" "$LAST_SHA"
+          git checkout --detach "${{ github.sha }}"
+          if ! git cat-file -e "${LAST_SHA}^{commit}" 2>/dev/null; then
+            echo "HIVE-665: anchor $LAST_SHA unreachable within fetch depth — deferring to the post-merge staging exercise"
+            exit 0
+          fi
+          MIGRATION_APPROVAL_ONLY=1 .forgejo/scripts/migration-compat-gate.sh "$LAST_SHA"
+      - name: Mirror backend test service images
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-mirror-hive-test-services-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          manifest_has_cluster_platforms() {
+            local REPO="$1" TAG="$2" MANIFEST
+            MANIFEST="$(curl -fsS -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
+              "http://${REG}/v2/${REPO}/manifests/${TAG}")" || return 1
+            grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"amd64"' <<<"$MANIFEST" &&
+              grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"arm64"' <<<"$MANIFEST"
+          }
+          if manifest_has_cluster_platforms hive-ci-postgres 16-alpine &&
+             manifest_has_cluster_platforms hive-ci-redis 7-alpine; then
+            echo "Backend test service images already mirrored for amd64 + arm64"
+            exit 0
+          fi
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-mirror, service: hive }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: postgres
+                    image: gcr.io/go-containerregistry/crane:latest
+                    imagePullPolicy: IfNotPresent
+                    args: [copy, --insecure, docker.io/library/postgres:16-alpine, ${REG}/hive-ci-postgres:16-alpine]
+                  - name: redis
+                    image: gcr.io/go-containerregistry/crane:latest
+                    imagePullPolicy: IfNotPresent
+                    args: [copy, --insecure, docker.io/library/redis:7-alpine, ${REG}/hive-ci-redis:7-alpine]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=600s || {
+            echo "::error::backend test service image mirror failed"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=100 || true
+            exit 1
+          }
+      - name: Run backend test suite before deploy
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-test-hive-${SHORT}"
+          TEST_IMAGE="$(kubectl get deployment hive -n shizuha-hive -o jsonpath='{.spec.template.spec.containers[?(@.name=="hive")].image}')"
+          test -n "$TEST_IMAGE"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test, service: hive, shizuha.io/ci-gate: PLAT-1219 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                  - name: postgres
+                    image: localhost:30500/hive-ci-postgres:16-alpine
+                    imagePullPolicy: IfNotPresent
+                    restartPolicy: Always
+                    args: [postgres, -c, fsync=off, -c, synchronous_commit=off, -c, full_page_writes=off]
+                    env:
+                      - { name: POSTGRES_DB, value: shizuha_hive_ci }
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+                    startupProbe:
+                      tcpSocket: { port: 5432 }
+                      periodSeconds: 1
+                      failureThreshold: 60
+                  - name: redis
+                    image: localhost:30500/hive-ci-redis:7-alpine
+                    imagePullPolicy: IfNotPresent
+                    restartPolicy: Always
+                    startupProbe:
+                      tcpSocket: { port: 6379 }
+                      periodSeconds: 1
+                      failureThreshold: 60
+                containers:
+                  - name: test
+                    image: ${TEST_IMAGE}
+                    imagePullPolicy: IfNotPresent
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        cd /workspace/src
+                        export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=shizuha_hive_ci
+                        export REDIS_URL=redis://127.0.0.1:6379/5 CACHE_REDIS_URL=redis://127.0.0.1:6379/6 DEBUG=True SECRET_KEY=ci-secret JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
+                        # Token coordinator encrypts claw credentials; tests call set_token()
+                        # without this KEK (ImproperlyConfigured → suite red → API never deploys).
+                        export HIVE_TOKEN_COORDINATOR_KEK="\$(/app/.venv/bin/python -c 'import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+                        export HIVE_TOKEN_COORDINATOR_KEK_ID=ci-test-kek
+                        # HIVE-2715 CI lap-3: the saga adapter path signs via
+                        # HIVE_SERVICE_SIGNING_KEY; without a value the fleet helper
+                        # raises ValueError before HTTP, so adapter-backed tests can
+                        # never run as authored (run 3134). CI-fixed value is
+                        # sufficient here: the suite mocks the admin HTTP seam, and
+                        # signature VERIFICATION on the admin side is not under test
+                        # in this Job.
+                        export HIVE_SERVICE_SIGNING_KEY=ci-test-hive-signing-key
+                        # SCLI-376: token revocation is consulted for EVERY token type
+                        # (fail closed). The test Job has no shizuha-id deployment, so a
+                        # real consult to the default http://shizuha-id:8001 would fail
+                        # DNS and fail closed (false "revoked") on every valid token,
+                        # turning the whole suite into 401/403s. Stand up a local stub
+                        # that answers with the exact revocation-status contract
+                        # ({"active": true}) and point SHIZUHA_EXPECTED_ISSUER at it, so
+                        # the consult genuinely runs and returns active for test tokens.
+                        # Mirror of the shizuha-tasks premerge fix (SCLI-376). Must stay
+                        # identical in deploy.yml (HIVE-1512).
+                        mkdir -p /tmp/revocation-stub
+                        cat > /tmp/revocation-stub/server.py <<'PY'
+                        import json
+                        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                        class H(BaseHTTPRequestHandler):
+                            def do_POST(self):
+                                length = int(self.headers.get("Content-Length") or 0)
+                                self.rfile.read(length)
+                                body = json.dumps({"active": True}).encode()
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/json")
+                                self.send_header("Content-Length", str(len(body)))
+                                self.end_headers()
+                                self.wfile.write(body)
+                            def log_message(self, *args):
+                                pass
+
+                        HTTPServer(("127.0.0.1", 19999), H).serve_forever()
+                        PY
+                        python3 /tmp/revocation-stub/server.py &
+                        REVOCATION_STUB_PID=\$!
+                        trap 'kill \${REVOCATION_STUB_PID} >/dev/null 2>&1 || true' EXIT
+                        for i in \$(seq 1 10); do
+                          if python3 -c "import json,urllib.request; \
+                            urllib.request.urlopen(urllib.request.Request( \
+                            'http://127.0.0.1:19999/api/oauth/revocation-status', \
+                            data=b'{}', method='POST'), timeout=1)" >/dev/null 2>&1; then break; fi
+                          sleep 1
+                        done
+                        export SHIZUHA_EXPECTED_ISSUER=http://127.0.0.1:19999
+                        # Static + full suite before auto-deploy (operator 2026-07-09)
+                        # HIVE-1512: this list MUST stay identical to deploy.yml's
+                        # test step. It was a strict SUBSET — no fleet in
+                        # compileall, and neither standalone tests/ script — so a PR
+                        # could go green on premerge and still red main on push,
+                        # skipping every deploy stage. That is exactly how a canary
+                        # fixture failure survived to main undetected. Add here and
+                        # in deploy.yml together, or the gate silently diverges again.
+                        /app/.venv/bin/python manage.py makemigrations --check --dry-run
+                        /app/.venv/bin/python .forgejo/scripts/check-django-migration-graph.py
+                        /app/.venv/bin/python -m compileall -q claws fleet hive_project manage.py
+                        /app/.venv/bin/python tests/test_explicit_credential_configuration.py
+                        /app/.venv/bin/python manage.py check --deploy 2>/dev/null || /app/.venv/bin/python manage.py check
+                        /app/.venv/bin/python tests/test_hive707_canary_teardown.py
+                        /app/.venv/bin/python tests/test_hive_api_service_selector.py
+                        /app/.venv/bin/python tests/test_deployment_event_recorder.py
+                        /app/.venv/bin/python tests/test_hive623_pulse_preflight.py
+                        /app/.venv/bin/python tests/test_pulse_fleet_read_client_provisioning.py
+                        /app/.venv/bin/python tests/test_coordinator_broker_client_provisioning.py
+                        /app/.venv/bin/python tests/test_pulse_writer_auth.py
+                        /app/.venv/bin/python tests/test_plat4086_rollout_rings.py RingFenceContractTests
+                        # PostgreSQL is an ephemeral sidecar destroyed with this Job.
+                        # Avoid Django's teardown DROP racing a late background connection.
+                        /app/.venv/bin/python manage.py test --noinput --keepdb
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          # Fail fast on job failure: a failed Job never becomes 'complete', so a plain
+          # wait hangs to timeout while ttlSecondsAfterFinished deletes the Job and its logs.
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::backend test gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::backend test gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+      - name: Run frontend unit, build, and browser regressions
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-test-hive-frontend-pr-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test, service: shizuha-hive-frontend, shizuha.io/ci-gate: HIVE-732 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: test
+                    image: mcr.microsoft.com/playwright:v1.58.2-noble
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        cd /workspace/src/frontend
+                        # HIVE-732: generic retry with backoff so a transient registry blip does
+                        # not red-light the gate. Deliberately attributes no cause: an earlier
+                        # revision asserted npm-cache degradation here, and that pre-written
+                        # diagnosis anchored three investigators away from the real defect
+                        # (this heredoc's own unescaped expansions, HIVE-1258). Read the npm output.
+                        for attempt in 1 2 3; do
+                          npm install --legacy-peer-deps --no-audit --no-fund && break
+                          if [ "\$attempt" = "3" ]; then
+                            echo "::error::npm install failed after 3 attempts. Read the npm output above before attributing a cause."
+                            exit 1
+                          fi
+                          echo "::warning::npm install attempt \$attempt failed; retrying in \$((attempt * 10))s"
+                          sleep \$((attempt * 10))
+                        done
+                        npm run lint
+                        npm test
+                        VITE_BASE_PATH=/hive/ npm run build
+                        VITE_BASE_PATH=/hive/ npm run preview -- --host 0.0.0.0 --port 4173 >/tmp/hive-preview.log 2>&1 &
+                        PREVIEW_PID=\$!
+                        trap 'kill "\$PREVIEW_PID" 2>/dev/null || true' EXIT
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-org-switcher
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-agent-drawer
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-openclaw-dashboard
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-operations-empty
+                    env:
+                      - name: NPM_CONFIG_REGISTRY
+                        value: http://npm-cache.registry.svc.cluster.local:4873/
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1200s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::frontend premerge gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=240 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::frontend premerge gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=240 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true

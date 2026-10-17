@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hive-tiers
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive-api
+    app.kubernetes.io/component: tier-config
+    app.kubernetes.io/managed-by: shizuha-hive
+data:
+  # Tier definitions for HIVE free-claw provisioning (HIVE-59 / HIVE-66).
+  # provisioner.resolve_tier() reads + caches this at runtime with a built-in
+  # free-tier fallback so a missing/malformed ConfigMap never crashes provisioning.
+  tiers.yaml: |
+    tiers:
+      free:
+        # Storage per claw PVC (Longhorn, ReadWriteOnce).
+        pvc_size: "5Gi"
+        # Pod resource envelope for the main claw container.
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+        # Scale-to-zero idle reclaim: recycle_after is set to
+        # provisioned_at + idle_ttl_minutes; the idle-reclaim cron acts on it.
+        scale_to_zero:
+          idle_ttl_minutes: 30
+        # Daily message cap enforced by the hive-api rate-limiter.
+        daily_msg_limit: 100
+        # LLM routing — new claws inherit the operator's DeepSeek-only default.
+        # Per-claw overrides remain entitlement-gated by Cortex.
+        llm:
+          service: "hive-llm"
+          default_model: "DeepSeek-V4-Flash"
+        # Maximum concurrent claws per owner on this tier.
+        max_claws_per_owner: 1

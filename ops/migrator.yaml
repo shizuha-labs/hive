@@ -1,0 +1,72 @@
+# HIVE-2 §4.3.3 — Ephemeral migrator pod for the Milestone A data lift.
+#
+# Purpose: mounts claw PVC `claw-data` at /mnt/dst so the operator can
+# tar-pipe the s1 host directories into the PVC without the claw pod running
+# (the claw is scaled to 0 before this pod is launched — §4.3.2).
+#
+# Image: debian:slim (provides GNU tar with --xattrs --acls support).
+# Busybox tar is DISQUALIFIED — it silently drops --xattrs/--acls and would
+# corrupt the WA session keys and workspace .git xattrs (HIVE-2 §4.3 note).
+# Alternative: alpine:3.20 with `apk add tar` (also GNU tar, tested by Ichi).
+#
+# Usage (in the namespace where the claw was provisioned):
+#   CLAW_NS=claw-<owner_id>-<claw_id>
+#   kubectl -n "$CLAW_NS" apply -f ops/migrator.yaml
+#   kubectl -n "$CLAW_NS" wait pod/migrator --for=condition=ready --timeout=120s
+#   # then run §4.3.4–§4.3.8 from hive-migrate-claw.sh (or manually)
+#   kubectl -n "$CLAW_NS" delete pod/migrator  # cleanup
+#
+# The pod uses `sleep infinity` as its command so the operator can exec into it
+# at each §4.3 step.  It will be deleted at the end of §4.4 (after cutover).
+#
+# Node scheduling:  must land on an arm64 node with Longhorn access so the
+# ReadWriteOnce PVC can bind (same pool as the claw deployment).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: migrator
+  # Apply in the claw namespace: kubectl -n <NS> apply -f ops/migrator.yaml
+  labels:
+    app.kubernetes.io/component: hive-migrator
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  # Longhorn PVC is ReadWriteOnce; must be on the same arm64 node the claw
+  # will eventually run on (or any arm64 node with Longhorn access).
+  nodeSelector:
+    kubernetes.io/arch: arm64
+    storage.longhorn.io/ready: "true"
+  tolerations:
+    - key: shizuha.com/inference-paused
+      operator: Exists
+      effect: NoSchedule
+  # fsGroup=1000 keeps /mnt/dst writable even if the Longhorn PVC is
+  # fresh (root:root 755 at first mount).  Matches the claw pod's fsGroup
+  # so chown 1000:1000 in §4.3.6 is a no-op on nodes where containerd
+  # already applied it.
+  securityContext:
+    fsGroup: 1000
+  containers:
+    - name: migrator
+      image: debian:slim
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      # §4.3 PVC layout (HIVE-2 §3.2):
+      #   /mnt/dst/*           ← openclaw-data/*        (§4.3.5 first tar pass)
+      #   /mnt/dst/workspace/* ← openclaw-workspace/*   (§4.3.5 second tar pass)
+      # This maps to the claw pod's /home/node/.openclaw/* after scale-up.
+      volumeMounts:
+        - name: claw-data
+          mountPath: /mnt/dst
+      resources:
+        requests:
+          memory: 64Mi
+          cpu: 50m
+        limits:
+          memory: 256Mi
+          cpu: 500m
+  volumes:
+    - name: claw-data
+      persistentVolumeClaim:
+        claimName: claw-data

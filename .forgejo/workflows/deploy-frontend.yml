@@ -1,0 +1,486 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-hive-FRONTEND (PLAT-1009).
+# The frontend is a separate image from the backend (deploy.yml builds the backend).
+# Self-contained: @shizuha/ui is installed from the in-cluster npm-cache (Verdaccio),
+# NOT file:../../packages/shizuha-ui, so this standalone-repo CI can build it.
+# Multi-arch (amd64 s1 + arm64 gx10) — hive-frontend is free-floating, must run on arm64.
+name: deploy-shizuha-hive-frontend
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    # Frontend CI pulls the pinned Playwright runtime and installs the complete
+    # npm graph. Do not spend that network/build budget on backend, fleet-policy,
+    # or documentation-only commits.
+    paths:
+      - '.forgejo/workflows/deploy-frontend.yml'
+      - 'frontend/**'
+# test cancels on new push (fast feedback). build-and-deploy has its own
+# concurrency with cancel-in-progress: false so deploys queue serially on the
+# dedicated deploy-lane runner and always land (ubuntu-latest starved by long
+# codex cross-compiles — ORIG-71/ORIG-76/ORIG-80).
+concurrency:
+  group: deploy-shizuha-hive-frontend-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    # HIVE frontend deploy red streak: keep short main-branch gate off shared ubuntu-latest.
+    runs-on: deploy-lane
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m); case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; esac
+          case "$KUBECTL_ARCH" in
+            amd64) KUBECTL_SHA=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+            arm64) KUBECTL_SHA=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+          esac
+          # anonymous-fetch: sanctioned — adding Authorization can turn this public package fetch into 401 (ORIG-144)
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL \
+            -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "$KUBECTL_SHA  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run frontend build smoke before deploy
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-test-shizuha-hive-frontend-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test, service: shizuha-hive-frontend, shizuha.io/ci-gate: PLAT-1219 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            # HIVE-1195: bound the Job so an image-pull failure (ImagePullBackOff)
+            # self-terminates (DeadlineExceeded -> Failed -> reaped) instead of
+            # lingering Pending forever and firing PodImagePullFailing indefinitely.
+            activeDeadlineSeconds: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: test
+                    image: mcr.microsoft.com/playwright:v1.58.2-noble
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        cd /workspace/src/frontend
+                        # Match frontend/Dockerfile.ci and resolve @shizuha/ui through the in-cluster cache.
+                        npm install --legacy-peer-deps --no-audit --no-fund
+                        # Static + smoke gates before auto-deploy (operator 2026-07-09).
+                        # Lint is advisory if config/tooling is incomplete on a fresh install;
+                        # build + unit tests are hard gates.
+                        npm run lint || echo "::warning::eslint reported issues (non-blocking if tooling drift)"
+                        npm test
+                        VITE_BASE_PATH=/hive/ npm run build
+                        VITE_BASE_PATH=/hive/ npm run preview -- --host 0.0.0.0 --port 4173 >/tmp/hive-preview.log 2>&1 &
+                        # This script is nested in the runner's unquoted heredoc.
+                        # Escape inner-shell PID variables so the runner does not
+                        # expand them under its own `set -u` before applying the Job.
+                        PREVIEW_PID=\$!
+                        trap 'kill "\$PREVIEW_PID" 2>/dev/null || true' EXIT
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-org-switcher
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-agent-drawer
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-openclaw-dashboard
+                        PLAYWRIGHT_BASE_URL=http://127.0.0.1:4173 npm run test:browser-operations-empty
+                    env:
+                      - name: NPM_CONFIG_REGISTRY
+                        value: http://npm-cache.registry.svc.cluster.local:4873/
+                      # HIVE-1398: the build-commit marker resolver reads
+                      # VITE_BUILD_COMMIT first; without it the kaniko build
+                      # context has no .git (dockerignored) and the marker
+                      # degrades to "unknown" (observed live 2026-09-06:
+                      # <meta name="build-commit" content="unknown">). The
+                      # workflow-level expression expands before the Job
+                      # renders — same mechanism as the initContainer's
+                      # EXPECTED_SHA checkout pin.
+                      - name: VITE_BUILD_COMMIT
+                        value: "${{ github.sha }}"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          # Fail fast on job failure: a failed Job never becomes 'complete', so a plain
+          # wait hangs to timeout while ttlSecondsAfterFinished deletes the Job and its logs.
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1200s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::frontend test/build gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::frontend test/build gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+      - name: Emit deduplicated alert to DevOps team on CI failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          cat <<'YAML' | kubectl apply -f - || true
+          apiVersion: monitoring.coreos.com/v1
+          kind: PrometheusRule
+          metadata:
+            name: hive-frontend-ci-alert
+            namespace: monitoring
+            labels:
+              app.kubernetes.io/name: hive-frontend
+              release: kube-prometheus-stack
+          spec:
+            groups:
+              - name: hive-frontend-ci-alert
+                rules:
+                  - alert: HiveFrontendCIBuildFailed
+                    expr: kube_job_status_failed{namespace="build", job_name=~"ci-test-shizuha-hive-frontend-.*"} > 0
+                    for: 0m
+                    labels:
+                      severity: warning
+                      team: devops
+                      owner_group: devops
+                      service: shizuha-hive-frontend
+                    annotations:
+                      summary: "Hive frontend CI build/test failed on main"
+                      description: >-
+                        Frontend CI build or unit test gate failed.
+                        Deduplicated operational alert for the DevOps on-call team. No task created.
+                      runbook_url: "https://wiki.shizuha.com/devops/ci-build-failures"
+          YAML
+  build-and-deploy:
+    needs: test
+    concurrency:
+      group: deploy-shizuha-hive-frontend-build-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: deploy-lane
+    steps:
+      - name: Checkout exact triggering revision for monotonic release guard
+        env:
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH=$(uname -m); case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; esac
+          case "$KUBECTL_ARCH" in
+            amd64) KUBECTL_SHA=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+            arm64) KUBECTL_SHA=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+          esac
+          # anonymous-fetch: sanctioned — adding Authorization can turn this public package fetch into 401 (ORIG-144)
+          curl --retry 3 --retry-all-errors --retry-delay 1 --max-time 60 -fsSL \
+            -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          echo "$KUBECTL_SHA  kubectl" | sha256sum -c -
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + deploy + verify (frontend)
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          FTAG="hive-frontend-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          echo "Multi-arch build shizuha-hive-frontend:${FTAG} (amd64 + arm64)"
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-hive-frontend-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: hive-frontend }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            # HIVE-1195: bound the Job to its gate's kubectl wait --timeout (1800s)
+            # so an image-pull/scheduling failure self-terminates (DeadlineExceeded
+            # -> Failed -> reaped) instead of lingering Pending forever.
+            activeDeadlineSeconds: 1800
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP;
+                  # s1 overlay works and carries operator=unschedulable. CI tolerates
+                  # the operator-hold taint instead of removing it.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded until
+                        # ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git /workspace/src
+                        cd /workspace/src && (git checkout ${{ github.sha }} 2>/dev/null || echo "sha not in shallow clone; building default HEAD")
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/frontend/Dockerfile.ci
+                      - --destination=${REG}/shizuha-hive-frontend:${FTAG}-${ARCH}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=VITE_BASE_PATH=/hive/
+                      - --build-arg=VITE_API_BASE=/hive/api
+                      - --build-arg=VITE_BUILD_COMMIT=${{ github.sha }}
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/hive-deploy-frontend-${ARCH}
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                      - --cleanup
+                      - --snapshot-mode=redo
+                      - --use-new-run
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          for stale_job in $(kubectl get jobs -n build -l app=ci-build,service=hive-frontend \
+            -o go-template='{{range .items}}{{if .status.active}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}'); do
+            case "$stale_job" in
+              "ci-build-hive-frontend-${SHORT}-amd64"|"ci-build-hive-frontend-${SHORT}-arm64") ;;
+              *) echo "Deleting superseded active Hive frontend builder: $stale_job"; kubectl delete job -n build "$stale_job" --wait=false ;;
+            esac
+          done
+          # HIVE-312: delete same-SHA leftovers first — 'apply' on an existing
+          # completed/failed Job is 'unchanged' and a rerun can never succeed.
+          kubectl delete job -n build "ci-build-hive-frontend-${SHORT}-amd64" "ci-build-hive-frontend-${SHORT}-arm64" --ignore-not-found
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {
+            local ARCH="$1"
+            local JOB="ci-build-hive-frontend-${SHORT}-${ARCH}"
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+            local WP=$!
+            while kill -0 "$WP" 2>/dev/null; do
+              if kubectl get "job/${JOB}" -n build -o jsonpath='{.status.failed}' | grep -q '[1-9]'; then
+                echo "::error::kaniko frontend ${ARCH} build failed"
+                kubectl logs -n build "job/${JOB}" --all-containers --tail=80 || true
+                exit 1
+              fi
+              sleep 5
+            done
+            wait "$WP"
+          }
+          wait_job amd64 &
+          AMD64_WAIT_PID=$!
+          wait_job arm64 &
+          ARM64_WAIT_PID=$!
+          WAIT_STATUS=0
+          wait "$AMD64_WAIT_PID" || WAIT_STATUS=$?
+          wait "$ARM64_WAIT_PID" || WAIT_STATUS=$?
+          [ "$WAIT_STATUS" -eq 0 ] || exit "$WAIT_STATUS"
+
+          kubectl delete job -n build "ci-manifest-hive-frontend-${SHORT}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-hive-frontend-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, service: hive-frontend }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            # HIVE-1195: bound the Job to its gate's kubectl wait --timeout (300s)
+            # so an image-pull/scheduling failure self-terminates (DeadlineExceeded
+            # -> Failed -> reaped) instead of lingering Pending forever.
+            activeDeadlineSeconds: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-hive-frontend:${FTAG}
+                      - -m
+                      - ${REG}/shizuha-hive-frontend:${FTAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-hive-frontend:${FTAG}-arm64
+          YAML
+          kubectl wait -n build --for=condition=complete "job/ci-manifest-hive-frontend-${SHORT}" --timeout=300s || {
+            echo "::error::frontend manifest combine failed"
+            kubectl logs -n build "job/ci-manifest-hive-frontend-${SHORT}" --tail=80 || true
+            exit 1
+          }
+
+          verify_manifest() {
+            local REPO="$1"
+            local IMAGE_TAG="$2"
+            local JOB="ci-verify-${REPO}-${SHORT}"
+            kubectl delete job -n build "${JOB}" --ignore-not-found
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-verify, service: ${REPO} }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            # HIVE-1195: bound the Job to its gate's kubectl wait --timeout (120s)
+            # so an image-pull/scheduling failure self-terminates (DeadlineExceeded
+            # -> Failed -> reaped) instead of lingering Pending forever.
+            activeDeadlineSeconds: 120
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: manifest-check
+                    image: python:3.12-alpine
+                    command: ["python", "-c"]
+                    args:
+                      - |
+                        import json, urllib.request
+                        url = "http://${REG}/v2/${REPO}/manifests/${IMAGE_TAG}"
+                        accept = ",".join([
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                        ])
+                        req = urllib.request.Request(url, headers={"Accept": accept})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            manifest = json.load(resp)
+                        platforms = {
+                            f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}"
+                            for m in manifest.get("manifests", [])
+                        }
+                        missing = {"linux/amd64", "linux/arm64"} - platforms
+                        print(f"{url} platforms={sorted(platforms)}")
+                        if missing:
+                            raise SystemExit(f"missing required platform(s): {sorted(missing)}")
+          YAML
+            kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=120s || {
+              echo "::error::manifest verification failed"
+              kubectl logs -n build "job/${JOB}" --tail=80 || true
+              exit 1
+            }
+            kubectl logs -n build "job/${JOB}" --tail=20 || true
+          }
+          verify_manifest "shizuha-hive-frontend" "${FTAG}"
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha-hive hive-frontend "${{ github.sha }}"
+          GUARD_RC="$?"
+          set -e
+          if [ "${GUARD_RC}" = 10 ]; then exit 0; fi
+          if [ "${GUARD_RC}" != 0 ]; then exit "${GUARD_RC}"; fi
+          PREV="$(kubectl get deploy -n shizuha-hive hive-frontend -o jsonpath='{.spec.template.spec.containers[?(@.name=="hive-frontend")].image}' 2>/dev/null || true)"
+          if [ -n "${PREV}" ]; then
+            echo "Current image: ${PREV}"
+            echo "Rollback command: kubectl set image -n shizuha-hive deploy/hive-frontend hive-frontend=${PREV} && kubectl rollout status -n shizuha-hive deploy/hive-frontend"
+          fi
+          kubectl set image -n shizuha-hive deploy/hive-frontend hive-frontend="localhost:30500/shizuha-hive-frontend:${FTAG}"
+          kubectl rollout status -n shizuha-hive deploy/hive-frontend --timeout=300s
+          kubectl annotate -n shizuha-hive deploy/hive-frontend --overwrite \
+            shizuha.io/last-successful-sha="${{ github.sha }}" \
+            shizuha.devops/deploy-commit="${SHORT}" \
+            shizuha.devops/deploy-image="localhost:30500/shizuha-hive-frontend:${FTAG}" \
+            shizuha.devops/deploy-note="CI deploy: hive frontend ${SHORT}" \
+            shizuha.devops/deploy-task="HIVE-AgentsRosterTeams"
+
+          LIVE="$(kubectl get deploy -n shizuha-hive hive-frontend -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          echo "Live frontend image: ${LIVE}"
+          echo "${LIVE}" | grep -q "${FTAG}" || { echo "::error::frontend image mismatch"; exit 1; }
+          kubectl annotate -n shizuha-hive deploy/hive-frontend shizuha.io/last-successful-sha="${{ github.sha }}" --overwrite
+          kubectl get pods -n shizuha-hive -l app=hive-frontend
+          # DeploymentEvent is post-rollout evidence, not part of the rollout
+          # transaction (wiki precedent): keep it fail-loud in the log without
+          # rewriting a converged deployment as failed when the credential
+          # read or the Pulse POST fails (run 2616: rollout converged, live
+          # image verified, then the pulse-api-token read came up empty).
+          if ! .forgejo/scripts/record-deployment-event.sh \
+            hive-frontend hive-frontend "localhost:30500/shizuha-hive-frontend:${FTAG}" \
+            /hive/agents,/hive/subscriptions; then
+            echo "::warning::frontend rollout succeeded but DeploymentEvent recording failed"
+          fi

@@ -1,0 +1,238 @@
+# Near-native OpenClaw claw reference spec — HIVE-231 / HIVE-2
+# Hive Charter D1 (direct k8s), D3 (Longhorn PVC per claw), D4 (single-replica Recreate),
+# D6 (owner-only dashboard).
+#
+# This file documents the k8s objects provisioner.py creates for one claw.
+# It is NOT applied directly (provisioner.py generates these at runtime from the
+# Claw model). Use it as a reference, a manual-recovery template, or to verify
+# that a live claw's topology matches the spec.
+#
+# §4.3 PVC layout (HIVE-2 §3.2 — single-PVC consolidation):
+#   Source (s1 host)                    → in-cluster path (PVC mount + subdir)
+#   $CLAW_SOURCE_DATA_DIR/*       → /home/node/.openclaw/*
+#   $CLAW_SOURCE_WORKSPACE_DIR/*  → /home/node/.openclaw/workspace/*
+# Workspace is mounted INSIDE the data path in the container; the PVC collapses
+# both host dirs into one volume so paths are identical to the source container.
+#
+# Placeholders (replace before applying manually):
+#   <NS>          — claw-<owner_id>-<claw_id>  e.g. claw-f4b2a1c0-8e3d5f2a...
+#   <OWNER-ID>    — Shizuha owner_id (UUID hex)
+#   <CLAW-ID>     — claw id hex
+#   <IMAGE>       — HIVE_CLAW_IMAGE value (digest-pinned per PLAT-170 convention)
+#                   e.g. gx10-1:30500/openclaw@sha256:f6fe3c7479e2...
+#   <PLATFORM-URL>  — SHIZUHA_PLATFORM_URL (e.g. https://s1.tail.shizuha.com)
+#   <PVC-SIZE>    — tier-dependent (free=5Gi, medium=4Gi per HIVE-2 §3.1)
+---
+# Charter D1: hive-api holds in-cluster ServiceAccount with sufficient RBAC to
+# create/manage these objects; claw pods themselves have NO k8s API access.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: <NS>
+  labels:
+    app.kubernetes.io/name: shizuha-claw
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/owner-id: <OWNER-ID>
+    shizuha.io/claw-id: <CLAW-ID>
+    # Baseline Pod Security Standard — claw runs as node uid 1000 (non-root),
+    # no host paths, no privileged escalation. Restrict is audited but not
+    # enforced (OpenClaw makes outbound internet calls that Restricted would block).
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# Harden the auto-created default ServiceAccount (kube-API path removed).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: <NS>
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+automountServiceAccountToken: false
+---
+# Charter D3: exactly one PVC per claw, Longhorn-backed.
+# §4.3 PVC layout: mounted at /home/node/.openclaw so:
+#   /home/node/.openclaw/*            holds openclaw-data/* (OAuth, WA session, sqlite, ...)
+#   /home/node/.openclaw/workspace/*  holds openclaw-workspace/* (.git, agent profiles, ...)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claw-data
+  namespace: <NS>
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/claw-id: <CLAW-ID>
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: <PVC-SIZE>
+---
+# Platform credentials + claw config (near-native OpenClaw, no agent account).
+# daemon.json / auth.json provide the Shizuha ID context; internal-auth-token
+# scopes this claw's service credential to one namespace only.
+#
+# For the Milestone A proving migration (HIVE-2 §6.2): additionally extract
+# OPENCLAW_GATEWAY_TOKEN from the s1 host container and store it in this secret
+# under key `gateway-auth-token` before boot.  New free-tier claws do not need
+# this key.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: claw-config
+  namespace: <NS>
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+type: Opaque
+stringData:
+  daemon.json: '{"platformUrl": "<PLATFORM-URL>"}'
+  auth.json: '{"username": "<OWNER-USERNAME>", "accessToken": "<USER-TOKEN>", "idApiBaseUrl": "<PLATFORM-URL>"}'
+  internal-auth-token: "<INTERNAL-AUTH-TOKEN>"
+  # Migration-only (HIVE-2 §6.2 — proving instance).  Omit for new claws.
+  # gateway-auth-token: "<OPENCLAW_GATEWAY_TOKEN from s1 docker inspect>"
+---
+# Near-native OpenClaw Deployment — Charter D4 (single-replica Recreate).
+# The claw image is the HIVE-21 multi-arch manifest list; containerd resolves
+# the arm64 child on the gx10 Longhorn pool (HIVE-2 §2.8 G-a + G-b).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claw
+  namespace: <NS>
+  labels:
+    app: claw
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/owner-id: <OWNER-ID>
+    shizuha.io/claw-id: <CLAW-ID>
+spec:
+  replicas: 1
+  # Charter D4: never two pods against the same WhatsApp session dir.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: claw
+  template:
+    metadata:
+      labels:
+        app: claw
+        app.kubernetes.io/managed-by: shizuha-hive
+        shizuha.io/owner-id: <OWNER-ID>
+        shizuha.io/claw-id: <CLAW-ID>
+    spec:
+      automountServiceAccountToken: false
+      # arm64 Longhorn nodes only (gx10-1..8; s1/i9-ws are not Longhorn-ready).
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        storage.longhorn.io/ready: "true"
+      # HIVE-74: ARM64 nodes carry NoSchedule shizuha.com/inference-paused.
+      tolerations:
+        - key: shizuha.com/inference-paused
+          operator: Exists
+          effect: NoSchedule
+      # fsGroup=1000 (openclaw node uid) so a fresh Longhorn PVC is writable by
+      # the non-root container.  Migrated PVCs already carry node ownership.
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        # Seeds gateway.mode=local into /home/node/.openclaw/openclaw.json and
+        # installs the notify_owner MCP server (HIVE-201 E2), idempotently.
+        # Runs node -e from the claw image itself — no extra image, multi-arch.
+        - name: init-gateway-config
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          command: ["node", "-e", "<INIT-SCRIPT>"]
+          env:
+            - name: HIVE_CLAW_ID
+              value: <CLAW-ID>
+            - name: BACKEND_URL
+              value: <PLATFORM-URL>
+            - name: HIVE_INTERNAL_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claw-config
+                  key: internal-auth-token
+          volumeMounts:
+            - name: claw-data
+              mountPath: /home/node/.openclaw
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 128Mi
+              cpu: 250m
+      containers:
+        - name: claw
+          image: <IMAGE>
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SHIZUHA_PLATFORM_URL
+              value: <PLATFORM-URL>
+            - name: BACKEND_URL
+              value: <PLATFORM-URL>
+            - name: PORT
+              value: "18789"
+            - name: HIVE_CLAW_ID
+              value: <CLAW-ID>
+            - name: HIVE_INTERNAL_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: claw-config
+                  key: internal-auth-token
+            # Migration-only (HIVE-2 §6.2 — proving instance).  Omit for new claws.
+            # - name: OPENCLAW_GATEWAY_TOKEN
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: claw-config
+            #       key: gateway-auth-token
+          # §4.3 PVC layout: single PVC at /home/node/.openclaw
+          #   .openclaw/*            ← openclaw-data/* (lifted by §4.3.5)
+          #   .openclaw/workspace/*  ← openclaw-workspace/* (lifted by §4.3.5 second pass)
+          volumeMounts:
+            - name: claw-data
+              mountPath: /home/node/.openclaw
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 2Gi
+              cpu: "1"
+          # HIVE-252: single-replica Recreate (Charter D4) means a hung-but-alive
+          # process never restarts on its own. Add a livenessProbe matching the one
+          # the fleet provisioner already generates for live claw Deployments
+          # (fleet/provisioner.py ~L1607). /api/healthz per ops/hive-migrate-claw.sh §4.4.
+          livenessProbe:
+            httpGet:
+              path: /api/healthz
+              port: 18789
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: claw-data
+          persistentVolumeClaim:
+            claimName: claw-data
+---
+# ClusterIP Service — Charter D6 auth-request gate sits at the Ingress layer.
+# Port 18789 only (18790 is unused — confirmed Ichi HIVE-2 v3.1;
+# 18791 is loopback-only inside the pod, never exposed here).
+apiVersion: v1
+kind: Service
+metadata:
+  name: claw
+  namespace: <NS>
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  selector:
+    app: claw
+  ports:
+    - name: dashboard
+      port: 18789
+      targetPort: 18789
+      protocol: TCP
+  type: ClusterIP

@@ -1,0 +1,442 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply antialiased bg-[#f4f5f9] text-slate-700 dark:bg-[#101017] dark:text-slate-300;
+}
+
+/* ── Eye-comfort contrast (operator 2026-07-11) ──────────────────────────────
+   Pull BOTH extremes inward so nothing is pure-white-on-near-black or
+   near-black-on-pure-white — that max-contrast pairing is what fatigues the
+   eye. Centralized here so it softens EVERY Hive page at once. The higher-
+   specificity selectors deliberately temper the rawest Tailwind utilities into
+   a calm off-white / soft-ink range while leaving the accent palette intact. */
+.dark .text-white, .dark .dark\:text-white { color: #e7e8f0; }
+.dark .text-gray-50, .dark .dark\:text-gray-50 { color: #e7e8f0; }
+.dark .text-gray-100, .dark .dark\:text-gray-100 { color: #dcdfe9; }
+.dark .text-gray-200, .dark .dark\:text-gray-200 { color: #cfd3df; }
+html:not(.dark) .text-gray-950 { color: #262c38; }
+html:not(.dark) .text-gray-900 { color: #2d3440; }
+html:not(.dark) .bg-white { background-color: #fbfcfe; }
+
+/* ── HV design system (HIVE-617) ─────────────────────────────────────────────
+   Hive shares the shizuha.com / cortex product-family polish: a deep console
+   sidebar with the honeycomb-amber identity, faint blueprint grid behind the
+   content, glassy elevated panels, mono kickers, glow accents. Both themes are
+   first-class: light = airy home-style; dark = deep cortex-style. Pages
+   compose these classes instead of raw gray-800 literals. */
+@layer components {
+  .hv-panel {
+    @apply rounded-2xl border border-gray-200/80 bg-white/90 dark:border-white/[0.075];
+    background-image: none;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 8px 24px -16px rgba(15, 23, 42, 0.10);
+  }
+  .dark .hv-panel {
+    /* Glassy elevated surface — layered gradient + glass top-edge + indigo-tinted
+       ambient shadow (matches shizuha.com console panels). */
+    background-color: transparent;
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012));
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.04), 0 18px 40px -22px rgba(0, 0, 0, 0.82), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+  .hv-panel-hover {
+    @apply transition-all duration-200 hover:-translate-y-0.5 hover:border-primary-400/40 dark:hover:border-primary-400/40;
+  }
+  .hv-panel-hover:hover {
+    box-shadow: 0 2px 4px rgba(15, 23, 42, 0.05), 0 16px 32px -14px rgba(99, 102, 241, 0.18);
+  }
+  .dark .hv-panel-hover:hover {
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.18), 0 26px 50px -24px rgba(49, 46, 129, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .hv-kicker {
+    @apply font-mono text-[10px] uppercase tracking-[0.22em] text-gray-400 dark:text-gray-500;
+  }
+  .hv-page-title {
+    @apply text-2xl font-bold tracking-tight text-slate-800 dark:text-[#e7e8f0];
+  }
+  .hv-stat-number {
+    @apply text-2xl font-bold tabular-nums tracking-tight text-slate-800 dark:text-[#e7e8f0];
+  }
+  .hv-grid-bg {
+    background-image:
+      radial-gradient(ellipse 70% 45% at 50% -8%, rgba(99, 102, 241, 0.06), transparent),
+      linear-gradient(rgba(100, 116, 139, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(100, 116, 139, 0.045) 1px, transparent 1px);
+    background-size: 100% 100%, 44px 44px, 44px 44px;
+  }
+  .dark .hv-grid-bg {
+    /* shizuha.com home's dark stage (HIVE-617 2026-07-11): deep #08080f with a
+       recessive grid. The indigo crown + violet floor glows live on a fixed
+       pseudo-layer (below) so the ambient depth stays put on long agent lists
+       WITHOUT the per-frame repaint cost of background-attachment:fixed. */
+    position: relative;
+    background-color: #101017;
+    background-image:
+      linear-gradient(rgba(148, 163, 184, 0.022) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.022) 1px, transparent 1px);
+    background-size: 46px 46px, 46px 46px;
+  }
+  .dark .hv-grid-bg::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-image:
+      radial-gradient(ellipse 90% 55% at 50% -12%, rgba(99, 102, 241, 0.13), transparent 60%),
+      radial-gradient(ellipse 55% 45% at 92% 108%, rgba(124, 58, 237, 0.16), transparent 60%);
+  }
+  .hv-input {
+    @apply rounded-lg border border-gray-200 bg-white text-gray-800 placeholder-gray-400 transition-colors focus:border-primary-500/60 focus:outline-none focus:ring-1 focus:ring-primary-500/30 dark:border-white/10 dark:bg-white/[0.04] dark:text-[#e7e8f0] dark:placeholder-gray-600;
+  }
+  .hv-chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-gray-50 px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-[0.16em] text-gray-500 dark:border-white/10 dark:bg-white/[0.03] dark:text-gray-400;
+  }
+  /* Console sidebar — deep near-black chrome in BOTH themes (the product
+     family's signature console), indigo crown glow + indigo active accent to
+     match shizuha.com. */
+  .hv-sidebar {
+    @apply border-r border-white/[0.06] bg-[#15151d] text-gray-300;
+    background-image: radial-gradient(ellipse 130% 26% at 50% 0%, rgba(99, 102, 241, 0.09), transparent 70%);
+  }
+  .hv-nav-item {
+    @apply flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-gray-400 transition-colors hover:bg-white/[0.05] hover:text-gray-100;
+  }
+  .hv-nav-item-active {
+    @apply font-medium text-primary-200;
+    background-image: linear-gradient(90deg, rgba(99, 102, 241, 0.16), rgba(99, 102, 241, 0.03));
+    box-shadow: inset 2px 0 0 0 #6366f1, 0 8px 20px -14px rgba(99, 102, 241, 0.6);
+  }
+  /* Three large cells stay legible at the 20px app-switcher size. Their
+     asymmetric 2-over-1 silhouette reads as a built hive instead of a flower. */
+  .hive-cell-hive-mark {
+    overflow: visible;
+    filter: drop-shadow(0 2px 4px rgba(245, 158, 11, 0.3));
+  }
+  .hive-cell-hive-cell {
+    fill: #fbbf24;
+    stroke: #fde68a;
+    stroke-width: 0.75;
+    stroke-linejoin: round;
+    vector-effect: non-scaling-stroke;
+  }
+  .hive-cell-hive-cell-gold {
+    fill: #f59e0b;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-100 dark:bg-gray-800;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 dark:bg-gray-600 rounded;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-400 dark:bg-gray-500;
+}
+
+@keyframes hive-live-ring {
+  0% {
+    opacity: 0.6;
+    transform: scale(0.9);
+  }
+  70% {
+    opacity: 0;
+    transform: scale(1.65);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.65);
+  }
+}
+
+@keyframes hive-signal {
+  0%, 100% {
+    transform: scaleY(0.35);
+    opacity: 0.45;
+  }
+  45% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+@keyframes hive-attention {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgb(239 68 68 / 0);
+  }
+  50% {
+    box-shadow: 0 0 0 3px rgb(239 68 68 / 0.14);
+  }
+}
+
+.hive-agent-card-live::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgb(34 197 94 / 0.06), transparent);
+  transform: translateX(-100%);
+  animation: hive-card-scan 4s ease-in-out infinite;
+}
+
+@keyframes hive-card-scan {
+  0%, 45% {
+    transform: translateX(-100%);
+  }
+  75%, 100% {
+    transform: translateX(100%);
+  }
+}
+
+.hive-agent-card-attention {
+  animation: hive-attention 1.6s ease-in-out infinite;
+}
+
+.hive-live-ring {
+  position: absolute;
+  inset: -3px;
+  border-radius: 0.95rem;
+  border: 2px solid rgb(34 197 94 / 0.45);
+  animation: hive-live-ring 1.7s ease-out infinite;
+}
+
+.hive-live-ring-thinking {
+  border-color: rgb(139 92 246 / 0.55);
+}
+
+.hive-live-ring-tool {
+  border-color: rgb(245 158 11 / 0.6);
+}
+
+.hive-live-ring-waste {
+  border-color: rgb(245 158 11 / 0.75);
+}
+
+.hive-agent-card-thinking::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgb(139 92 246 / 0.08), transparent);
+  transform: translateX(-100%);
+  animation: hive-card-scan 3.2s ease-in-out infinite;
+}
+
+.hive-agent-card-tool::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgb(245 158 11 / 0.08), transparent);
+  transform: translateX(-100%);
+  animation: hive-card-scan 2.4s ease-in-out infinite;
+}
+
+.hive-agent-card-waste {
+  animation: hive-attention 1.8s ease-in-out infinite;
+}
+
+@keyframes hive-think-shimmer {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 200% 50%; }
+}
+
+.hive-think-shimmer {
+  height: 4px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgb(139 92 246 / 0.15), rgb(167 139 250 / 0.95), rgb(139 92 246 / 0.15));
+  background-size: 200% 100%;
+  animation: hive-think-shimmer 1.15s linear infinite;
+}
+
+@keyframes hive-tool-track {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(220%); }
+}
+
+.hive-tool-track {
+  position: relative;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgb(245 158 11 / 0.18);
+}
+
+.hive-tool-track > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 40%;
+  border-radius: 999px;
+  background: rgb(245 158 11 / 0.9);
+  animation: hive-tool-track 0.9s ease-in-out infinite;
+}
+
+@keyframes hive-tool-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(180deg); }
+}
+
+.hive-tool-spin {
+  animation: hive-tool-spin 1.2s ease-in-out infinite;
+}
+
+.hive-life {
+  border: 1px solid;
+}
+
+.hive-life-live,
+.hive-life-working,
+.hive-life-responding {
+  color: rgb(21 128 61);
+  background: rgb(240 253 244);
+  border-color: rgb(187 247 208);
+}
+
+.hive-life-thinking {
+  color: rgb(91 33 182);
+  background: rgb(245 243 255);
+  border-color: rgb(221 214 254);
+}
+
+.dark .hive-life-thinking {
+  color: rgb(196 181 253);
+  background: rgb(76 29 149 / 0.28);
+  border-color: rgb(109 40 217);
+}
+
+.hive-life-tool {
+  color: rgb(180 83 9);
+  background: rgb(255 251 235);
+  border-color: rgb(253 230 138);
+}
+
+.dark .hive-life-tool {
+  color: rgb(252 211 77);
+  background: rgb(120 53 15 / 0.28);
+  border-color: rgb(180 83 9);
+}
+
+.hive-life-idle {
+  color: rgb(75 85 99);
+  background: rgb(249 250 251);
+  border-color: rgb(229 231 235);
+}
+
+.dark .hive-life-idle {
+  color: rgb(209 213 219);
+  background: rgb(31 41 55 / 0.55);
+  border-color: rgb(75 85 99);
+}
+
+.hive-life-waste {
+  color: rgb(146 64 14);
+  background: rgb(255 247 237);
+  border-color: rgb(253 186 116);
+}
+
+.dark .hive-life-waste {
+  color: rgb(253 186 116);
+  background: rgb(120 53 15 / 0.35);
+  border-color: rgb(217 119 6);
+}
+
+.dark .hive-life-live,
+.dark .hive-life-working,
+.dark .hive-life-responding {
+  color: rgb(134 239 172);
+  background: rgb(20 83 45 / 0.25);
+  border-color: rgb(22 101 52);
+}
+
+.hive-life-busy {
+  color: rgb(29 78 216);
+  background: rgb(239 246 255);
+  border-color: rgb(191 219 254);
+}
+
+.dark .hive-life-busy {
+  color: rgb(147 197 253);
+  background: rgb(30 58 138 / 0.25);
+  border-color: rgb(30 64 175);
+}
+
+.hive-life-attention {
+  color: rgb(185 28 28);
+  background: rgb(254 242 242);
+  border-color: rgb(254 202 202);
+}
+
+.dark .hive-life-attention {
+  color: rgb(252 165 165);
+  background: rgb(127 29 29 / 0.25);
+  border-color: rgb(153 27 27);
+}
+
+.hive-life-hibernate {
+  color: rgb(3 105 161);
+  background: rgb(240 249 255);
+  border-color: rgb(186 230 253);
+}
+
+.dark .hive-life-hibernate {
+  color: rgb(125 211 252);
+  background: rgb(12 74 110 / 0.28);
+  border-color: rgb(3 105 161);
+}
+
+.hive-life-stopped {
+  color: rgb(185 28 28);
+  background: rgb(254 242 242);
+  border-color: rgb(254 202 202);
+}
+
+.dark .hive-life-stopped {
+  color: rgb(252 165 165);
+  background: rgb(127 29 29 / 0.2);
+  border-color: rgb(127 29 29);
+}
+
+.hive-life-sleep,
+.hive-life-unknown {
+  color: rgb(75 85 99);
+  background: rgb(249 250 251);
+  border-color: rgb(229 231 235);
+}
+
+.dark .hive-life-sleep,
+.dark .hive-life-unknown {
+  color: rgb(209 213 219);
+  background: rgb(31 41 55 / 0.55);
+  border-color: rgb(75 85 99);
+}
+
+.hive-signal-bar {
+  display: inline-block;
+  width: 3px;
+  height: 14px;
+  border-radius: 999px;
+  background: currentColor;
+  transform-origin: bottom;
+  animation: hive-signal 1.05s ease-in-out infinite;
+}
+
+.hive-signal-bar:nth-child(2) {
+  animation-delay: 0.12s;
+}
+
+.hive-signal-bar:nth-child(3) {
+  animation-delay: 0.24s;
+}
+
+.hive-signal-bar:nth-child(4) {
+  animation-delay: 0.36s;
+}

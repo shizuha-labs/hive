@@ -1,0 +1,99 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-usage-metering
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: hive-usage-metering
+      rules:
+        # HIVE-408 fail-loud (PLAT-1254): a billing usage-metering record failed to
+        # persist — a missed/at-risk billing event. Metric is scraped from
+        # /hive/api/v1/internal/usage-metering/metrics. Any increase surfaces to the
+        # billing/analytics owner via Alertmanager→Connect DM (not log-only),
+        # carrying the failing producer source (runtime / cortex / storage).
+        - alert: HiveUsageMeteringFailure
+          expr: sum(increase(hive_usage_metering_failure_total[15m])) by (source) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive billing usage-metering failing (source={{ $labels.source }})"
+            description: >-
+              hive_usage_metering_failure_total is increasing for producer source
+              {{ $labels.source }} — one or more billable usage events failed to
+              record in the last 15m (HIVE-345/HIVE-319 metering). Producing
+              requests fail closed (returned upstream_unavailable), so billing
+              events are being MISSED, not silently mis-billed. Triage: hive-api pod
+              logs — grep 'usage metering failed'; check DB reachability and the
+              UsageEvent write path. A sustained rate means reconciliation will
+              under-bill until fixed. Runbook: agent-alert-remediation.
+        # Invariant probe (HIVE-408): the failure counter should always be scraped
+        # (emitted at 0 when healthy). If it goes absent while the hive-api is up,
+        # the exporter/endpoint is down — the fail-loud mechanism itself failed
+        # silently (the exact PLAT-1254 gap this closes).
+        - alert: HiveUsageMeteringMetricsAbsent
+          expr: absent(hive_usage_metering_failure_total)
+          for: 30m
+          labels:
+            severity: info
+            team: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive usage-metering failure metric absent"
+            description: >-
+              hive_usage_metering_failure_total has not been scraped for 30m — the
+              HIVE-408 fail-loud signal for billing usage metering is missing
+              (endpoint down or not scraped). Verify
+              /hive/api/v1/internal/usage-metering/metrics is reachable and scraped.
+        - alert: HiveUsageOutboxIdempotencyConflict
+          expr: sum(increase(hive_usage_outbox_delivery_total{outcome="conflict"}[15m])) by (source) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive usage outbox idempotency conflict (source={{ $labels.source }})"
+            description: >-
+              Metering Core rejected a producer outbox event because its immutable
+              CloudEvents source/id was replayed with a different payload. Delivery
+              is stopped for that row. Inspect UsageEventOutbox rows in conflict,
+              compare stored/supplied hashes, and notify the producer plus Metering
+              owners. Pulse: https://pulse.shizuha?task=PLAT-4482
+        - alert: HiveUsageOutboxDeliveryRetrying
+          expr: sum(increase(hive_usage_outbox_delivery_total{outcome="retry"}[15m])) by (source) > 2
+          for: 0m
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive usage outbox delivery repeatedly failing (source={{ $labels.source }})"
+            description: >-
+              More than two Metering Core outbox deliveries failed for this producer
+              source in 15m. Rows remain durable and retry with backoff, but billing
+              ingestion is delayed. Check the dispatcher Job logs, Metering endpoint,
+              auth, and UsageEventOutbox.last_error. Pulse: https://pulse.shizuha?task=PLAT-4482
+        - alert: HiveUsageOutboxDispatcherStale
+          expr: hive_usage_outbox_last_dispatch_timestamp_seconds == 0 or (time() - hive_usage_outbox_last_dispatch_timestamp_seconds > 300)
+          for: 10m
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive usage outbox dispatcher has stopped"
+            description: >-
+              No completed usage-outbox sweep has been observed for more than five
+              minutes. Verify CronJob hive-usage-outbox-dispatcher exists, its image
+              matches the deployed Hive image, and recent Jobs complete. Pending
+              billable events are not reaching Metering Core until restored.

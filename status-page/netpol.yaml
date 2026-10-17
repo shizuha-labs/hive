@@ -1,0 +1,160 @@
+# PLAT-2695 — Data-isolation NetworkPolicies for ns `customer`.
+# Source: PLAT-1324 infra security posture audit (2026-07-03).
+#
+# ns `customer` currently holds only `status-page` (nginx :80 + a status-generator
+# sidecar that polls Prometheus). Low blast radius, but the namespace is
+# customer-designated and should be isolated by default so future customer
+# workloads inherit a deny-by-default ingress posture.
+#
+# POSTURE: default-deny INGRESS (PLAT-2695) + default-deny EGRESS (PLAT-2894).
+# The egress set captures the live-applied state of 2026-07-04: DNS, intra-ns,
+# and Prometheus (the generator sidecar's only external dependency).
+#
+# ── APPLY / VERIFY RUNBOOK (operator with kubectl) ──
+#   1. Confirm node InternalIP / probe source (see cortex-netpol runbook). The
+#      status-page pod uses httpGet probes on :80 — allow-node-healthchecks must
+#      cover the kubelet source.
+#   2. Apply: kubectl apply -f status-page/netpol.yaml
+#   3. Verify within 60s: `kubectl get pods -n customer` Ready; https://status.shizuha.com
+#      still loads (ingress-nginx path); the generator sidecar still updates
+#      (egress unrestricted).
+#   4. Rollback: kubectl delete -f status-page/netpol.yaml
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+    shizuha.io/task: plat-2695
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-node-healthchecks
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 100.64.0.0/10 }   # tailnet — k3s node InternalIP (s1)
+        - ipBlock: { cidr: 10.200.10.0/24 }  # gx10 cluster mgmt LAN
+---
+# HTTP (:80) reachable from any namespace + cluster/private source ranges so the
+# ingress-nginx path (status.shizuha.com) and svclb/node sources keep working.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-http-ingress
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+        - ipBlock: { cidr: 10.0.0.0/8 }
+        - ipBlock: { cidr: 172.16.0.0/12 }
+        - ipBlock: { cidr: 192.168.0.0/16 }
+        - ipBlock: { cidr: 100.64.0.0/10 }
+      ports:
+        - { protocol: TCP, port: 80 }
+---
+# ── EGRESS HARDENING (PLAT-2894) — as applied live 2026-07-04 18:41Z ──
+# 5) Default-deny all egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+    shizuha.io/task: plat-2894
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+---
+# 6) DNS to CoreDNS only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# 7) Intra-namespace egress (nginx <-> generator sidecar paths).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace-egress
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {}
+---
+# 8) Prometheus (monitoring ns) — the status generator's only external call.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-egress
+  namespace: customer
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: egress-hardening
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { protocol: TCP, port: 9090 }

@@ -1,0 +1,97 @@
+# On-demand fleet reconciler — BOOTSTRAP REFERENCE ONLY, do NOT hand-apply.
+#
+# Since 2026-07-11 the live CronJob is CI-owned: .forgejo/workflows/deploy.yml
+# re-renders it from the deployed pod spec on every deploy (unsuspended, with
+# --apply, current image). Hand-applying this file would roll the live cron
+# back to suspended + dry-run + a stale image pin.
+#
+# Historical activation gates (all met 2026-07-11, dry-run reviewed):
+#   1. the Hive image includes `reconcile_on_demand_agents` (+ archived-agent exclusion);
+#   2. a non-human Pulse service token is available as HIVE_PULSE_API_TOKEN; and
+#   3. operators have reviewed several dry-run outputs.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hive-on-demand-reconciler
+  namespace: shizuha-hive
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: on-demand-reconciler
+spec:
+  suspend: true
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hive
+            app.kubernetes.io/name: hive
+            app.kubernetes.io/component: on-demand-reconciler
+        spec:
+          restartPolicy: Never
+          serviceAccountName: hive-controller
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: shizuha.io/platform
+                        operator: In
+                        values: ["true"]
+                      - key: kubernetes.io/hostname
+                        operator: NotIn
+                        values: ["s1", "i9-ws"]
+          tolerations:
+            - key: node.shizuha/workstation
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: reconciler
+              image: localhost:30500/shizuha-hive:hive-8f413da
+              imagePullPolicy: Always
+              command:
+                - python
+                - manage.py
+                - reconcile_on_demand_agents
+                - --reconcile-org-memberships
+                - --reconcile-capabilities
+              env:
+                - name: DB_NAME
+                  value: shizuha_hive
+                - name: DB_USER
+                  value: postgres
+                - name: DB_PASSWORD
+                  valueFrom: {secretKeyRef: {name: shizuha-infra-postgresql, key: postgres-password}}
+                - name: DB_HOST
+                  value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+                - name: DB_PORT
+                  value: "5432"
+                - name: JWT_SECRET_KEY
+                  valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+                - name: SHIZUHA_JWT_SIGNING_KEY
+                  valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+                - name: SHIZUHA_PLATFORM_URL
+                  value: http://shizuha-nginx.shizuha.svc.cluster.local
+                - name: HIVE_PULSE_API_URL
+                  value: http://shizuha-pulse.shizuha.svc.cluster.local:8002/api
+                - name: HIVE_PULSE_API_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: hive-secrets
+                      key: HIVE_PULSE_API_TOKEN
+                      optional: true
+                - name: RUNTIME_FLEET_API_URL
+                  value: http://shizuha-runtime-fleet.rt-fleet.svc.cluster.local:8016
+                - name: RUNTIME_FLEET_CONTROL_URL
+                  value: http://shizuha-runtime-fleet-control.rt-fleet.svc.cluster.local:8016
+                - name: RUNTIME_FLEET_CONTROL_SECRET
+                  valueFrom: {secretKeyRef: {name: runtime-fleet-control-secret, key: secret}}
+                - name: RUNTIME_FLEET_API_TIMEOUT
+                  value: "15"
