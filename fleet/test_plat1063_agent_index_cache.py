@@ -109,8 +109,11 @@ class AgentIndexCacheTests(TestCase):
         # request never runs the fan-out inline once a payload exists.
         payload = [{'agent_username': 'a'}]
         build, calls = self._counting_builder(payload)
-        aic.get_or_build('ext1', build)          # cold miss -> build #1 (inline)
-        aic.get_or_build('ext1', build)          # hit
+        aic.get_or_build('ext1', build)          # cold background build
+        # Payload publication precedes single-flight cleanup. Establish the
+        # completed warm baseline before testing a separate invalidation.
+        self._join_revalidators()
+        self.assertEqual(aic.get_or_build('ext1', build)[1], 'hit')
         aic.invalidate('status change')
         out, st = aic.get_or_build('ext1', build)
         self.assertEqual(st, 'stale-revalidating')
@@ -121,6 +124,58 @@ class AgentIndexCacheTests(TestCase):
         self.assertTrue(self._wait_for(
             lambda: aic.get_or_build('ext1', build)[1] == 'hit'))
         self.assertEqual(calls[0], 2)
+
+    def test_invalidation_during_cold_worker_preserves_generation_until_next_read(self):
+        # Exercise both publication orderings with the real background worker.
+        # An old generation may publish last-good, but cannot become a fresh
+        # hit for the invalidated generation. A subsequent read must rearm it.
+        for hold_before_store in (True, False):
+            with self.subTest(hold_before_store=hold_before_store):
+                self._join_revalidators()
+                cache.clear()
+                entered, release = threading.Event(), threading.Event()
+                self.addCleanup(release.set)
+                calls = []
+                store = aic._store_payload
+
+                def build():
+                    calls.append(len(calls) + 1)
+                    return [{'generation': calls[-1]}]
+
+                def held_store(*args):
+                    if len(calls) == 1:
+                        if not hold_before_store:
+                            store(*args)
+                        entered.set()
+                        if not release.wait(10):
+                            raise AssertionError('test did not release the first publisher')
+                        if hold_before_store:
+                            store(*args)
+                    else:
+                        store(*args)
+
+                try:
+                    with patch.object(aic, '_store_payload', side_effect=held_store):
+                        aic.get_or_build('ext1', build)
+                        self.assertTrue(entered.wait(5))
+                        previous_version = aic._current_version()
+                        aic.invalidate('while cold publisher is in flight')
+                        invalidated_version = aic._current_version()
+                        self.assertEqual(invalidated_version, previous_version + 1)
+                        aic.get_or_build('ext1', build)
+                        self.assertEqual(calls, [1], 'old worker still owns single-flight')
+                        release.set()
+                        self._join_revalidators()
+                        self.assertEqual(aic._current_version(), invalidated_version)
+                        out, state = aic.get_or_build('ext1', build)
+                        self.assertEqual((out, state), ([{'generation': 1}], 'stale-revalidating'))
+                        self._join_revalidators()
+                        self.assertEqual(aic.get_or_build('ext1', build),
+                                         ([{'generation': 2}], 'hit'))
+                        self.assertEqual(calls, [1, 2])
+                finally:
+                    release.set()
+                    self._join_revalidators()
 
     def test_runtime_observation_burst_bumps_generation_once(self):
         aic.invalidate_observation('daemon-link snapshot')
