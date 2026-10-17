@@ -288,3 +288,101 @@ class GoldenPathArmingTests(TestCase):
         self.assertIn("hive-golden-path-validation", workflow)
         self.assertIn("--from=cronjob/hive-golden-path-validation", workflow)
         self.assertIn("hive-golden-path-alerts.yaml", workflow)
+
+
+class GoldenPathRenderedTeardownTests(TestCase):
+    """Execute the fleet heredoc, then its command parser and real teardown.
+
+    Only transport destinations are mapped to an owned loopback server: public
+    internal routes return 404, while the private ID route accepts the fixture.
+    No signup, tenant creation, or production request is performed.
+    """
+
+    def render(self, inherited=()):
+        import json
+        import re
+        import subprocess
+        import sys
+        import tempfile
+
+        source = RING_RELEASE_FLEET.read_text()
+        match = re.search(
+            r"python3 - /tmp/hive-deploy-post-rollout\.json <<'PY' > /tmp/hive-golden-path-cronjob\.json\n(.*?)\nPY",
+            source, re.S,
+        )
+        self.assertIsNotNone(match, "actual fleet renderer must be exercised")
+        deployment = {"spec": {"template": {"spec": {"containers": [{
+            "name": "hive", "image": "reviewed-fixture-image", "env": list(inherited),
+        }]}}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "deployment.json"
+            path.write_text(json.dumps(deployment))
+            result = subprocess.run(
+                [sys.executable, "-", str(path)], input=match.group(1),
+                text=True, capture_output=True, check=True, timeout=10,
+            )
+        return json.loads(result.stdout)["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+
+    def test_emitted_command_teardown_uses_private_id_route(self):
+        import os
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import urlsplit
+        import requests
+        from claws.golden_path_validation import GoldenPathHarness, HarnessConfig, StageStatus
+
+        emitted = self.render()
+        self.assertEqual(emitted["command"], ["python", "manage.py", "run_golden_path_cycle"])
+        env = {item["name"]: item["value"] for item in emitted["env"] if "value" in item}
+        with mock.patch.dict(os.environ, env, clear=True):
+            options = vars(Command().create_parser("manage.py", "run_golden_path_cycle").parse_args([]))
+        calls = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_DELETE(self):
+                calls.append((self.path, self.headers.get("X-Validation-Runtime-Token")))
+                self.send_response(200 if self.path == "/private/api/internal/test-tenants/7001/deprovision/" else 404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{}')
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}"
+        class LocalTransport(requests.adapters.HTTPAdapter):
+            def send(self, request, **kwargs):
+                request = request.copy()
+                private = request.url.startswith("http://shizuha-id.shizuha.svc.cluster.local:8001/")
+                request.url = base + ("/private" if private else "/public") + urlsplit(request.url).path
+                kwargs["proxies"] = {}
+                return super().send(request, **kwargs)
+        session = requests.Session()
+        self.addCleanup(session.close)
+        session.trust_env = False
+        session.mount("http://", LocalTransport())
+        session.mount("https://", LocalTransport())
+        harness = GoldenPathHarness(HarnessConfig(
+            run_id="generated-private-id-fixture", id_base_url=options["id_base_url"],
+            id_internal_base_url=options["id_internal_base_url"],
+            validation_runtime_token="synthetic-validation-token", allow_live_side_effects=True,
+        ), session=session)
+        harness.context["user_id"] = 7001
+        result = harness.teardown()
+        self.assertEqual(result.status, StageStatus.PASS, result)
+        self.assertEqual(calls, [("/private/api/internal/test-tenants/7001/deprovision/", "synthetic-validation-token")])
+
+    def test_renderer_replaces_inherited_internal_identity_once(self):
+        for inherited in (
+            {"name": "SHIZUHA_ID_INTERNAL_URL", "value": "https://public.invalid/id"},
+            {"name": "SHIZUHA_ID_INTERNAL_URL", "valueFrom": {"secretKeyRef": {"name": "unrelated", "key": "url"}}},
+        ):
+            with self.subTest(inherited=list(inherited)):
+                emitted = self.render([inherited, {"name": "UNRELATED_FIXTURE", "value": "preserved"}])
+                selected = [item for item in emitted["env"] if item["name"] == "SHIZUHA_ID_INTERNAL_URL"]
+                self.assertEqual(selected, [{"name": "SHIZUHA_ID_INTERNAL_URL", "value": "http://shizuha-id.shizuha.svc.cluster.local:8001"}])
+                self.assertIn({"name": "UNRELATED_FIXTURE", "value": "preserved"}, emitted["env"])
+                token = next(item for item in emitted["env"] if item["name"] == "VALIDATION_RUNTIME_TOKEN")
+                self.assertEqual(token["valueFrom"]["secretKeyRef"], {"name": "hive-golden-path-validation", "key": "validation-runtime-token"})

@@ -2711,10 +2711,11 @@ for field in (
     container.pop(field, None)
 
 env = [e for e in container.get("env", []) if e.get("name") not in {
-    "ID_BASE_URL", "HIVE_BASE_URL", "VALIDATION_RUNTIME_TOKEN",
+    "ID_BASE_URL", "SHIZUHA_ID_INTERNAL_URL", "HIVE_BASE_URL", "VALIDATION_RUNTIME_TOKEN",
 }]
 env.extend([
     {"name": "ID_BASE_URL", "value": "https://shizuha.com/id"},
+    {"name": "SHIZUHA_ID_INTERNAL_URL", "value": "http://shizuha-id.shizuha.svc.cluster.local:8001"},
     {"name": "HIVE_BASE_URL", "value": "https://shizuha.com"},
     # Clause 5: provisioned OUTSIDE this workload and consumed
     # fail-closed. Required (not optional) so a missing Secret stops
