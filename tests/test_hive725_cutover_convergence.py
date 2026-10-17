@@ -85,6 +85,12 @@ def endpoint_slice(*names, terminating=()):
 
 
 class Hive725CutoverConvergenceTests(unittest.TestCase):
+    def test_native_ci_runs_cutover_observer_regressions(self):
+        for name in ("deploy.yml", "premerge.yml"):
+            with self.subTest(workflow=name):
+                workflow = (ROOT / ".forgejo/workflows" / name).read_text()
+                self.assertIn("/app/.venv/bin/python tests/test_hive725_cutover_convergence.py", workflow)
+
     def test_exact_enforcing_pods_and_endpoints_pass(self):
         result = module.evaluate_snapshot(
             deployment(),
@@ -92,6 +98,58 @@ class Hive725CutoverConvergenceTests(unittest.TestCase):
             endpoint_slice("hive-a", "hive-b"),
         )
         self.assertEqual(result[0], True, result[1])
+
+    def test_terminal_owned_pods_do_not_count_as_live_cutover_members(self):
+        for phase in ("Succeeded", "Failed"):
+            for deleting in (False, True):
+                with self.subTest(phase=phase, deleting=deleting):
+                    old = pod("hive-history", enforce="false", ready=False, deleting=deleting)
+                    old["status"]["phase"] = phase
+                    old["spec"]["containers"][0]["image"] = "registry/hive:previous"
+                    result = module.evaluate_snapshot(
+                        deployment(), {"items": [pod("hive-a"), pod("hive-b"), old]},
+                        endpoint_slice("hive-a", "hive-b"),
+                    )
+                    self.assertTrue(result[0], result[1])
+                    self.assertEqual(module.orphaned_image_mismatch_pods(
+                        deployment(), {"items": [pod("hive-a"), pod("hive-b"), old]},
+                    ), [])
+
+    def test_terminal_pod_still_present_in_service_endpoints_is_refused(self):
+        old = pod("hive-history", ready=False)
+        old["status"]["phase"] = "Succeeded"
+        result = module.evaluate_snapshot(
+            deployment(), {"items": [pod("hive-a"), pod("hive-b"), old]},
+            endpoint_slice("hive-a", "hive-b", "hive-history"),
+        )
+        self.assertFalse(result[0])
+        self.assertIn("do not equal", result[1])
+
+    def test_terminal_members_never_substitute_for_missing_live_replica(self):
+        old = pod("hive-history")
+        old["status"]["phase"] = "Failed"
+        result = module.evaluate_snapshot(
+            deployment(), {"items": [pod("hive-a"), old]}, endpoint_slice("hive-a"),
+        )
+        self.assertFalse(result[0])
+        self.assertIn("pods=1 desired=2", result[1])
+
+    def test_nonterminal_old_image_remains_blocking(self):
+        for phase in ("Pending", "Running", "Unknown", None):
+            with self.subTest(phase=phase):
+                old = pod("hive-old")
+                if phase is not None:
+                    old["status"]["phase"] = phase
+                old["spec"]["containers"][0]["image"] = "registry/hive:previous"
+                result = module.evaluate_snapshot(
+                    deployment(), {"items": [pod("hive-a"), pod("hive-b"), old]},
+                    endpoint_slice("hive-a", "hive-b"),
+                )
+                self.assertFalse(result[0])
+                self.assertIn("image does not match", result[1])
+                self.assertEqual(module.orphaned_image_mismatch_pods(
+                    deployment(), {"items": [pod("hive-a"), pod("hive-b"), old]},
+                ), ["hive-old"])
 
     def test_retiring_phase_one_pod_holds_cutover(self):
         result = module.evaluate_snapshot(

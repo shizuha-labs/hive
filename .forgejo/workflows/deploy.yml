@@ -317,6 +317,7 @@ jobs:
                         /app/.venv/bin/python tests/test_explicit_credential_configuration.py
                         /app/.venv/bin/python manage.py check --deploy 2>/dev/null || /app/.venv/bin/python manage.py check
                         /app/.venv/bin/python tests/test_hive707_canary_teardown.py
+                        /app/.venv/bin/python tests/test_hive725_cutover_convergence.py
                         /app/.venv/bin/python tests/test_hive_api_service_selector.py
                         /app/.venv/bin/python tests/test_deployment_event_recorder.py
                         /app/.venv/bin/python tests/test_hive623_pulse_preflight.py

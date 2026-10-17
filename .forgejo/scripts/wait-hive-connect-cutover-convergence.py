@@ -71,6 +71,11 @@ def orphaned_image_mismatch_pods(
 
     orphans: list[str] = []
     for pod in pods.get("items", []):
+        # Completed Pods may remain owned by old ReplicaSets for history. They
+        # cannot serve or satisfy replicas; EndpointSlice equality below still
+        # refuses any terminal Pod that remains a Service traffic target.
+        if pod.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+            continue
         owners = pod.get("metadata", {}).get("ownerReferences") or []
         if not any(owner.get("kind") == "ReplicaSet" for owner in owners):
             continue
@@ -116,6 +121,11 @@ def evaluate_snapshot(
 
     exact_pods: dict[str, dict[str, Any]] = {}
     for pod in pods.get("items", []):
+        # Completed Pods may remain owned by old ReplicaSets for history. They
+        # cannot serve or satisfy replicas; EndpointSlice equality below still
+        # refuses any terminal Pod that remains a Service traffic target.
+        if pod.get("status", {}).get("phase") in ("Succeeded", "Failed"):
+            continue
         owners = pod.get("metadata", {}).get("ownerReferences") or []
         if not any(owner.get("kind") == "ReplicaSet" for owner in owners):
             continue
