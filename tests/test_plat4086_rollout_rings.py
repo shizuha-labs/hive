@@ -3614,6 +3614,26 @@ class RingFenceContractTests(InstallationProfileCases, unittest.TestCase):
 
     def test_partial_fleet_failure_restores_backend_and_later_refresh_target(self):
         r, m = self.recovery_module, self.fence_module
+        # The real rollback must work under its declared Role/Binding; an
+        # omnipotent fake hid the missing hive-api grant in production.
+        documents = [item for item in yaml.safe_load_all(
+            (ROOT / "k8s/hive-ring-executor-rbac.yaml").read_text()
+        ) if item]
+        role = next(item for item in documents if item["kind"] == "Role"
+                    and item["metadata"] == {"name": "hive-ring-recover", "namespace": "shizuha-hive"})
+        binding = next(item for item in documents if item["kind"] == "RoleBinding"
+                       and item["metadata"] == role["metadata"])
+        self.assertEqual(binding["roleRef"]["name"], role["metadata"]["name"])
+        self.assertEqual(binding["subjects"], [{
+            "kind": "ServiceAccount", "name": "hive-ring-recover", "namespace": "origin",
+        }])
+        def allows(verb, name):
+            return any("apps" in rule["apiGroups"] and "deployments" in rule["resources"]
+                       and verb in rule["verbs"] and name in rule.get("resourceNames", [])
+                       for rule in role["rules"])
+        for verb, name in (("create", "hive-api"), ("delete", "hive-api"),
+                           ("patch", "unrelated-deployment")):
+            self.assertFalse(allows(verb, name), (verb, name))
         holder = self.holder(m)
         bad_image = f"localhost:30500/shizuha-hive:hive-{SHA[:7]}"
         good_image = f"localhost:30500/shizuha-hive:hive-{OLD_SHA[:7]}"
@@ -3655,6 +3675,8 @@ class RingFenceContractTests(InstallationProfileCases, unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "", "")
 
             def json_patch(inner, _namespace, _resource, name, operations):
+                if _namespace != "shizuha-hive" or _resource != "deployment" or not allows("patch", name):
+                    raise m.FenceError("source Role denies the rollback target")
                 inner.patched.append(name)
                 target = inner.deployments[name]
                 for operation in operations:
@@ -3696,6 +3718,9 @@ class RingFenceContractTests(InstallationProfileCases, unittest.TestCase):
             return_value=subprocess.CompletedProcess([], 0, "", ""),
         ):
             r.rollback_fleet(fence)
+        for name in ("hive", "hive-api", "hive-codex-refresh"):
+            self.assertTrue(allows("get", name), name)
+            self.assertTrue(allows("watch", name), name)
         self.assertEqual(fence.api.patched, ["hive", "hive-codex-refresh", "hive-api"])
         self.assertEqual(
             fence.api.deployments["hive"]["spec"]["template"]["spec"]["containers"][0]["image"],

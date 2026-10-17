@@ -190,7 +190,7 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    resourceNames: ["hive", "hive-canary", "hive-codex-refresh"]
+    resourceNames: ["hive", "hive-api", "hive-canary", "hive-codex-refresh"]
     verbs: ["get", "watch", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
