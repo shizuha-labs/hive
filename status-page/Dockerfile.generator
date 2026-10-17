@@ -1,0 +1,8 @@
+# HIVE-333 P1-1: build source for the status-generator image (k8s.yaml sidecar).
+# Runs as a sidecar next to nginx: regenerate status.json into the shared
+# emptyDir every 5 minutes so the public page reflects live Prometheus state.
+FROM python:3.12-alpine
+WORKDIR /app
+COPY generate-status.py /app/generate-status.py
+ENV STATUS_DIR=/data
+CMD ["sh", "-c", "while true; do python /app/generate-status.py; sleep 300; done"]

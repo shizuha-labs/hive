@@ -1,0 +1,246 @@
+# Daemon-fleet tenant isolation (PLAT-4235 hardening, operator 2026-07-13).
+# Applies to every agent pod in shizuha-fleet (podSelector: shizuha.io/agent Exists),
+# which EXCLUDES the fleet-daemon-k8s operator pod (no shizuha.io/agent label).
+#
+# Property: agents may reach ONLY the platform gateway, ID account service,
+# Origin source/CI plane, hive coordinator, Cortex, search, the k8s API
+# (RBAC-gated), DNS, and the public internet — NOT each other (no lateral
+# movement) and NOT arbitrary internal services. Verified live via recon
+# (standard) + ichi (infra/k8s-API) canaries before rollout.
+#
+# Egress allowlist derived from the live agent env:
+#   SHIZUHA_PLATFORM_URL / BACKEND_URL = shizuha-nginx.shizuha:80 (platform + MCP + id)
+#   MCP_AUTH_PROXY_COORDINATOR_URL     = hive.shizuha-hive:8030 (model-token)
+#   Cortex LLM = shizuha-cortex:8040 · Search = shizuha-search.search:80 (->8090)
+#   Direct ID = shizuha-id.shizuha:8001/18102 (startup account + MCP identity)
+#   Origin = forgejo-http/forgejo-ssh/ci-logs.origin:3000/22/8080
+#   Package/image caches = registry.registry:5000 · mirror-dockerhub.registry:5000
+#     · pip-cache.registry:80 · apt-cache.registry:3142 · npm-cache.registry:4873
+#   Public TLS edge = shizuha/shizuha-edge:443 (post-DNAT endpoint selector)
+#     plus 192.168.0.250:443 (exact pre-DNAT VIP only)
+#   k8s API = node host-plane 10.200.10.0/24:6443 (+ 10.43.0.1 VIP) · WAN 443/80
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-agent-default-deny
+  namespace: shizuha-fleet
+  labels: { app.kubernetes.io/managed-by: shizuha-hive, shizuha.io/policy: fleet-isolation }
+spec:
+  podSelector:
+    matchExpressions: [ { key: shizuha.io/agent, operator: Exists } ]
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-agent-allow-egress
+  namespace: shizuha-fleet
+  labels: { app.kubernetes.io/managed-by: shizuha-hive, shizuha.io/policy: fleet-isolation }
+spec:
+  podSelector:
+    matchExpressions: [ { key: shizuha.io/agent, operator: Exists } ]
+  policyTypes: [Egress]
+  egress:
+    - to:  # DNS (CoreDNS)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: kube-system } }
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports: [ { protocol: UDP, port: 53 }, { protocol: TCP, port: 53 } ]
+    - to: [ { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha } } } ]
+      ports: [ { protocol: TCP, port: 80 } ]
+    - to:  # direct ID account/login + MCP identity (service DNAT uses target ports)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha } }
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: shizuha-id
+              app.kubernetes.io/component: backend
+      ports: [ { protocol: TCP, port: 8001 }, { protocol: TCP, port: 18102 } ]
+    - to:  # Origin HTTPS/git, SSH, and ci-logs (service DNAT uses pod target ports)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: origin } }
+          podSelector: { matchLabels: { app: forgejo } }
+      ports:
+        - { protocol: TCP, port: 3000 }
+        - { protocol: TCP, port: 22 }
+        - { protocol: TCP, port: 8080 }
+    - to:  # dockerd's configured Docker Hub pull-through cache
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: shizuha-registry
+              app.kubernetes.io/component: mirror-dockerhub
+      ports: [ { protocol: TCP, port: 5000 } ]
+    - to:  # Internal image registry used by fleet build/runtime recipes (PLAT-5022)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: shizuha-registry
+              app.kubernetes.io/component: registry
+      ports: [ { protocol: TCP, port: 5000 } ]
+    - to:  # PIP_INDEX_URL / UV_INDEX_URL configured on fleet runtimes
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector: { matchLabels: { app: pip-cache } }
+      ports: [ { protocol: TCP, port: 80 } ]
+    - to:  # APT_CACHE_URL propagated into containerized dependency bootstraps
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector: { matchLabels: { app: apt-cache } }
+      ports: [ { protocol: TCP, port: 3142 } ]
+    - to:  # NPM_CONFIG_REGISTRY configured on fleet runtimes (PLAT-5022). The
+           # sibling pip/apt caches were allowlisted here; npm never was, so every
+           # `npm ci`/`npm install` from an agent pod failed with an instant
+           # ECONNREFUSED that reads exactly like the cache being down. It is not:
+           # npm-cache has ready endpoints and is healthy. Same shape, same ports
+           # field, same podSelector convention as the two rules above.
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector: { matchLabels: { app: npm-cache } }
+      ports: [ { protocol: TCP, port: 4873 } ]
+    - to:  # APK cache used by Alpine-based CI/runtime containers (PLAT-4692)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector: { matchLabels: { app: apk-cache } }
+      ports: [ { protocol: TCP, port: 80 } ]
+    - to:  # Raw GitHub content cache used by source/archive bootstraps (PLAT-4692)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: registry } }
+          podSelector: { matchLabels: { app: git-raw-cache } }
+      ports: [ { protocol: TCP, port: 80 } ]
+    - to:  # Shared public TLS edge; kube-router evaluates LoadBalancer traffic post-DNAT
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: shizuha-edge } }
+      ports: [ { protocol: TCP, port: 443 } ]
+    - to:  # Exact pre-DNAT VIP; keep the private-CIDR exception closed otherwise
+        - ipBlock: { cidr: 192.168.0.250/32 }
+        - ipBlock: { cidr: 192.168.88.250/32 }
+      ports: [ { protocol: TCP, port: 443 } ]
+    - to: [ { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha-hive } } } ]
+      ports: [ { protocol: TCP, port: 8030 } ]
+    - to:  # Private per-agent browser MCP workers (BRW-12 / operator 2026-07-29).
+           # One Service+Deployment per agent in shizuha-browser; agents must reach
+           # ONLY that plane (not lateral agent-to-agent). Shared multi-tenant
+           # browser is intentionally not the default path.
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha-browser } }
+      ports: [ { protocol: TCP, port: 18116 } ]
+    - to: [ { namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha-cortex } } } ]
+      ports: [ { protocol: TCP, port: 8040 } ]
+    - to:  # SEARCH_BASE_URL on every fleet runtime. kube-router evaluates egress
+           # AFTER kube-proxy DNAT, and shizuha-search is Service :80 -> targetPort
+           # 8090, so the port-80-only rule never matched a real packet: every
+           # admitted agent's web_search got an instant ECONNREFUSED that reads
+           # exactly like the search backend being down. It is not — shizuha-search
+           # has ready endpoints (10.42.16.133:8090). provision_user_daemon.py
+           # already carries both ports; only this manifest half shipped (PLAT-6007,
+           # same shape as the PLAT-5022 registry:5000 miss). Keep 80 so the two
+           # sources stay in lockstep.
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: search } }
+      ports: [ { protocol: TCP, port: 80 }, { protocol: TCP, port: 8090 } ]
+    - to:  # QA Cuttlefish ADB (agent-driven live APK verification)
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: bench } }
+          podSelector: { matchLabels: { app: android-emulator } }
+      ports: [ { protocol: TCP, port: 6520 } ]
+    - to:  # k8s API server (RBAC-gated; infra agents reach it via SA token)
+        - ipBlock: { cidr: 10.200.10.0/24 }
+        - ipBlock: { cidr: 10.43.0.1/32 }
+      ports: [ { protocol: TCP, port: 6443 }, { protocol: TCP, port: 443 } ]
+    - to:  # s1 bridge services (PLAT-8489): ori MCP :9500, google-drive MCP :9600,
+           # fleet-control socat :8016 — hostNetwork pods on s1, reached via the
+           # tailnet address (WAN rule excludes 100.64.0.0/10) or the node LAN IP.
+           # /32 node-set + named ports per the PLAT-6041 constraints above.
+        - ipBlock: { cidr: 100.64.0.3/32 }
+        - ipBlock: { cidr: 192.168.0.136/32 }
+        - ipBlock: { cidr: 192.168.88.136/32 }
+      ports: [ { protocol: TCP, port: 9500 }, { protocol: TCP, port: 9600 }, { protocol: TCP, port: 8016 } ]
+    - to:  # WAN (public internet only; private/cluster/tailnet CIDRs excluded)
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10 ]
+      ports: [ { protocol: TCP, port: 443 }, { protocol: TCP, port: 80 } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-agent-allow-platform-ingress
+  namespace: shizuha-fleet
+  labels: { app.kubernetes.io/managed-by: shizuha-hive, shizuha.io/policy: fleet-isolation }
+spec:
+  # expose_http agents (16 have Services) are reached via the platform gateway,
+  # never by peer agents. Allow ingress only from platform namespaces; kubelet
+  # health probes come from the node and are not NetworkPolicy-governed.
+  podSelector:
+    matchExpressions: [ { key: shizuha.io/agent, operator: Exists } ]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha } }
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: shizuha-hive } }
+    # CON-339/PLAT-6006: kube-prometheus Prometheus lives in `monitoring`, so
+    # every NetworkPolicy-admitted agent pod was unscrapeable on its runtime
+    # metrics port (PodMonitor monitoring/shizuha-agent-runtime-metrics).
+    # TCP/9103 only, scoped to the Prometheus workload; every other namespace,
+    # port and direction stays default-deny.
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: prometheus } }
+      ports: [ { protocol: TCP, port: 9103 } ]
+---
+# Live S2S: Voice proxies browser PCM to the agent's SCLI gateway
+# (`/v1/voice/realtime`). Only grok-voice seats carry shizuha.io/voice-s2s=true
+# (Hive provisioner). TCP/8080 only, from the public Voice proxy pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-agent-allow-voice-s2s-ingress
+  namespace: shizuha-fleet
+  labels: { app.kubernetes.io/managed-by: shizuha-hive, shizuha.io/policy: fleet-isolation }
+spec:
+  podSelector:
+    matchLabels: { shizuha.io/voice-s2s: "true" }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: voice }
+          podSelector:
+            matchLabels: { app: shizuha-voice }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# PLAT-4729 / PLAT-6041 (DECIDED, wiki SDR 74b498f3): restore the privileged
+# host-plane SSH egress class inside the SHARED shizuha-fleet namespace.
+#
+# Why it lives here and not in the provisioner: the per-agent
+# allow-hostplane-ssh-* policies templated in 20-devops-isolation.yaml are
+# emitted by fleet/provisioner.py into fleet-<username> namespaces, and that
+# plane has no members — `isolated` is set on no row and is immutable after
+# provisioning, so the DevOps seats live in shizuha-fleet like everyone else.
+# The shared-namespace policy set is declarative and applied by
+# .forgejo/workflows/deploy-fleet-networkpolicy.yml, which is what the decision
+# means by "Hive renders … no hand-applied objects, no self-grant".
+#
+# Without this policy a DevOps seat has ZERO tailnet reach: the WAN rule above
+# carries `except: [… 100.64.0.0/10]`, so 100.64.0.3:22 is default-denied.
+# NetworkPolicy allows are additive, so this narrows nothing that already works.
+#
+# Constraints that are load-bearing, not stylistic (PLAT-6041 Option 1):
+#   * egress is the tailnet NODE SET as /32s — never 100.64.0.0/10, per SDR;
+#   * TCP/22 only;
+#   * podSelector shizuha.io/agent-role=devops-ssh, which Hive sets on the
+#     designated DevOps seats only (fleet/provisioner.py::_base_labels, driven
+#     by FleetAgent.hostplane_ssh) — membership is a Hive data decision, never a
+#     hand-applied `kubectl label` on a pod;
+#   * NO 10.200.10.0/24 bootstrap-LAN companion: a /24 is not a node set. That
+#     prefix already appears above, but only on the k8s-API rule (6443) — it must
+#     never be paired with TCP/22, which is what
+#     fleet.test_plat4729_hostplane_ssh asserts. Additional host-plane nodes are
+#     added as further /32 entries BELOW, never by widening the prefix.
+#   * auth is out of scope for this object and stays with the Tailscale ACL /
+#     Tailscale-SSH / short-TTL-cert half: reaching the port is not being let in.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fleet-allow-hostplane-ssh-egress-v2
+  namespace: shizuha-fleet
+  labels: { app.kubernetes.io/managed-by: shizuha-hive, shizuha.io/policy: fleet-isolation }
+spec:
+  podSelector: { matchLabels: { shizuha.io/agent-role: devops-ssh } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        # s1 / Phoenix host plane — k3s InternalIP == tailnet address.
+        - ipBlock: { cidr: 100.64.0.3/32 }
+      ports: [ { protocol: TCP, port: 22 } ]

@@ -1,0 +1,71 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-codex-refresh
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: hive-codex-refresh
+      rules:
+        # HIVE-585 fail-loud: a revoked Codex/OpenAI refresh token used to appear
+        # only as `[codex-broker] refresh HTTP error status=401` in logs while the
+        # fleet degraded. Alert on any 401 refresh failure and include a Hive
+        # browser re-auth link so the on-call/operator can recover without a host
+        # shell.
+        - alert: HiveCodexRefreshToken401
+          expr: increase(hive_codex_refresh_401_total[5m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive Codex refresh token revoked ({{ $labels.account_email }})"
+            description: >-
+              Hive saw an OpenAI/Codex OAuth refresh HTTP 401 for account
+              {{ $labels.account_email }} (entry {{ $labels.label }}) in the
+              last 5m. Agents leasing this account will fail over or wedge until
+              the account is re-authenticated. Re-auth:
+              https://shizuha.com/hive/credentials/codex/re-auth?email={{ $labels.account_email_urlencoded }}
+
+        # HIVE-583 fail-loud: the HA refresh loop must not fail silently. Any
+        # failed terminal outcome means the leader ran but one or more expiring
+        # tokens could not be refreshed; route to Engineering on-call via the
+        # standard Alertmanager -> Connect DM path.
+        - alert: HiveCodexRefreshLoopFailures
+          expr: increase(hive_codex_refresh_total{outcome="failed"}[10m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive Codex refresh loop failures"
+            description: >-
+              The HIVE-583 codex-refresh-loop recorded one or more failed
+              refresh outcomes in the last 10m. Check the Hive refresh-loop pod
+              logs and the redacted Codex account status dashboard; repeated
+              failures can leave agent OAuth tokens expired instead of refreshed
+              8 minutes before expiry. Runbook / task context:
+              https://pulse.shizuha?task=HIVE-583
+        # Liveness probe for the fail-loud mechanism itself: this metric is emitted
+        # at 1 by /hive/api/v1/internal/codex-refresh/metrics whenever scraping works.
+        - alert: HiveCodexRefreshMetricsAbsent
+          expr: absent(hive_codex_refresh_metrics_present)
+          for: 30m
+          labels:
+            severity: info
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive Codex refresh metrics absent"
+            description: >-
+              hive_codex_refresh_metrics_present has not been scraped for 30m —
+              the HIVE-585 revoked-token fail-loud exporter is missing. Verify
+              /hive/api/v1/internal/codex-refresh/metrics is reachable and scraped.

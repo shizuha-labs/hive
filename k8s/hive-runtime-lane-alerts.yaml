@@ -1,0 +1,44 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-runtime-lane
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: hive-runtime-lane
+      rules:
+        # Alertmanager routes team=engineering alerts to the Engineering Connect
+        # recipient. This makes a stuck durable dispatcher fail loud rather than
+        # waiting invisibly for a daemon reconnect.
+        - alert: HiveRuntimeLaneOutboxStuck
+          expr: hive_runtime_lane_outbox_pending{owner_team="engineering"} > 0 and hive_runtime_lane_outbox_oldest_seconds{owner_team="engineering"} > 120
+          for: 2m
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive RuntimeLane actuator outbox is stuck"
+            description: >-
+              At least one atomically admitted RuntimeLane has remained pending
+              for more than two minutes despite heartbeat-driven bounded retry.
+              Inspect daemon-link health, hive_runtime_lane_outbox_attempts, and
+              the RuntimeLaneOutbox last_error before retrying or rolling back.
+        - alert: HiveRuntimeLaneOutboxMetricsAbsent
+          expr: absent(hive_runtime_lane_outbox_pending{owner_team="engineering"})
+          for: 30m
+          labels:
+            severity: info
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive RuntimeLane outbox metrics are absent"
+            description: >-
+              The RuntimeLane dispatcher liveness metrics have not been scraped
+              for 30 minutes. Verify Hive's metrics endpoint and Prometheus
+              scrape before trusting rollout-state liveness.

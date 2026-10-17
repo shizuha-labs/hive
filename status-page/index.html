@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shizuha Platform Status</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --green: #22c55e;
+            --yellow: #eab308;
+            --red: #ef4444;
+            --border: #334155;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 2rem;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border);
+        }
+        header h1 { font-size: 1.75rem; margin-bottom: 0.25rem; }
+        header p { color: var(--muted); font-size: 0.9rem; }
+        .overall-status {
+            text-align: center;
+            padding: 1.5rem;
+            border-radius: 12px;
+            margin-bottom: 2rem;
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+        .overall-status.operational { background: rgba(34,197,94,0.15); color: var(--green); }
+        .overall-status.degraded { background: rgba(234,179,8,0.15); color: var(--yellow); }
+        .overall-status.outage { background: rgba(239,68,68,0.15); color: var(--red); }
+        .components { display: grid; gap: 0.5rem; margin-bottom: 2rem; }
+        .component {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.75rem 1rem;
+            background: var(--card);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        .component .name { font-weight: 500; }
+        .component .status-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+        .status-badge.operational { background: rgba(34,197,94,0.2); color: var(--green); }
+        .status-badge.degraded { background: rgba(234,179,8,0.2); color: var(--yellow); }
+        .status-badge.outage { background: rgba(239,68,68,0.2); color: var(--red); }
+        .status-badge.maintenance { background: rgba(148,163,184,0.2); color: var(--muted); }
+        h2 {
+            font-size: 1.1rem;
+            margin-bottom: 0.75rem;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .incidents { margin-bottom: 2rem; }
+        .incident {
+            padding: 0.75rem 1rem;
+            background: var(--card);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            margin-bottom: 0.5rem;
+        }
+        .incident .title { font-weight: 500; margin-bottom: 0.25rem; }
+        .incident .meta { font-size: 0.8rem; color: var(--muted); }
+        .incident .status-tag {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            margin-left: 0.5rem;
+        }
+        .status-tag.investigating { background: rgba(239,68,68,0.2); color: var(--red); }
+        .status-tag.identified { background: rgba(234,179,8,0.2); color: var(--yellow); }
+        .status-tag.monitoring { background: rgba(59,130,246,0.2); color: #60a5fa; }
+        .status-tag.resolved { background: rgba(34,197,94,0.2); color: var(--green); }
+        .uptime { margin-bottom: 2rem; }
+        .uptime-table { width: 100%; border-collapse: collapse; }
+        .uptime-table th, .uptime-table td {
+            padding: 0.5rem 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+        .uptime-table th { color: var(--muted); font-weight: 500; }
+        footer {
+            text-align: center;
+            color: var(--muted);
+            font-size: 0.8rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--border);
+        }
+        .last-updated { text-align: right; font-size: 0.8rem; color: var(--muted); margin-bottom: 1rem; }
+        .rss-link { color: #f97316; text-decoration: none; font-size: 0.85rem; }
+        .rss-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔵 Shizuha Platform Status</h1>
+            <p>Real-time operational status for all Shizuha platform services</p>
+        </header>
+
+        <div class="overall-status operational" id="overall-status">
+            ✅ All Systems Operational
+        </div>
+
+        <div class="last-updated" id="last-updated">
+            Last updated: <span id="update-time">--</span>
+        </div>
+
+        <h2>📊 Components</h2>
+        <div class="components" id="components">
+            <!-- Populated by status-generator -->
+        </div>
+
+        <h2>📋 Recent Incidents</h2>
+        <div class="incidents" id="incidents">
+            <p style="color: var(--muted); font-size: 0.9rem;">No recent incidents.</p>
+        </div>
+
+        <h2>📈 Uptime (Current Month)</h2>
+        <div class="uptime">
+            <table class="uptime-table">
+                <thead>
+                    <tr>
+                        <th>Tier</th>
+                        <th>Target</th>
+                        <th>Current</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Organization</td>
+                        <td>99.9%</td>
+                        <td id="uptime-org">--</td>
+                    </tr>
+                    <tr>
+                        <td>Team</td>
+                        <td>99.5%</td>
+                        <td id="uptime-team">--</td>
+                    </tr>
+                    <tr>
+                        <td>Assistant</td>
+                        <td>Best-effort</td>
+                        <td id="uptime-assistant">--</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <p style="text-align: center; margin-bottom: 1rem;">
+            <a href="/incidents.rss" class="rss-link">📡 Subscribe to Incident RSS Feed</a>
+        </p>
+
+        <footer>
+            <p>Shizuha Global Pvt Ltd · <a href="https://shizuha.com" style="color: #60a5fa;">shizuha.com</a></p>
+            <p style="margin-top: 0.25rem;">For support: <a href="mailto:support@shizuha.com" style="color: #60a5fa;">support@shizuha.com</a></p>
+        </footer>
+    </div>
+
+    <script>
+        // Load status data from JSON
+        fetch('/status.json')
+            .then(r => r.json())
+            .then(data => {
+                // Update overall status
+                const overall = document.getElementById('overall-status');
+                if (data.overall === 'operational') {
+                    overall.className = 'overall-status operational';
+                    overall.innerHTML = '✅ All Systems Operational';
+                } else if (data.overall === 'degraded') {
+                    overall.className = 'overall-status degraded';
+                    overall.innerHTML = '⚠️ Degraded Performance';
+                } else {
+                    overall.className = 'overall-status outage';
+                    overall.innerHTML = '🔴 Service Outage';
+                }
+
+                // Update timestamp
+                document.getElementById('update-time').textContent = data.updated_at || '--';
+
+                // Update components
+                const componentsDiv = document.getElementById('components');
+                componentsDiv.innerHTML = '';
+                (data.components || []).forEach(c => {
+                    const div = document.createElement('div');
+                    div.className = 'component';
+                    div.innerHTML = `
+                        <span class="name">${c.name}</span>
+                        <span class="status-badge ${c.status}">${c.label}</span>
+                    `;
+                    componentsDiv.appendChild(div);
+                });
+
+                // Update incidents
+                const incidentsDiv = document.getElementById('incidents');
+                if (data.incidents && data.incidents.length > 0) {
+                    incidentsDiv.innerHTML = '';
+                    data.incidents.forEach(inc => {
+                        const div = document.createElement('div');
+                        div.className = 'incident';
+                        div.innerHTML = `
+                            <div class="title">
+                                ${inc.title}
+                                <span class="status-tag ${inc.status}">${inc.status_label}</span>
+                            </div>
+                            <div class="meta">${inc.date} · ${inc.affected}</div>
+                        `;
+                        incidentsDiv.appendChild(div);
+                    });
+                } else {
+                    incidentsDiv.innerHTML = '<p style="color: var(--muted); font-size: 0.9rem;">No recent incidents.</p>';
+                }
+
+                // Update uptime
+                if (data.uptime) {
+                    document.getElementById('uptime-org').textContent = data.uptime.org || '--';
+                    document.getElementById('uptime-team').textContent = data.uptime.team || '--';
+                    document.getElementById('uptime-assistant').textContent = data.uptime.assistant || '--';
+                }
+            })
+            .catch(err => {
+                console.error('Failed to load status:', err);
+                document.getElementById('overall-status').className = 'overall-status degraded';
+                document.getElementById('overall-status').innerHTML = '⚠️ Status data unavailable';
+            });
+    </script>
+</body>
+</html>

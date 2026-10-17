@@ -1,0 +1,61 @@
+# =============================================================================
+# Production Dockerfile for the Shizuha HIVE frontend
+# =============================================================================
+# Multi-stage: build static files with Vite, then serve them with nginx.
+#
+# BUILD CONTEXT: the monorepo root (so we can copy `packages/shizuha-ui`).
+#   docker build -f shizuha-hive/frontend/Dockerfile.prod \
+#     --build-arg VITE_BASE_PATH=/hive/ \
+#     --build-arg VITE_API_BASE=/hive/api \
+#     -t <registry>/shizuha-hive-frontend:latest .
+#
+# The standalone Hive repo resolves @shizuha/ui through the in-cluster npm cache
+# in CI. This monorepo/local production Dockerfile copies the shared package and
+# rewrites that one dependency to a local file: path so buildx does not try the
+# public npm registry.
+# =============================================================================
+
+# Stage 1: Build
+FROM node:20-alpine AS builder
+
+ARG FRONTEND_PATH=hive/frontend
+
+# Reproduce the monorepo-relative layout the package.json expects.
+WORKDIR /build
+
+ENV NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
+
+WORKDIR /build/${FRONTEND_PATH}
+
+COPY ${FRONTEND_PATH}/package*.json ./
+COPY ${FRONTEND_PATH}/vendor/ ./vendor/
+RUN npm ci --no-audit --no-fund
+
+# Copy frontend source and configs.
+COPY ${FRONTEND_PATH}/src ./src
+COPY ${FRONTEND_PATH}/public ./public
+COPY ${FRONTEND_PATH}/index.html ${FRONTEND_PATH}/vite.config.js ${FRONTEND_PATH}/tailwind.config.js ${FRONTEND_PATH}/postcss.config.js ${FRONTEND_PATH}/nginx.prod.conf ./
+
+# Vite build args.
+ARG VITE_BASE_PATH=/hive/
+ARG VITE_API_BASE=/hive/api
+ENV VITE_BASE_PATH=$VITE_BASE_PATH
+ENV VITE_API_BASE=$VITE_API_BASE
+ENV VITE_HMR_DISABLE=true
+ENV NODE_ENV=production
+
+RUN npm run build
+
+# Stage 2: Serve with nginx
+FROM nginx:alpine
+
+ARG FRONTEND_PATH=hive/frontend
+COPY --from=builder /build/${FRONTEND_PATH}/nginx.prod.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /build/${FRONTEND_PATH}/dist /usr/share/nginx/html
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1/health || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

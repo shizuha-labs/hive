@@ -1,0 +1,180 @@
+# Writable control proxy for the rt-fleet daemon dashboard (SCLI-110 / HIVE-171).
+#
+# The daemon (deploy shizuha-runtime-fleet, ns rt-fleet) runs hostNetwork on s1
+# and binds its dashboard on 127.0.0.1:8016 (localhost-only), so it is NOT
+# reachable from other pods. The readonly-proxy exposes only GET /v1/agents on
+# :8017. Hive's Stop/Start controls need the WRITABLE endpoints, so this proxy
+# forwards a small allow-list of control verbs to 127.0.0.1:8016. Mirrors the
+# readonly-proxy pattern (reaches the hostNetwork daemon via loopback). Replaces
+# the defunct :31416 writable proxy that RUNTIME_FLEET_CONTROL_URL pointed at.
+#
+# Hive backend reaches this via the shizuha-runtime-fleet-control ClusterIP svc:
+#   RUNTIME_FLEET_CONTROL_URL=http://shizuha-runtime-fleet-control.rt-fleet.svc.cluster.local:8016
+# Apply:  kubectl apply -f k8s/rt-fleet-control-proxy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shizuha-runtime-fleet-control-proxy
+  namespace: rt-fleet
+  labels:
+    app: shizuha-runtime-fleet-control-proxy
+spec:
+  replicas: 1
+  # hostNetwork pin to port 8018 on s1 — a RollingUpdate deadlocks (new pod can't
+  # bind 8018 while the old one holds it), so replace the pod outright.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: shizuha-runtime-fleet-control-proxy
+  template:
+    metadata:
+      labels:
+        app: shizuha-runtime-fleet-control-proxy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: s1
+      tolerations:
+      - key: node.shizuha/workstation
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+      - key: operator
+        operator: Equal
+        value: unschedulable
+        effect: NoSchedule
+      containers:
+      - name: control-proxy
+        image: localhost:30500/shizuha-runtime-fleet-base:amd64-20260606
+        env:
+        - name: FLEET_CONTROL_SECRET
+          valueFrom:
+            secretKeyRef:
+              # Live + canonical: runtime-fleet-control-secret / secret
+              # (must match daemon + Hive RUNTIME_FLEET_CONTROL_SECRET)
+              name: runtime-fleet-control-secret
+              key: secret
+        command:
+        - node
+        - -e
+        - |
+          const http = require('http');
+          const crypto = require('crypto');
+          const controlSecret = process.env.FLEET_CONTROL_SECRET || '';
+          const SECRET_HEADER = 'x-fleet-control-secret';
+          const json = (res, status, payload) => {
+            res.writeHead(status, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(payload));
+          };
+          const sameSecret = (a, b) => {
+            if (!a || !b) return false;
+            const aa = Buffer.from(String(a));
+            const bb = Buffer.from(String(b));
+            return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+          };
+          const requireControlSecret = (req, res) => {
+            if (!controlSecret) {
+              json(res, 503, { error: 'fleet control secret not configured' });
+              return false;
+            }
+            if (!sameSecret(req.headers[SECRET_HEADER], controlSecret)) {
+              json(res, 401, { error: 'missing or invalid fleet control secret' });
+              return false;
+            }
+            return true;
+          };
+          // Curated allow-list to the daemon dashboard (Hive-only control plane):
+          //  POST  agent enable/disable/toggle + restart variants (lifecycle control)
+          //  PATCH per-agent configuration push (control)
+          //  GET   per-agent activity transcript + fleet activity-rates (read/inspect)
+          const isAllowed = (method, pathname) => {
+            if (method === 'POST') {
+              if (pathname === '/v1/agents/toggle') return true;
+              if (pathname === '/v1/agents/provision') return true;
+              if (/^\/v1\/agents\/[^/]+\/enable$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/disable$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/restart$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/restart-if-running$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/reset-session$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/pause$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/resume$/.test(pathname)) return true;
+              if (/^\/v1\/agents\/[^/]+\/kill-task$/.test(pathname)) return true;
+              return false;
+            }
+            if (method === 'PATCH') {
+              if (/^\/v1\/agents\/[^/]+$/.test(pathname)) return true;
+              return false;
+            }
+            if (method === 'DELETE') {
+              if (/^\/v1\/agents\/[^/]+$/.test(pathname)) return true;
+              return false;
+            }
+            if (method === 'GET') {
+              if (pathname === '/v1/agents/activity-rates') return true;
+              if (pathname === '/v1/agents/heartbeat-outcomes') return true;
+              if (/^\/v1\/agents\/[^/]+\/activity$/.test(pathname)) return true;
+              return false;
+            }
+            return false;
+          };
+          http.createServer((req, res) => {
+            const url = new URL(req.url || '/', 'http://runtime-fleet');
+            if (!isAllowed(req.method, url.pathname)) {
+              json(res, 404, { error: 'not found' });
+              return;
+            }
+            if (!requireControlSecret(req, res)) return;
+            const chunks = [];
+            req.on('data', (c) => chunks.push(c));
+            req.on('end', () => {
+              const body = Buffer.concat(chunks);
+              // Forward the Hive control secret to the daemon so daemon-side
+              // hive-only enforcement accepts this call (operator 2026-07-09).
+              const headers = { host: 'localhost', [SECRET_HEADER]: controlSecret };
+              if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE') {
+                headers['content-type'] = req.headers['content-type'] || 'application/json';
+                headers['content-length'] = body.length;
+              }
+              const upstream = http.request({
+                hostname: '127.0.0.1',
+                port: 8016,
+                path: `${url.pathname}${url.search}`,
+                method: req.method,
+                headers,
+              }, (upstreamRes) => {
+                res.writeHead(upstreamRes.statusCode || 502, {
+                  'content-type': upstreamRes.headers['content-type'] || 'application/json',
+                });
+                upstreamRes.pipe(res);
+              });
+              upstream.on('error', () => {
+                res.writeHead(502, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ error: 'runtime-fleet unavailable' }));
+              });
+              upstream.end((req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE') ? body : undefined);
+            });
+          }).listen(8018, '0.0.0.0');
+          console.log('fleet control/inspect proxy on 0.0.0.0:8018 -> 127.0.0.1:8016 (forwards hive secret)');
+        ports:
+        - containerPort: 8018
+          name: http
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shizuha-runtime-fleet-control
+  namespace: rt-fleet
+  labels:
+    app: shizuha-runtime-fleet-control-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: shizuha-runtime-fleet-control-proxy
+  ports:
+  - name: http
+    port: 8016
+    targetPort: 8018
+    protocol: TCP

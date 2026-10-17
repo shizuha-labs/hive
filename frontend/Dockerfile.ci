@@ -1,0 +1,44 @@
+# =============================================================================
+# CI Dockerfile for the Shizuha HIVE frontend — SELF-CONTAINED (no monorepo).
+# Build context = the hive repo ROOT. @shizuha/ui is installed as a published
+# npm package from the in-cluster npm-cache (Verdaccio), NOT file:../../packages.
+# This is what lets a standalone-repo CI build the frontend (PLAT-1009).
+#   kaniko --context=dir:///workspace/src --dockerfile=.../frontend/Dockerfile.ci \
+#     --build-arg NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/ \
+#     --build-arg VITE_BASE_PATH=/hive/ --build-arg VITE_API_BASE=/hive/api
+# =============================================================================
+
+# Stage 1: build
+FROM node:20-alpine AS builder
+WORKDIR /build
+
+# All deps (incl. the private @shizuha/ui) resolve from the npm-cache, which
+# proxies npmjs for public packages.
+ARG NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+ENV NPM_CONFIG_REGISTRY=$NPM_CONFIG_REGISTRY
+
+COPY frontend/package*.json ./
+COPY frontend/vendor/ ./vendor/
+RUN npm ci --no-audit --no-fund
+
+COPY frontend/ .
+
+ARG VITE_BASE_PATH=/hive/
+ARG VITE_API_BASE=/hive/api
+ARG VITE_BUILD_COMMIT
+ENV VITE_BASE_PATH=$VITE_BASE_PATH
+ENV VITE_API_BASE=$VITE_API_BASE
+ENV VITE_BUILD_COMMIT=$VITE_BUILD_COMMIT
+ENV VITE_HMR_DISABLE=true
+ENV NODE_ENV=production
+
+RUN npm run build
+
+# Stage 2: serve
+FROM nginx:alpine
+COPY --from=builder /build/nginx.prod.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /build/dist /usr/share/nginx/html
+EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1/health || exit 1
+CMD ["nginx", "-g", "daemon off;"]

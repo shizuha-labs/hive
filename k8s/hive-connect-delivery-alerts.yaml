@@ -1,0 +1,52 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-connect-delivery
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: hive-connect-delivery
+      rules:
+        # HIVE-360 fail-loud: a persistent async reply failure on the HIVE-355
+        # Connect personal-agent delivery path. Metric is scraped from
+        # /hive/api/v1/internal/connect/delivery/metrics. Any increase surfaces to
+        # the owning team via Alertmanager→Connect DM (not log-only) with the
+        # failing stage (cortex reply-gen vs connect post-back).
+        - alert: HiveConnectDeliveryReplyFailed
+          expr: increase(hive_connect_delivery_reply_failed_total[15m]) > 0
+          for: 0m
+          labels:
+            severity: warning
+            team: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive Connect personal-agent async reply failing ({{ $labels.stage }})"
+            description: >-
+              The HIVE-355 Connect delivery path failed to produce/post an
+              assistant reply at stage {{ $labels.stage }} in the last 15m
+              (hive_connect_delivery_reply_failed_total increasing). Inbound
+              Connect DMs to personal agents are being accepted (202) but not
+              answered. Triage: hive-api pod logs — grep 'HIVE-355/360 connect
+              reply FAILED' for stable_id/conversation/message; check Cortex
+              reachability (stage=cortex) or the Connect internal agent-message
+              endpoint (stage=connect_post). Runbook: agent-alert-remediation.
+        # Invariant probe (HIVE-360): the delivery path should be reporting
+        # outcomes — if the metric goes absent while agents exist, the exporter or
+        # endpoint is down (the mechanism itself failed silently).
+        - alert: HiveConnectDeliveryMetricsAbsent
+          expr: absent(hive_connect_delivery_total)
+          for: 30m
+          labels:
+            severity: info
+            team: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive Connect delivery metrics absent"
+            description: >-
+              hive_connect_delivery_total has not been scraped for 30m — the
+              HIVE-360 liveness signal for the Connect delivery mechanism is
+              missing (endpoint down or not scraped). Verify
+              /v1/internal/connect/delivery/metrics is reachable and scraped.

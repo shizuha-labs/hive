@@ -1,0 +1,1329 @@
+# Shizuha Origin CI/CD — multi-arch build + guarded Hive backend deploy.
+#
+# The build pushes to the in-cluster registry service, while the workload image
+# reference uses localhost:30500 because every k3s node maps that insecure alias
+# to the registry NodePort. The deploy step reapplies the Hive scheduling guard
+# so future CI runs cannot accidentally undo the live s1 exclusion.
+name: deploy-hive
+on:
+  workflow_dispatch:
+    inputs:
+      ring:
+        description: 'Target ring (staging|canary|fleet)'
+        required: false
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - canary
+          - fleet
+      hold:
+        description: 'Hold at canary (do not promote to fleet)'
+        required: false
+        default: 'false'
+        type: boolean
+      sha:
+        description: 'Required full commit SHA for break-glass ring=fleet'
+        required: false
+        default: ''
+        type: string
+      hive725_phase:
+        description: 'HIVE-725 cutover phase (phase1 is automatic; finalize requires exact-SHA fleet dispatch)'
+        required: false
+        default: 'phase1'
+        type: choice
+        options:
+          - phase1
+          - finalize
+  push:
+    branches: [main, master]
+    # Forgejo documents `on.push.paths` (not `paths-ignore`). Keep the backend
+    # workflow on an explicit backend/control-plane allowlist so frontend-only
+    # commits are handled solely by deploy-frontend.yml, while mixed commits
+    # still run whenever any backend-relevant path changes.
+    paths:
+      - '.forgejo/workflows/deploy.yml'
+      - '.forgejo/workflows/premerge.yml'
+      - '.forgejo/scripts/**'
+      - '.forgejo/migration-approvals/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - 'manage.py'
+      - 'analytics/**'
+      - 'claws/**'
+      - 'fleet/**'
+      - 'hive_project/**'
+      - 'k8s/**'
+      - 'mcp-server/**'
+      - 'ops/**'
+      - 'scripts/**'
+      - 'security/**'
+      - 'waitlist/**'
+      - '.ci-local-gate.sh'
+# test cancels on new push (fast feedback). build-and-deploy has its own
+# concurrency with cancel-in-progress: false so deploys queue serially on the
+# dedicated deploy-lane runner and always land (ubuntu-latest starved by long
+# codex cross-compiles — ORIG-71/ORIG-76/ORIG-80).
+concurrency:
+  group: deploy-hive-${{ github.ref }}
+  # A cancelled R1/R2 job cannot complete its rollback/evidence path. Queue the
+  # next release instead; per-build resources are cleaned by the owning run.
+  cancel-in-progress: false
+jobs:
+  test:
+    # HIVE deploy red streak: keep short main-branch gate off shared ubuntu-latest.
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Monotonic test guard — stale queued/rerun faces of a superseded sha skip, not red (PLAT-9661 family)
+        env:
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Ported from the cortex deploy-lane monotonic release guard: a QUEUED
+          # face for a superseded sha — or a rerun of a failed old-sha run — can
+          # mint LATE, walk the backend suite on the pre-fix code state, and fail
+          # red AFTER a newer commit already released (runs 3139/3140/3141 all
+          # minted for ancestor sha 77a7390 and re-paged false escalations; the
+          # correct fix was already in at 1a3e3995). The suite verdict belongs to
+          # the LIVE head's own face; sha-tagged artifacts are harmless. Skip
+          # ONLY when this run's sha is an ANCESTOR of the live ref head — a
+          # divergent/force-pushed head proceeds (its face is the only evidence).
+          if ! [[ "${{ github.ref }}" =~ ^refs/heads/ ]]; then
+            echo "not a branch push — guard not applicable"; exit 0
+          fi
+          BRANCH="${{ github.ref }}"; BRANCH="${BRANCH#refs/heads/}"
+          LIVE="$(git ls-remote "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git" "refs/heads/${BRANCH}" | cut -f1)"
+          if ! [[ "$LIVE" =~ ^[0-9a-f]{40}$ ]] || [ "$LIVE" = "${{ github.sha }}" ]; then
+            echo "live head current or unknown — suite proceeds"; exit 0
+          fi
+          workdir="$(mktemp -d)"; cd "$workdir"
+          git init -q .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch -q --no-tags --depth=200 origin "${{ github.sha }}" "$LIVE"
+          if git merge-base --is-ancestor "${{ github.sha }}" "$LIVE"; then
+            echo "::warning::MONOTONIC TEST GUARD — ${{ github.sha }} is an ancestor of live ${BRANCH} head ${LIVE}; skipping the suite (stale queued/rerun face, PLAT-9661 family). Verdict rides the live head's own face."
+            exit 0
+          fi
+          echo "divergent head — suite proceeds"
+      - name: PLAT-187 migration-approval gate (early, fail-fast)  # HIVE-665
+        env:
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # HIVE-665: enforce the PLAT-187 migration-approval-doc requirement HERE,
+          # in the pipeline-gating `test` job, so a flagged migration merged without
+          # its approval doc fails THIS author's run — loud and attributed — instead
+          # of silently fail-closing the post-merge deploy-staging INV-D gate and
+          # wedging the whole hive ring for hours (root cause: fleet.0027 / HIVE-661).
+          # Scope is the unreleased delta only (anchor...HEAD), so the 11 grandfathered
+          # pre-anchor flagged migrations are never re-litigated.
+          LAST_SHA="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.metadata.annotations.last-successful-sha}' 2>/dev/null || true)"
+          if ! [[ "$LAST_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "HIVE-665: no valid last-successful-sha anchor yet — approval gate deferred to the post-merge staging exercise"
+            exit 0
+          fi
+          workdir="$(mktemp -d)"; cd "$workdir"
+          git init -q .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags --depth=200 origin "${{ github.sha }}" "$LAST_SHA"
+          git checkout --detach "${{ github.sha }}"
+          if ! git cat-file -e "${LAST_SHA}^{commit}" 2>/dev/null; then
+            echo "HIVE-665: anchor $LAST_SHA unreachable within fetch depth — deferring to the post-merge staging exercise"
+            exit 0
+          fi
+          MIGRATION_APPROVAL_ONLY=1 .forgejo/scripts/migration-compat-gate.sh "$LAST_SHA"
+      - name: Mirror backend test service images
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          JOB="ci-mirror-hive-test-services-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          manifest_has_cluster_platforms() {
+            local REPO="$1" TAG="$2" MANIFEST
+            MANIFEST="$(curl -fsS -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
+              "http://${REG}/v2/${REPO}/manifests/${TAG}")" || return 1
+            grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"amd64"' <<<"$MANIFEST" &&
+              grep -Eq '"architecture"[[:space:]]*:[[:space:]]*"arm64"' <<<"$MANIFEST"
+          }
+          if manifest_has_cluster_platforms hive-ci-postgres 16-alpine &&
+             manifest_has_cluster_platforms hive-ci-redis 7-alpine; then
+            echo "Backend test service images already mirrored for amd64 + arm64"
+            exit 0
+          fi
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-mirror, service: hive }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: postgres
+                    image: gcr.io/go-containerregistry/crane:latest@sha256:6f95e0e453f09944a625fa219d6879aa2dfaf3f4c7fe3ac9bf41a0a41d45ec46
+                    imagePullPolicy: IfNotPresent
+                    args: [copy, --insecure, docker.io/library/postgres:16-alpine, ${REG}/hive-ci-postgres:16-alpine]
+                  - name: redis
+                    image: gcr.io/go-containerregistry/crane:latest@sha256:6f95e0e453f09944a625fa219d6879aa2dfaf3f4c7fe3ac9bf41a0a41d45ec46
+                    imagePullPolicy: IfNotPresent
+                    args: [copy, --insecure, docker.io/library/redis:7-alpine, ${REG}/hive-ci-redis:7-alpine]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=600s || {
+            echo "::error::backend test service image mirror failed"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=100 || true
+            exit 1
+          }
+      - name: Run backend test suite before deploy
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          JOB="ci-test-hive-${SHORT}"
+          TEST_IMAGE="$(kubectl get deployment hive -n shizuha-hive -o jsonpath='{.spec.template.spec.containers[?(@.name=="hive")].image}')"
+          test -n "$TEST_IMAGE"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test, service: hive, shizuha.io/ci-gate: PLAT-1219 }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 3600
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin "$GITHUB_SHA"
+                        git checkout --detach "$GITHUB_SHA"
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                  - name: postgres
+                    image: localhost:30500/hive-ci-postgres:16-alpine
+                    imagePullPolicy: IfNotPresent
+                    restartPolicy: Always
+                    args: [postgres, -c, fsync=off, -c, synchronous_commit=off, -c, full_page_writes=off]
+                    env:
+                      - { name: POSTGRES_DB, value: shizuha_hive_ci }
+                      - { name: POSTGRES_USER, value: postgres }
+                      - { name: POSTGRES_PASSWORD, value: postgres }
+                    startupProbe:
+                      tcpSocket: { port: 5432 }
+                      periodSeconds: 1
+                      failureThreshold: 60
+                  - name: redis
+                    image: localhost:30500/hive-ci-redis:7-alpine
+                    imagePullPolicy: IfNotPresent
+                    restartPolicy: Always
+                    startupProbe:
+                      tcpSocket: { port: 6379 }
+                      periodSeconds: 1
+                      failureThreshold: 60
+                containers:
+                  - name: test
+                    image: ${TEST_IMAGE}
+                    imagePullPolicy: IfNotPresent
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        cd /workspace/src
+                        export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=shizuha_hive_ci
+                        export REDIS_URL=redis://127.0.0.1:6379/5 CACHE_REDIS_URL=redis://127.0.0.1:6379/6 DEBUG=True SECRET_KEY=ci-secret JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
+                        # Token coordinator encrypts claw credentials; tests call set_token()
+                        # without this KEK (ImproperlyConfigured → suite red → API never deploys).
+                        export HIVE_TOKEN_COORDINATOR_KEK="\$(/app/.venv/bin/python -c 'import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')"
+                        export HIVE_TOKEN_COORDINATOR_KEK_ID=ci-test-kek
+                        # SCLI-376: token revocation is consulted for EVERY token type
+                        # (fail closed). The test Job has no shizuha-id deployment, so a
+                        # real consult to the default http://shizuha-id:8001 would fail
+                        # DNS and fail closed (false "revoked") on every valid token,
+                        # turning the whole suite into 401/403s. Stand up a local stub
+                        # that answers with the exact revocation-status contract
+                        # ({"active": true}) and point SHIZUHA_EXPECTED_ISSUER at it, so
+                        # the consult genuinely runs and returns active for test tokens.
+                        # Mirror of the shizuha-tasks premerge fix (SCLI-376). Must stay
+                        # identical in premerge.yml (HIVE-1512).
+                        mkdir -p /tmp/revocation-stub
+                        cat > /tmp/revocation-stub/server.py <<'PY'
+                        import json
+                        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                        class H(BaseHTTPRequestHandler):
+                            def do_POST(self):
+                                length = int(self.headers.get("Content-Length") or 0)
+                                self.rfile.read(length)
+                                body = json.dumps({"active": True}).encode()
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/json")
+                                self.send_header("Content-Length", str(len(body)))
+                                self.end_headers()
+                                self.wfile.write(body)
+                            def log_message(self, *args):
+                                pass
+
+                        HTTPServer(("127.0.0.1", 19999), H).serve_forever()
+                        PY
+                        python3 /tmp/revocation-stub/server.py &
+                        REVOCATION_STUB_PID=\$!
+                        trap 'kill \${REVOCATION_STUB_PID} >/dev/null 2>&1 || true' EXIT
+                        for i in \$(seq 1 10); do
+                          if python3 -c "import json,urllib.request; \
+                            urllib.request.urlopen(urllib.request.Request( \
+                            'http://127.0.0.1:19999/api/oauth/revocation-status', \
+                            data=b'{}', method='POST'), timeout=1)" >/dev/null 2>&1; then break; fi
+                          sleep 1
+                        done
+                        export SHIZUHA_EXPECTED_ISSUER=http://127.0.0.1:19999
+                        # Static + full suite before auto-deploy (operator 2026-07-09)
+                        /app/.venv/bin/python manage.py makemigrations --check --dry-run
+                        /app/.venv/bin/python .forgejo/scripts/check-django-migration-graph.py
+                        /app/.venv/bin/python -m compileall -q claws fleet hive_project manage.py
+                        /app/.venv/bin/python tests/test_explicit_credential_configuration.py
+                        /app/.venv/bin/python manage.py check --deploy 2>/dev/null || /app/.venv/bin/python manage.py check
+                        /app/.venv/bin/python tests/test_hive707_canary_teardown.py
+                        /app/.venv/bin/python tests/test_hive_api_service_selector.py
+                        /app/.venv/bin/python tests/test_deployment_event_recorder.py
+                        /app/.venv/bin/python tests/test_hive623_pulse_preflight.py
+                        /app/.venv/bin/python tests/test_pulse_fleet_read_client_provisioning.py
+                        /app/.venv/bin/python tests/test_coordinator_broker_client_provisioning.py
+                        /app/.venv/bin/python tests/test_pulse_writer_auth.py
+                        /app/.venv/bin/python tests/test_plat4086_rollout_rings.py RingFenceContractTests
+                        # PostgreSQL is an ephemeral sidecar destroyed with this Job.
+                        # Avoid Django's teardown DROP racing a late background connection.
+                        /app/.venv/bin/python manage.py test --noinput --keepdb
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          # Fail fast on job failure: a failed Job never becomes 'complete', so a plain
+          # wait hangs to timeout while ttlSecondsAfterFinished deletes the Job and its logs.
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::backend test gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::backend test gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=200 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+  build:
+    needs: test
+    concurrency:
+      group: deploy-hive-build-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + guarded deploy + verify
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          TAG="hive-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          echo "Multi-arch build shizuha-hive:${TAG} (amd64 + arm64)"
+
+          # Pod-start failures are not index verdicts. backoffLimit:0 makes a
+          # registry-read or node-pressure start failure terminal for the verify
+          # Job, and a container that never started has unfetchable logs
+          # (BadRequest "is not available") — the wrapper used to classify that
+          # as "immutable identity verification failed", blocking the sanctioned
+          # same-sha re-fire path (run 3179, 2026-09-24: a 2.2s start failure
+          # killed the dispatch). Distinguish infrastructure from identity and
+          # re-create the Job (bounded) before believing the index is bad.
+          verify_release_index() {
+            local attempt rc
+            for attempt in 1 2 3; do
+              verify_release_index_attempt && return 0
+              rc=$?
+              case "$rc" in
+                10) return 10 ;;
+                11)
+                  if [ "$attempt" -lt 3 ]; then
+                    echo "::warning::release-index verify job failed to start (infrastructure; no verdict about the index); retrying ($attempt/3)"
+                    sleep 5
+                    continue
+                  fi
+                  echo "::error::release-index verify job failed to start after 3 attempts (infrastructure; index unverified, not failed)"
+                  return 1 ;;
+                *) return "$rc" ;;
+              esac
+            done
+          }
+
+          verify_release_index_attempt() {
+            local JOB="ci-verify-hive-${SHORT}" logs
+            kubectl delete job -n build "$JOB" --ignore-not-found
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-verify-hive-${SHORT}
+            namespace: build
+            labels: { app: ci-verify, service: hive }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: manifest-check
+                    image: python:3.12-alpine
+                    command: ["python", "-c"]
+                    args:
+                      - |
+                        import json
+                        import re
+                        import time
+                        import urllib.error
+                        import urllib.request
+
+                        base = "http://${REG}/v2/shizuha-hive"
+                        tag = "${TAG}"
+                        expected_revision = "${GITHUB_SHA}"
+                        index_accept = ",".join([
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                        ])
+                        manifest_accept = ",".join([
+                            "application/vnd.oci.image.manifest.v1+json",
+                            "application/vnd.docker.distribution.manifest.v2+json",
+                        ])
+
+                        def fetch_json(url, accept=None):
+                            headers = {"Accept": accept} if accept else {}
+                            request = urllib.request.Request(url, headers=headers)
+                            for attempt in range(1, 7):
+                                try:
+                                    with urllib.request.urlopen(
+                                        request, timeout=30,
+                                    ) as response:
+                                        return json.load(response), response.headers
+                                except urllib.error.HTTPError:
+                                    # HTTP responses are authoritative: preserve
+                                    # immediate 404/identity handling below.
+                                    raise
+                                except (urllib.error.URLError, TimeoutError) as exc:
+                                    if attempt == 6:
+                                        raise
+                                    delay = min(2 ** (attempt - 1), 5)
+                                    print(
+                                        "registry transport retry "
+                                        f"attempt={attempt}/6 delay={delay}s: {exc}",
+                                    )
+                                    time.sleep(delay)
+
+                        try:
+                            index, headers = fetch_json(
+                                f"{base}/manifests/{tag}", index_accept,
+                            )
+                        except urllib.error.HTTPError as exc:
+                            if exc.code == 404:
+                                print("RELEASE_INDEX_ABSENT")
+                                raise SystemExit(10)
+                            raise
+
+                        index_digest = headers.get("Docker-Content-Digest", "")
+                        if not re.fullmatch(r"sha256:[0-9a-f]{64}", index_digest):
+                            raise SystemExit(
+                                f"registry returned invalid index digest: {index_digest!r}"
+                            )
+                        descriptors = {
+                            (
+                                item.get("platform", {}).get("os"),
+                                item.get("platform", {}).get("architecture"),
+                            ): item
+                            for item in index.get("manifests", [])
+                        }
+                        required = {("linux", "amd64"), ("linux", "arm64")}
+                        missing = required - descriptors.keys()
+                        if missing:
+                            raise SystemExit(
+                                f"missing required platform(s): {sorted(missing)}"
+                            )
+                        for platform in sorted(required):
+                            manifest_digest = descriptors[platform].get("digest", "")
+                            if not re.fullmatch(
+                                r"sha256:[0-9a-f]{64}", manifest_digest,
+                            ):
+                                raise SystemExit(
+                                    f"{platform} has invalid manifest digest: "
+                                    f"{manifest_digest!r}"
+                                )
+                            manifest, _ = fetch_json(
+                                f"{base}/manifests/{manifest_digest}",
+                                manifest_accept,
+                            )
+                            config_digest = manifest.get("config", {}).get("digest", "")
+                            if not re.fullmatch(
+                                r"sha256:[0-9a-f]{64}", config_digest,
+                            ):
+                                raise SystemExit(
+                                    f"{platform} has invalid config digest: "
+                                    f"{config_digest!r}"
+                                )
+                            config, _ = fetch_json(
+                                f"{base}/blobs/{config_digest}",
+                            )
+                            labels = config.get("config", {}).get("Labels") or {}
+                            revision = labels.get(
+                                "org.opencontainers.image.revision",
+                            )
+                            if revision != expected_revision:
+                                raise SystemExit(
+                                    f"{platform} revision label={revision!r}, "
+                                    f"expected {expected_revision!r}"
+                                )
+                        print(
+                            f"immutable release index verified: tag={tag} "
+                            f"digest={index_digest} revision={expected_revision}"
+                        )
+          YAML
+            for _ in $(seq 1 60); do
+              if [ "$(kubectl get job -n build "$JOB" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)" = 1 ]; then
+                kubectl logs -n build "job/${JOB}" --tail=40
+                return 0
+              fi
+              if [ "$(kubectl get job -n build "$JOB" -o jsonpath='{.status.failed}' 2>/dev/null || true)" = 1 ]; then
+                logs="$(kubectl logs -n build "job/${JOB}" --tail=80 2>&1 || true)"
+                printf '%s\n' "$logs"
+                grep -q '^RELEASE_INDEX_ABSENT$' <<<"$logs" && return 10
+                if [ -z "$logs" ] || grep -q '^Error from server' <<<"$logs"; then
+                  # No readable output: the pod never started (registry read
+                  # degradation, node pressure). Say nothing about the index.
+                  return 11
+                fi
+                echo "::error::existing Hive release index failed immutable identity verification"
+                return 1
+              fi
+              sleep 2
+            done
+            echo "::error::timed out verifying Hive release index"
+            kubectl logs -n build "job/${JOB}" --tail=80 || true
+            return 1
+          }
+
+          # Release tags are immutable source artifacts. Re-running an exact SHA
+          # (notably HIVE-725 phase-two finalize) must reuse the already-proven
+          # index; rebuilding the same source can change timestamps and therefore
+          # the OCI digest, invalidating its create-once evidence generation.
+          VERIFY_RC=0
+          verify_release_index || VERIFY_RC=$?
+          case "$VERIFY_RC" in
+            0)
+              echo "Reusing immutable multi-arch release ${TAG}; no rebuild"
+              exit 0
+              ;;
+            10)
+              echo "Release index ${TAG} is absent; building it once"
+              ;;
+            *)
+              exit "$VERIFY_RC"
+              ;;
+          esac
+
+          render_build_job() {
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-hive-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: hive }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP;
+                  # s1 overlay works and carries operator=unschedulable. CI tolerates
+                  # the operator-hold taint instead of removing it.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded until
+                        # ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    # NOTE: this init runs in alpine/git — busybox sh ONLY, no bash.
+                    # Any script invoked here (verify-exact-checkout.sh) MUST be
+                    # POSIX-sh with a /bin/sh shebang. A bash shebang fails with
+                    # 'env: can't execute bash' (exit 127) and silently blocks every
+                    # backend build (this happened 2026-07-10; hive backend was
+                    # un-deployable until the script was made POSIX). Do not add bashisms.
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git /workspace/src
+                        cd /workspace/src
+                        .forgejo/scripts/verify-exact-checkout.sh "$GITHUB_SHA"
+                        case "${ARCH}" in
+                          amd64) KUBECTL_SHA=7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3 ;;
+                          arm64) KUBECTL_SHA=420e6110e3ba7ee5a3927b5af868d18df17aae36b720529ffa4e9e945aa95450 ;;
+                          *) echo "unsupported executor architecture" >&2; exit 2 ;;
+                        esac
+                        # anonymous-fetch: sanctioned — adding Authorization can turn this public package fetch into 401 (ORIG-144)
+                        wget -q \
+                          -O kubectl \
+                          "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${ARCH}"
+                        echo "\${KUBECTL_SHA}  kubectl" | sha256sum -c -
+                        chmod 0755 kubectl
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/Dockerfile
+                      - --destination=${REG}/shizuha-hive:${TAG}-${ARCH}
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      # --registry-mirror only covers Docker Hub; the Dockerfile also pulls
+                      # ghcr.io/astral-sh/uv (kaniko fetched it direct + flaked 2026-07-12).
+                      # Map ghcr.io to the in-cluster pull-through proxy so it cannot flake.
+                      - --registry-map=ghcr.io=mirror-ghcr.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=PIP_INDEX_URL=http://pip-cache.registry.svc.cluster.local/simple/
+                      - --build-arg=PIP_TRUSTED_HOST=pip-cache.registry.svc.cluster.local
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/hive-deploy-${ARCH}
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                      - --cleanup
+                      - --label=org.opencontainers.image.revision=${GITHUB_SHA}
+                      # Avoid Kaniko's full-filesystem syncfs wedge on the
+                      # shared amd64 builder; image smoke gates still verify
+                      # the resulting release before rollout.
+                      - --snapshot-mode=redo
+                      - --use-new-run
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          # Forgejo cancellation cannot stop external Kubernetes Jobs. Reap
+          # superseded active builders before launching this source revision;
+          # otherwise their global syncfs snapshots contend for the single
+          # amd64 builder and every newer deploy stalls behind abandoned work.
+          for stale_job in $(kubectl get jobs -n build -l app=ci-build,service=hive \
+            -o go-template='{{range .items}}{{if .status.active}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}'); do
+            case "$stale_job" in
+              "ci-build-hive-${SHORT}-amd64"|"ci-build-hive-${SHORT}-arm64") ;;
+              *) echo "Deleting superseded active Hive builder: $stale_job"; kubectl delete job -n build "$stale_job" --wait=false ;;
+            esac
+          done
+          # HIVE-312: delete same-SHA leftovers first — 'apply' on an existing
+          # completed/failed Job is 'unchanged' and a rerun can never succeed.
+          kubectl delete job -n build "ci-build-hive-${SHORT}-amd64" "ci-build-hive-${SHORT}-arm64" --ignore-not-found
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+          # The build guard already captured both terminal completion receipts.
+          # A finished Job may be reaped while the other architecture builds.
+          echo "Both arch builds done."
+
+          # Assemble the OCI index through the private Registry API. Keeping
+          # this in the already-running deploy runner avoids a cold pull of a
+          # public crane image after both architecture images are complete.
+          REGISTRY_HOST="${REG}" RELEASE_TAG="${TAG}" python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          registry = os.environ["REGISTRY_HOST"]
+          tag = os.environ["RELEASE_TAG"]
+          repository = "shizuha-hive"
+          manifest_accept = ",".join([
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          ])
+          descriptors = []
+          for architecture in ("amd64", "arm64"):
+              source_tag = f"{tag}-{architecture}"
+              request = urllib.request.Request(
+                  f"http://{registry}/v2/{repository}/manifests/{source_tag}",
+                  headers={"Accept": manifest_accept},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  body = response.read()
+                  digest = response.headers["Docker-Content-Digest"]
+                  media_type = response.headers.get_content_type()
+              descriptors.append({
+                  "mediaType": media_type,
+                  "digest": digest,
+                  "size": len(body),
+                  "platform": {"architecture": architecture, "os": "linux"},
+              })
+
+          index = json.dumps({
+              "schemaVersion": 2,
+              "mediaType": "application/vnd.oci.image.index.v1+json",
+              "manifests": descriptors,
+          }, separators=(",", ":")).encode()
+          request = urllib.request.Request(
+              f"http://{registry}/v2/{repository}/manifests/{tag}",
+              data=index,
+              method="PUT",
+              headers={"Content-Type": "application/vnd.oci.image.index.v1+json"},
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              if response.status != 201:
+                  raise SystemExit(f"registry index PUT returned {response.status}")
+              print(
+                  f"published {repository}:{tag} "
+                  f"digest={response.headers.get('Docker-Content-Digest', '')}"
+              )
+          PY
+
+          verify_release_index
+
+  # ── R0: isolated staging smoke (PLAT-1223 / PLAT-4086) ──────────────
+  deploy-staging:
+    needs: build
+    if: github.event_name == 'push' || github.event.inputs.ring != 'fleet'
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout exact triggering revision for monotonic release guard
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Pre-deploy Pulse auth validation (HIVE-623)
+        run: |
+          set -euo pipefail
+          # PLAT-1121: the runner may create/read a Job but must never read the
+          # token. The kubelet injects it only into this short-lived pod.
+          JOB="hive-pulse-auth-preflight-${GITHUB_SHA:0:7}"
+          IMAGE="localhost:30500/shizuha-hive:hive-${GITHUB_SHA:0:7}"
+          kubectl -n origin delete job "$JOB" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: { name: ${JOB}, namespace: origin }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: check
+                  image: ${IMAGE}
+                  command:
+                  - /app/.venv/bin/python
+                  - /app/.forgejo/scripts/pulse-auth-preflight.py
+                  env:
+                  - name: RELEASE_SHA
+                    value: ${GITHUB_SHA}
+                  - name: PULSE_TOKEN
+                    valueFrom:
+                      secretKeyRef: { name: pulse-api-token, key: token }
+                  - name: PULSE_USERNAME
+                    valueFrom:
+                      secretKeyRef: { name: pulse-api-token, key: username, optional: true }
+                  - name: PULSE_PASSWORD
+                    valueFrom:
+                      secretKeyRef: { name: pulse-api-token, key: password, optional: true }
+          YAML
+          kubectl -n origin wait --for=condition=complete --timeout=180s "job/${JOB}" &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl -n origin get "job/${JOB}" -o jsonpath='{.status.failed}' \
+                2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::Pulse auth preflight failed — rollback recording is unavailable"
+              kubectl -n origin logs "job/${JOB}" --tail=80 || true
+              kill "$WP" 2>/dev/null || true
+              wait "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            WAITING=$(kubectl -n origin get po -l "job-name=${JOB}" \
+              -o jsonpath='{.items[0].status.containerStatuses[0].state.waiting.reason}' \
+              2>/dev/null || true)
+            if [ "$WAITING" = "CreateContainerConfigError" ]; then
+              echo "::error::Pulse auth preflight never started — secret key missing"
+              kubectl -n origin describe po -l "job-name=${JOB}" | tail -20 || true
+              kill "$WP" 2>/dev/null || true
+              wait "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 2
+          done
+          wait "$WP" || {
+            echo "::error::Pulse auth preflight failed — rollback recording is unavailable"
+            kubectl -n origin logs "job/${JOB}" --tail=80 || true
+            exit 1
+          }
+          kubectl -n origin logs "job/${JOB}" --tail=10
+      - name: R0 — isolated dependencies, migration compatibility, app + probe
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHA="$GITHUB_SHA"
+          SHORT="${SHA:0:7}"
+          IMAGE="localhost:30500/shizuha-hive:hive-${SHORT}"
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha-hive hive "$SHA"
+          GUARD_RC="$?"
+          set -e
+          if [ "${GUARD_RC}" = 10 ]; then exit 0; fi
+          if [ "${GUARD_RC}" != 0 ]; then exit "${GUARD_RC}"; fi
+          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label ns staging app.kubernetes.io/name=shizuha-hive staging=true --overwrite
+
+          .forgejo/scripts/render-ring-manifest.sh k8s/rollout/hive-staging-deps.yaml.tpl "$IMAGE" "$SHA" /tmp/hive-staging-deps.yaml
+          .forgejo/scripts/render-ring-manifest.sh k8s/rollout/hive-staging-app.yaml.tpl "$IMAGE" "$SHA" /tmp/hive-staging-app.yaml
+          kubectl apply -f /tmp/hive-staging-deps.yaml
+          kubectl -n staging rollout status deploy/hive-staging-postgres --timeout=180s
+          kubectl -n staging rollout status deploy/hive-staging-redis --timeout=180s
+
+          LAST_SHA="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.metadata.annotations.last-successful-sha}')"
+          [[ "$LAST_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid rollback anchor before rings"; exit 1; }
+          # CRITICAL (operator 2026-07-28): never reconstruct OLD_IMAGE as
+          # hive-${LAST_SHA:0:7}. Break-glass / hand-promote can leave the
+          # last-successful-sha pointing at a tag that is single-arch or
+          # absent while live pods run a different multi-arch image (observed:
+          # fa36e9a single-arch + live hive-antigravity-fix-v18 multi-arch).
+          # Migration-compat then CrashLoops on arm64 (exec format error) and
+          # blocks staging→canary→fleet forever — the "33 commits behind" lag.
+          LIVE_IMAGE="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.spec.template.spec.containers[?(@.name=="hive")].image}')"
+          [ -n "$LIVE_IMAGE" ] || LIVE_IMAGE="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          OLD_IMAGE="$LIVE_IMAGE"
+          echo "INV-D old schema image (live fleet): ${OLD_IMAGE} (anchor sha=${LAST_SHA})"
+          # Compatibility must cover the complete live-anchor→release delta.
+          # github.event.before is only the prior pushed commit and misses a
+          # migration in an intermediate release whose pipeline never reached INV-F.
+          git fetch --no-tags --depth=500 origin "$LAST_SHA" "$SHA" || \
+            git fetch --no-tags origin "$LAST_SHA" "$SHA"
+          .forgejo/scripts/migration-compat-gate.sh "$LAST_SHA" "$IMAGE" "$OLD_IMAGE"
+
+          MIGRATE="hive-staging-migrate-${SHORT}"
+          kubectl -n staging delete pod "$MIGRATE" --ignore-not-found --wait=true
+          kubectl -n staging run "$MIGRATE" --restart=Never --image="$IMAGE" \
+            --env=DB_NAME=shizuha_hive_staging --env=DB_USER=postgres --env=DB_PASSWORD=staging-only \
+            --env=DB_HOST=hive-staging-postgres.staging.svc.cluster.local --env=DB_PORT=5432 \
+            --env=REDIS_URL=redis://hive-staging-redis.staging.svc.cluster.local:6379/5 \
+            --env=CACHE_REDIS_URL=redis://hive-staging-redis.staging.svc.cluster.local:6379/6 \
+            --env=JWT_SECRET_KEY=staging-only-jwt --env=SHIZUHA_JWT_SIGNING_KEY=staging-only-jwt \
+            --command -- python manage.py migrate --noinput
+          if ! kubectl -n staging wait --for=jsonpath='{.status.phase}'=Succeeded pod/"$MIGRATE" --timeout=300s; then
+            kubectl -n staging logs "$MIGRATE" --tail=200 || true
+            exit 1
+          fi
+          kubectl -n staging delete pod "$MIGRATE" --wait=true
+
+          # Retire the old build-attributed target on every Prometheus replica
+          # while its staging workload is still healthy. Recreate/apply may then
+          # replace the backing endpoint without leaving a terminal zero series.
+          .forgejo/scripts/retire-canary-probe.sh staging hive.staging.svc.cluster.local
+          # A pre-PLAT-4086 staging object may have an incompatible selector.
+          # Recreate only this isolated R0 object; never delete the prod Deployment.
+          if kubectl -n staging get deploy hive >/dev/null 2>&1 &&
+             [ "$(kubectl -n staging get deploy hive -o jsonpath='{.spec.selector.matchLabels.release_ring}')" != staging ]; then
+            kubectl -n staging delete deploy hive --wait=true
+          fi
+          kubectl apply -f /tmp/hive-staging-app.yaml
+          kubectl -n staging rollout status deploy/hive --timeout=300s
+          kubectl -n staging get endpoints hive -o jsonpath='{.subsets[0].addresses[0].ip}' | grep -q .
+          # Accepted R0 smoke is health plus a staging-only channel-token round
+          # trip. The fixture is created and removed inside the isolated DB.
+          kubectl -n staging exec -i deploy/hive -- python manage.py shell \
+            < .forgejo/scripts/hive-channel-token-smoke.py
+          bash .forgejo/scripts/ring-gate.sh staging staging hive "$SHA"
+
+  # Validate the actual requested graph. Fleet/push require the fenced R2
+  # receipt; staging/canary-only runs report their narrower completion without
+  # claiming production. Only the fenced R2 executor writes DeploymentEvent.
+  verify-production-deploy:
+    needs: [build, deploy-staging, deploy-canary, deploy-fleet]
+    if: always()
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require fleet production receipt
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          STAGING_RESULT: ${{ needs.deploy-staging.result }}
+          CANARY_RESULT: ${{ needs.deploy-canary.result }}
+          FLEET_RESULT: ${{ needs.deploy-fleet.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          RING: ${{ github.event.inputs.ring }}
+        run: |
+          set -euo pipefail
+          printf 'build=%s staging=%s canary=%s fleet=%s event=%s ring=%s\n' \
+            "$BUILD_RESULT" "$STAGING_RESULT" "$CANARY_RESULT" "$FLEET_RESULT" \
+            "$EVENT_NAME" "${RING:-}"
+          [ "$BUILD_RESULT" = success ]
+          case "$EVENT_NAME:${RING:-}" in
+            push:*)
+              [ "$STAGING_RESULT" = success ]
+              [ "$CANARY_RESULT" = success ]
+              ;;
+            workflow_dispatch:fleet)
+              # Both predecessors are intentionally skipped by the fleet-only
+              # graph. A failed predecessor is still an error, not a skip.
+              for predecessor in "$STAGING_RESULT" "$CANARY_RESULT"; do
+                case "$predecessor" in success|skipped) ;; *) exit 1 ;; esac
+              done
+              ;;
+            workflow_dispatch:canary)
+              [ "$STAGING_RESULT" = success ]
+              [ "$CANARY_RESULT" = success ]
+              [ "$FLEET_RESULT" = skipped ]
+              echo 'canary workflow completed; no production deployment was requested or inferred'
+              exit 0
+              ;;
+            workflow_dispatch:staging)
+              [ "$STAGING_RESULT" = success ]
+              [ "$CANARY_RESULT" = skipped ]
+              [ "$FLEET_RESULT" = skipped ]
+              echo 'staging workflow completed; no production deployment was requested or inferred'
+              exit 0
+              ;;
+            *)
+              echo '::error::unsupported deployment event or requested ring'
+              exit 1
+              ;;
+          esac
+          [ "$FLEET_RESULT" = success ] || {
+            echo "::error::production deploy absent: fenced fleet convergence did not complete; no DeploymentEvent may be inferred from this run"
+            exit 1
+          }
+          echo "production deploy receipt accepted: deploy-fleet completed the fenced event-producing path"
+
+  # ── R1: additive addressable canary + full soak ──────────────────────────
+  deploy-canary:
+    needs: deploy-staging
+    if: github.event_name == 'push' || github.event.inputs.ring == 'canary'
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Preflight create-once release credentials
+        run: |
+          set -euo pipefail
+          .forgejo/scripts/ensure-capability-evidence-key.sh shizuha-hive
+          .forgejo/scripts/project-mcp-projection-keyring.sh shizuha-hive shizuha-fleet
+          .forgejo/scripts/ensure-capability-evidence-client-auth.sh shizuha-hive shizuha
+          .forgejo/scripts/ensure-hive-connect-hmac.sh shizuha shizuha-hive
+          .forgejo/scripts/ensure-company-state-read-token.sh shizuha-hive shizuha
+          .forgejo/scripts/ensure-pulse-fleet-read-client.sh shizuha-hive shizuha
+          .forgejo/scripts/ensure-coordinator-broker-client.sh shizuha-hive shizuha
+          python3 .forgejo/scripts/ensure-runtime-platform-jwt.py
+      - name: Reconcile reviewed ring recovery RBAC
+        run: |
+          set -euo pipefail
+          kubectl apply -f k8s/hive-ring-recover-rbac.yaml
+          # Prove the exact reviewed Role and binding are live. The deployer is
+          # intentionally not allowed to impersonate service accounts; asking
+          # `auth can-i --as` here would test that unrelated privilege instead
+          # of the RBAC objects we just reconciled.
+          kubectl diff -f k8s/hive-ring-recover-rbac.yaml
+      - name: Verify administrator-bootstrapped ring executor identities
+        run: |
+          set -euo pipefail
+          for RING in canary fleet; do
+            kubectl -n origin get lease "hive-ring-owner-${RING}" >/dev/null || {
+              echo "::error::ring authority is not administrator-bootstrapped for ${RING}" >&2
+              exit 1
+            }
+          done
+          SERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+          CA_DATA="$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+          TOKEN="$(kubectl -n origin create token hive-ring-submit --duration=3h)"
+          umask 077
+          cat > "$HOME/.kube/config" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: cluster
+            cluster:
+              server: ${SERVER}
+              certificate-authority-data: ${CA_DATA}
+          users:
+          - name: submit
+            user:
+              token: ${TOKEN}
+          contexts:
+          - name: submit
+            context: {cluster: cluster, user: submit, namespace: origin}
+          current-context: submit
+          EOF
+          unset TOKEN CA_DATA
+          [ "$(kubectl auth can-i create jobs.batch -n origin)" = yes ]
+          [ "$(kubectl auth can-i patch deployments.apps -n shizuha-hive)" = no ]
+      - name: R1 — deploy, soak, rollback fail-loud
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          CANARY_HOLD: ${{ github.event.inputs.hold || 'false' }}
+        run: |
+          set -euo pipefail
+          SHA="$RELEASE_SHA"
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha-hive hive "$SHA"
+          GUARD_RC="$?"
+          set -e
+          if [ "$GUARD_RC" = 10 ]; then exit 0; fi
+          if [ "$GUARD_RC" != 0 ]; then exit "$GUARD_RC"; fi
+          LAST_SHA="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.metadata.annotations.last-successful-sha}')"
+          [[ "$LAST_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::missing rollback anchor (INV-B)"; exit 1; }
+          python3 .forgejo/scripts/ring-executor.py submit \
+            --ring canary --release-sha "$SHA" --restored-sha "$LAST_SHA" \
+            --run-id '${{ github.run_id }}' --run-number '${{ github.run_number }}' \
+            --job deploy-canary --event-name '${{ github.event_name }}' \
+            --hold "$CANARY_HOLD" --source-tree "$(git rev-parse "${SHA}^{tree}")"
+
+  # ── R2: Fleet promotion (existing deploy path) ─────────────────────────────
+  deploy-fleet:
+    needs: [build, deploy-staging, deploy-canary]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      ((github.event_name == 'push' && needs.deploy-staging.result == 'success' &&
+        needs.deploy-canary.result == 'success' && github.event.inputs.hold != 'true') ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.ring == 'fleet' &&
+        github.event.inputs.sha == github.sha))
+    runs-on: deploy-lane
+    container:
+      image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          ORIGIN_TOKEN: ${{ secrets.CI_PACKAGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "http://x-token-auth:${ORIGIN_TOKEN}@forgejo-http.origin.svc.cluster.local/shizuha-labs/hive.git"
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          # Pinned toolbox vendors the client; do not download it per job.
+          kubectl version --client -o json | python3 -c 'import json,sys; assert json.load(sys.stdin)["clientVersion"]["gitVersion"].split("+")[0] == "v1.34.6"'
+          helm version --short | grep -F 'v3.21.2'
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Verify Hive boundary release authority
+        run: |
+          set -euo pipefail
+          for policy in \
+            fleet-agent-default-deny \
+            fleet-agent-allow-egress \
+            fleet-agent-allow-platform-ingress \
+            fleet-allow-hostplane-ssh-egress-v2; do
+            for verb in get patch update; do
+              [ "$(kubectl auth can-i "$verb" \
+                "networkpolicies.networking.k8s.io/${policy}" \
+                -n shizuha-fleet)" = yes ] || {
+                echo "::error::Origin CI cannot ${verb} reviewed fleet NetworkPolicy ${policy}; apply deploy/k3s/origin/ci-deployer-rbac.yaml through its administrator bootstrap"
+                exit 1
+              }
+            done
+          done
+          for verb in create delete; do
+            [ "$(kubectl auth can-i "$verb" networkpolicies.networking.k8s.io \
+              -n shizuha-fleet)" = no ] || {
+              echo "::error::Origin CI unexpectedly has broad ${verb} authority over fleet NetworkPolicies"
+              exit 1
+            }
+          done
+      - name: Reconcile fleet agent connectivity policy
+        run: |
+          set -euo pipefail
+          MANIFEST=k8s/fleet/30-fleet-isolation-netpol.yaml
+          kubectl apply --dry-run=server -f "$MANIFEST" >/dev/null
+          kubectl apply -f "$MANIFEST"
+      - name: Preflight create-once release credentials
+        run: |
+          set -euo pipefail
+          .forgejo/scripts/ensure-capability-evidence-key.sh shizuha-hive
+          .forgejo/scripts/project-mcp-projection-keyring.sh shizuha-hive shizuha-fleet
+          .forgejo/scripts/ensure-capability-evidence-client-auth.sh shizuha-hive shizuha
+          .forgejo/scripts/ensure-hive-connect-hmac.sh shizuha shizuha-hive
+          .forgejo/scripts/ensure-company-state-read-token.sh shizuha-hive shizuha
+          .forgejo/scripts/ensure-pulse-fleet-read-client.sh shizuha-hive shizuha
+          .forgejo/scripts/ensure-coordinator-broker-client.sh shizuha-hive shizuha
+          python3 .forgejo/scripts/ensure-runtime-platform-jwt.py
+      - name: Reconcile reviewed ring recovery RBAC
+        run: |
+          set -euo pipefail
+          kubectl apply -f k8s/hive-ring-recover-rbac.yaml
+          # Prove the exact reviewed Role and binding are live. The deployer is
+          # intentionally not allowed to impersonate service accounts; asking
+          # `auth can-i --as` here would test that unrelated privilege instead
+          # of the RBAC objects we just reconciled.
+          kubectl diff -f k8s/hive-ring-recover-rbac.yaml
+      - name: Reconcile hive-controller fleet exec RBAC (PLAT-4924)
+        run: |
+          set -euo pipefail
+          # PLAT-4924: the Role grants pods/exec create+get (get = the kubernetes-python-client
+          # websocket exec path; see the Role file). Kubernetes forbids
+          # origin-ci-deployer from CREATING that Role (privilege escalation —
+          # the deployer does not hold pods/exec). First install is
+          # administrator bootstrap of k8s/hive-controller-fleet-exec-rbac.yaml.
+          # CI only reapplies the already-created objects and proves the SA.
+          if ! kubectl -n shizuha-fleet get role hive-controller-fleet-pods-exec >/dev/null 2>&1; then
+            echo "::error::hive-controller-fleet-pods-exec Role is missing; apply k8s/hive-controller-fleet-exec-rbac.yaml through the administrator bootstrap (CI cannot grant pods/exec it does not hold)"
+            exit 1
+          fi
+          kubectl apply -f k8s/hive-controller-fleet-exec-rbac.yaml
+          kubectl diff -f k8s/hive-controller-fleet-exec-rbac.yaml
+          # Do not `auth can-i --as=hive-controller`: origin-ci-deployer is
+          # intentionally forbidden from impersonating service accounts (same
+          # as hive-ring-recover). Prove the live Role still grants pods/exec
+          # create, and that the RoleBinding still subjects hive-controller.
+          # jsonpath renders a string list as ["create","get"] (comma, no space).
+          # A space between the verbs never matches, so this step exited 1 and
+          # skipped the fleet roll on every push.
+          kubectl -n shizuha-fleet get role hive-controller-fleet-pods-exec \
+            -o jsonpath='{range .rules[*]}{.resources}{" "}{.verbs}{"\n"}{end}' \
+            | grep -Fq '["pods/exec"] ["create","get"]'
+          kubectl -n shizuha-fleet get rolebinding hive-controller-fleet-pods-exec \
+            -o jsonpath='{.subjects[0].namespace}/{.subjects[0].name}{" -> "}{.roleRef.name}{"\n"}' \
+            | grep -Fx 'shizuha-hive/hive-controller -> hive-controller-fleet-pods-exec'
+      - name: Reconciling fleet-agent-liveness-reconciler (PLAT-4549 VIP probe)
+        run: |
+          set -euo pipefail
+          kubectl apply -f k8s/fleet-agent-liveness-reconciler.yaml
+          kubectl diff -f k8s/fleet-agent-liveness-reconciler.yaml
+      - name: Verify administrator-bootstrapped ring executor identities
+        run: |
+          set -euo pipefail
+          for RING in canary fleet; do
+            kubectl -n origin get lease "hive-ring-owner-${RING}" >/dev/null || {
+              echo "::error::ring authority is not administrator-bootstrapped for ${RING}" >&2
+              exit 1
+            }
+          done
+          SERVER="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+          CA_DATA="$(kubectl config view --raw --minify -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+          TOKEN="$(kubectl -n origin create token hive-ring-submit --duration=3h)"
+          umask 077
+          cat > "$HOME/.kube/config" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - name: cluster
+            cluster:
+              server: ${SERVER}
+              certificate-authority-data: ${CA_DATA}
+          users:
+          - name: submit
+            user:
+              token: ${TOKEN}
+          contexts:
+          - name: submit
+            context: {cluster: cluster, user: submit, namespace: origin}
+          current-context: submit
+          EOF
+          unset TOKEN CA_DATA
+          [ "$(kubectl auth can-i create jobs.batch -n origin)" = yes ]
+          [ "$(kubectl auth can-i patch deployments.apps -n shizuha-hive)" = no ]
+      - name: R2 — Fleet deploy + verify
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_RING: ${{ github.event.inputs.ring }}
+          REQUESTED_SHA: ${{ github.event.inputs.sha }}
+          REQUESTED_HIVE725_PHASE: ${{ github.event.inputs.hive725_phase || 'phase1' }}
+        run: |
+          set -euo pipefail
+          SHA="$RELEASE_SHA"
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha-hive hive "$SHA"
+          GUARD_RC="$?"
+          set -e
+          if [ "$GUARD_RC" = 10 ] && [ "$REQUESTED_HIVE725_PHASE" != finalize ]; then exit 0; fi
+          if [ "$GUARD_RC" != 0 ] && [ "$GUARD_RC" != 10 ]; then exit "$GUARD_RC"; fi
+          LAST_SHA="$(kubectl -n shizuha-hive get deploy hive -o jsonpath='{.metadata.annotations.last-successful-sha}')"
+          [[ "$LAST_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::missing rollback anchor before R2"; exit 1; }
+          DELTA_MODE=allow-migrations
+          [ "$EVENT_NAME" != workflow_dispatch ] || DELTA_MODE=reject-migrations
+          git fetch --no-tags origin "$LAST_SHA" "$SHA"
+          .forgejo/scripts/verify-release-delta.sh "$LAST_SHA" "$SHA" "$DELTA_MODE"
+          set +e
+          python3 .forgejo/scripts/ring-executor.py submit \
+            --ring fleet --release-sha "$SHA" --restored-sha "$LAST_SHA" \
+            --run-id '${{ github.run_id }}' --run-number '${{ github.run_number }}' \
+            --job deploy-fleet --event-name "$EVENT_NAME" \
+            --hive725-phase "$REQUESTED_HIVE725_PHASE" \
+            --source-tree "$(git rev-parse "${SHA}^{tree}")"
+          FLEET_RC="$?"
+          set -e
+          # Canary retirement is a distinct canary-fenced generation. It runs
+          # after the fleet executor has stopped, never by holding fleet then
+          # acquiring canary in the forbidden reverse order.
+          CLEANUP_RC=0
+          # Only a committed fleet generation may retire the proven canary.
+          # rc=20 is the executor's explicit post-commit failure class: the
+          # release is healthy, so cleanup remains safe even though this job
+          # must still report the operational failure afterward.
+          if [ "$FLEET_RC" -eq 0 ] || [ "$FLEET_RC" -eq 20 ]; then
+            python3 .forgejo/scripts/ring-executor.py submit \
+              --operation cleanup-canary --ring canary \
+              --release-sha "$SHA" --restored-sha "$LAST_SHA" \
+              --run-id '${{ github.run_id }}' --run-number '${{ github.run_number }}' \
+              --job deploy-fleet-cleanup --event-name "$EVENT_NAME" \
+              --source-tree "$(git rev-parse "${SHA}^{tree}")" || CLEANUP_RC="$?"
+          fi
+          [ "$FLEET_RC" -eq 0 ] || exit "$FLEET_RC"
+          [ "$CLEANUP_RC" -eq 0 ] || exit "$CLEANUP_RC"
+

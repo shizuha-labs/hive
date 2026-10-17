@@ -1,0 +1,388 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shizuha-hive
+  labels:
+    app.kubernetes.io/name: shizuha-hive
+    app.kubernetes.io/managed-by: shizuha-hive
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hive-api
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive-api
+    app.kubernetes.io/component: control-plane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hive-api-control-plane
+  labels:
+    app.kubernetes.io/name: hive-api
+    app.kubernetes.io/component: control-plane
+rules:
+  # hive-api provisions/deletes one namespace per claw.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # hive-api creates and manages claw config, data PVCs, and Services inside
+  # those claw namespaces; RBAC is bound to the dedicated hive-api SA below.
+  - apiGroups: [""]
+    resources: ["secrets", "persistentvolumeclaims", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # HIVE-127: per-claw ResourceQuota + LimitRange for tenancy guardrails.
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Live status reads pod state for a claw namespace.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Lifecycle operations create/replace Deployments and patch Deployment scale.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+  # PLAT-174: provisioner emits SSH-egress + baseline NetworkPolicies into per-agent namespaces.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # HIVE-66: provisioner reads the hive-tiers ConfigMap (shizuha-hive ns) to
+  # resolve per-tier pvc_size, resource requests/limits, and idle TTL at
+  # provision time. Read-only — provisioner never writes ConfigMaps.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hive-api-control-plane
+  labels:
+    app.kubernetes.io/name: hive-api
+    app.kubernetes.io/component: control-plane
+subjects:
+  - kind: ServiceAccount
+    name: hive-api
+    namespace: shizuha-hive
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hive-api-control-plane
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive-api
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive-api
+    app.kubernetes.io/component: control-plane
+spec:
+  # Zero-downtime invariant (operator 2026-07-04): 2 replicas + surge-first roll —
+  # a single-replica bounce blanked /hive/agents to "0/0" during every deploy.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hive-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hive-api
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: hive-api
+      containers:
+        - name: hive-api
+          image: localhost:30500/shizuha-hive:fleet-dind-202606280809
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - python manage.py migrate --noinput && exec gunicorn hive_project.wsgi:application --bind 0.0.0.0:8030 --workers 2 --timeout 120
+          ports:
+            - name: http
+              containerPort: 8030
+          env:
+            # HIVE-609 temporary containment. Remove with PLAT-4159 when the
+            # owner/epoch/resource-fenced authority projection is consumed.
+            - name: HIVE_NATIVE_RUNTIME_RELEASE_ENABLED
+              value: "true"
+            - name: HIVE_NATIVE_RUNTIME_RELEASE_NAMESPACE
+              value: shizuha-hive
+            - name: HIVE609_TEMP_FRESHNESS_PRECEDENCE
+              value: "true"
+            - name: DEBUG
+              value: "False"
+            - name: DB_HOST
+              value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+            - name: DB_NAME
+              value: shizuha_hive
+            - name: DB_USER
+              value: postgres
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: shizuha-infra-postgresql
+                  key: postgres-password
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: jwt-secret
+            - name: SHIZUHA_JWT_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: jwt-secret
+            - name: HIVE_INTERNAL_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: internal-auth-token
+            - name: COMPANY_STATE_READ_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hive-company-state-read
+                  key: token
+                  optional: false
+            - name: HIVE_CAPABILITY_EVIDENCE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hive-capability-evidence-client-auth
+                  key: token
+            - name: HIVE_CAPABILITY_EVIDENCE_PRIVATE_KEY_PEM
+              valueFrom:
+                secretKeyRef:
+                  name: hive-capability-evidence-signer
+                  key: private-key.pem
+                  optional: true
+            - name: HIVE_CAPABILITY_EVIDENCE_KID
+              valueFrom:
+                secretKeyRef:
+                  name: hive-capability-evidence-signer
+                  key: kid
+                  optional: true
+            - name: HIVE_CAPABILITY_EVIDENCE_SERVICE_ACCOUNT
+              value: hive-api
+            - name: HIVE_CONNECT_WAKE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hive-connect-wake
+                  key: HIVE_CONNECT_WAKE_TOKEN
+                  optional: true
+            - name: SHIZUHA_PLATFORM_URL
+              value: http://shizuha-nginx.shizuha.svc.cluster.local
+            - name: SHIZUHA_CONNECT_INTERNAL_URL
+              value: http://shizuha-connect.shizuha.svc.cluster.local:8019
+            - name: HIVE_PUBLIC_PLATFORM_URL
+              value: https://shizuha.com
+            - name: RUNTIME_REGISTRY
+              value: gx10-1:30500
+            - name: FLEET_AGENT_IMAGE
+              value: localhost:30500/shizuha-agent-runtime:k3s-browserfix-202607040756
+            # GLM decommissioned (HIVE-167): no implicit model default — empty
+            # so the fleet UI never invents a retired backend for a native row.
+            - name: FLEET_AGENT_MODEL
+              value: ""
+            - name: RUNTIME_FLEET_API_URL
+              value: http://shizuha-runtime-fleet.rt-fleet.svc.cluster.local:8016
+            # HIVE-146: sidecar broker that injects coordinator JWTs into agent pods
+            - name: FLEET_BROKER_IMAGE
+              value: localhost:30500/mcp-auth-proxy:src-3a0a1b6a159c
+            # PLAT-536/BRW-12: per-agent private browser-worker image (internal
+            # registry, pinned — never the unqualified :latest fallback).
+            - name: FLEET_BROWSER_IMAGE
+              value: localhost:30500/shizuha-browser:s260606x-b9669f4
+            # HIVE-146: coordinator model-token endpoint (pool-based token vending)
+            - name: FLEET_COORDINATOR_MODEL_TOKEN_URL
+              value: http://hive-direct.shizuha-hive.svc.cluster.local:8030/hive/api/v1/coordinator/model-token
+            # HIVE-146: k8s secret name holding the broker's coordinator JWT
+            - name: FLEET_COORDINATOR_TOKEN_SECRET_NAME
+              value: hive-coordinator-broker-token
+            - name: FLEET_COORDINATOR_OAUTH_SECRET_NAME
+              value: hive-coordinator-broker-oauth
+            # SCLI-110: writable control path (Stop/Start/restart) — the daemon's
+            # writable dashboard is localhost-only, reached via the control-proxy
+            # (k8s/rt-fleet-control-proxy.yaml). 15s allows for container boot.
+            - name: RUNTIME_FLEET_CONTROL_URL
+              value: http://shizuha-runtime-fleet-control.rt-fleet.svc.cluster.local:8016
+            - name: RUNTIME_FLEET_CONTROL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hive-secrets
+                  key: fleet-control-secret
+            - name: RUNTIME_FLEET_API_TIMEOUT
+              value: "15"
+            - name: HIVE_CLAW_IMAGE
+              value: gx10-1:30500/openclaw:2026.6.11-multiarch
+            - name: HIVE_SCLI_IMAGE
+              value: localhost:30500/shizuha-runtime:latest
+            - name: HIVE_CLAW_DATA_MOUNT_PATH
+              value: /home/node/.openclaw
+            - name: HIVE_CLAW_HTTP_PORT
+              value: "18789"
+            - name: RUNTIME_STORAGE_CLASS
+              value: local-path
+            - name: HIVE_CLAW_STORAGE_CLASS
+              value: longhorn-3x
+            - name: RUNTIME_PVC_SIZE
+              value: 4Gi
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import urllib.request; response = urllib.request.urlopen('http://127.0.0.1:8030/hive/api/health/', timeout=5); raise SystemExit(0 if response.status == 200 else 1)"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import urllib.request; response = urllib.request.urlopen('http://127.0.0.1:8030/hive/api/health/', timeout=5); raise SystemExit(0 if response.status == 200 else 1)"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        # codex-refresh lives in hive-codex-refresh-deploy.yaml (separate Deploy).
+        # Do NOT re-add as a sidecar: single-arch images make arm64 API pods
+        # NotReady and stall maxUnavailable:0 rolling HA for /hive/api.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-api
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive-api
+spec:
+  selector:
+    app.kubernetes.io/name: hive-api
+  ports:
+    - name: http
+      port: 8030
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hive-api
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive-api
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: k3s.s1.tail.shizuha.com
+      http:
+        paths:
+          - path: /hive/
+            pathType: Prefix
+            backend:
+              service:
+                name: hive-api
+                port:
+                  name: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hive-frontend
+  namespace: shizuha-hive
+  labels:
+    app: hive-frontend
+    app.kubernetes.io/name: hive-frontend
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: 2
+  # Zero-downtime rollout: never drop below the desired count — bring a new pod
+  # to Ready before removing an old one, so /hive/ stays served during a deploy.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: hive-frontend
+  template:
+    metadata:
+      labels:
+        app: hive-frontend
+        app.kubernetes.io/name: hive-frontend
+        app.kubernetes.io/component: frontend
+    spec:
+      # Multi-arch frontend image (amd64+arm64). Keep replicas spread across
+      # real cluster nodes so /hive/ stays served during node maintenance.
+      tolerations:
+        - key: node.shizuha/workstation
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: hive-frontend
+      containers:
+        - name: hive-frontend
+          image: localhost:30500/shizuha-hive-frontend:cfgedit-ae67163
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-frontend
+  namespace: shizuha-hive
+  labels:
+    app: hive-frontend
+    app.kubernetes.io/name: hive-frontend
+    app.kubernetes.io/component: frontend
+spec:
+  selector:
+    app: hive-frontend
+  ports:
+    - name: http
+      port: 80
+      # numeric (not the named "http") so endpoints resolve regardless of whether
+      # the running image names its container port — a re-apply of this manifest
+      # must never re-introduce the empty-endpoints 502 (2026-06-23 clobber).
+      targetPort: 80

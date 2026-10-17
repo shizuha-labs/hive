@@ -1,0 +1,233 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover-fleet-liveness
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["fleet-agent-liveness-reconciler"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["hive-tiers"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover-fleet-liveness
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-recover
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-recover-fleet-liveness
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover-harness-drift
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["fleet-harness-drift-roll"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover-harness-drift
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-recover
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-recover-harness-drift
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover-compute-billing
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["hive-compute-billing"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover-compute-billing
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-recover
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-recover-compute-billing
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-execute-tier-config
+  namespace: shizuha-hive
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["hive-tiers"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-execute-tier-config
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-execute
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-execute-tier-config
+---
+# PLAT-7310: cronjob/hive-golden-path-validation (HIVE-580 golden-path
+# harness) is in the fleet ring's protected-target set
+# (.forgejo/scripts/ring_executor.py protected_targets), but the ring
+# executor SAs had no get/patch grant for it. Every fleet release since the
+# cronjob joined the protected set fail-closed at target claim:
+#   ::error::ring executor fail-closed: cannot CAS-claim protected
+#             cronjob/hive-golden-path-validation
+# (deploy-fleet red since 2026-08-29 22:59Z — runs #2385/#2431/#2434).
+# Grant both ring SAs the same resourceName-scoped get/patch the other
+# protected cronjobs carry.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-execute-golden-path
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["hive-golden-path-validation"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-execute-golden-path
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-execute
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-execute-golden-path
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover-golden-path
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["hive-golden-path-validation"]
+    verbs: ["get", "patch"]
+  # 2026-09-01: prometheusrule/hive-golden-path is also in protected_targets.
+  # Recover GET 403'd it → fail-closed "cannot CAS-claim protected
+  # prometheusrule/hive-golden-path" → fence stuck recovering → the next
+  # fleet execute cannot acquire (c34906b leftover-yield and 47f841e 90%
+  # cap both died here; live Hive stayed hive-8d8e847).
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules"]
+    resourceNames: ["hive-golden-path"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover-golden-path
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-recover
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-recover-golden-path
+---
+# 2026-09-02: cronjob/hive-forgejo-token-reconciler joined protected_targets
+# in 989d1f1 (executor Role resourceNames only). Recover GET 403'd it →
+# fail-closed "cannot CAS-claim protected cronjob/hive-forgejo-token-reconciler"
+# → fence stuck phase=recovering with a dead recover Job → the next fleet
+# execute cannot acquire (5cc6cf6 canary landed; fleet stayed hive-a85cceb).
+# Grant recover the same resourceName-scoped get/patch execute already has.
+# Applied by deploy-fleet BEFORE ring-executor submit, so recover can finish
+# an abandoned generation without waiting for execute to refresh the July Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover-forgejo-token
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["hive-forgejo-token-reconciler"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover-forgejo-token
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-recover
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-recover-forgejo-token
+
+---
+# Pre-submit recovery must be able to claim the existing platform-egress policy
+# before the next execute Job can refresh its full Role. Scope only this name.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover-platform-egress
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    resourceNames: ["allow-platform-egress"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover-platform-egress
+  namespace: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-ring-recover
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-ring-recover-platform-egress

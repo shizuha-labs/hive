@@ -1,0 +1,15 @@
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: hive-ring-owner-canary
+  namespace: origin
+  annotations:
+    shizuha.io/fence-token: "0"
+    shizuha.io/phase: completed
+    shizuha.io/ring-generation: bootstrap
+spec:
+  holderIdentity: '{"job":"bootstrap","release_sha":"0000000000000000000000000000000000000000","repo":"shizuha-labs/hive","restored_sha":"0000000000000000000000000000000000000000","ring":"canary","run_id":"0","run_number":"0","workflow":"deploy.yml"}'
+  leaseDurationSeconds: 90
+  acquireTime: "2026-07-31T00:00:00.000000Z"
+  renewTime: "2026-07-31T00:00:00.000000Z"
+  leaseTransitions: 0

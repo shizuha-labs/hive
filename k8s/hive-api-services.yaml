@@ -1,0 +1,53 @@
+# Hive API Services must select only long-lived backend pods.
+#
+# Several reconcilers run from the Hive image and intentionally share
+# app.kubernetes.io/name=hive, but they do not listen on port 8030. Selecting on
+# the legacy app=hive label alone admitted short-lived CronJob pods as ready
+# endpoints and caused intermittent ingress retries/slow page hydration.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive
+  namespace: shizuha-hive
+spec:
+  selector:
+    app: hive
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 8030
+      targetPort: 8030
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-direct
+  namespace: shizuha-hive
+spec:
+  clusterIP: None
+  selector:
+    app: hive
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 8030
+      targetPort: 8030
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hive-tail
+  namespace: shizuha-hive
+spec:
+  type: NodePort
+  selector:
+    app: hive
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 8030
+      targetPort: 8030
+      nodePort: 31830
+      protocol: TCP

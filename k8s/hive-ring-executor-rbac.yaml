@@ -1,0 +1,389 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hive-ring-submit
+  namespace: origin
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hive-ring-execute
+  namespace: origin
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hive-ring-recover
+  namespace: origin
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-submit
+  namespace: origin
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["hive-ring-owner-canary", "hive-ring-owner-fleet"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # PLAT-8230: when a ring Job misses its observation deadline the fail-loud
+  # diagnostics must be able to say WHY — watch pod state transitions and read
+  # the failed Job's logs. Least privilege: watch on pods only, logs stay
+  # read-only get; no exec, no write.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-submit
+  namespace: origin
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-submit, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-submit}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-submit-read-anchor
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["hive"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-submit-read-anchor
+  namespace: shizuha-hive
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-submit, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-submit-read-anchor}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-fence
+  namespace: origin
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["hive-ring-owner-canary", "hive-ring-owner-fleet"]
+    verbs: ["get", "update", "patch"]
+  # Kubernetes RBAC cannot resourceName-restrict create. The executor schema
+  # and typed NotFound branch restrict bootstrap to the two stable names.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["pulse-api-token"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-fence
+  namespace: origin
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-execute, namespace: origin}
+  - {kind: ServiceAccount, name: hive-ring-recover, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-fence}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-execute
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "endpoints", "events"]
+    verbs: ["get", "list", "watch"]
+  # HIVE-2567: the Connect cutover convergence gate self-heals orphaned
+  # old-image ReplicaSet pods (live, no deletionTimestamp, previous image —
+  # never reaped by the RS controller) that would otherwise fail the strict
+  # image gate forever and auto-rollback every healthy release (runs
+  # 2782/2787/2801/2803/2806). Deletion is graceful and bounded (max 3 pods,
+  # one attempt per name) and strictly narrower than the deployment delete
+  # this Role already holds. Run 2806 proved the gate code path but failed
+  # here with CalledProcessError: pods were read-only for this identity.
+  # Run 3071 cleared the RBAC layer but hit the next one: the fenced kubectl
+  # stamps ownership metadata (ring-generation + fence-token, then the
+  # delete-intent mark) onto an orphaned old-RS pod before its preconditioned
+  # delete — every mark is a JSON patch, so delete without patch leaves the
+  # self-heal fail-closed at the fence's adopt step. Administrator-applied
+  # (this manifest stays administrator-bootstrapped by design).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["hive-connect-hmac", "hive-installation-config"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["hive-tiers"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-execute
+  namespace: shizuha-hive
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-execute, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-execute}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-recover
+  namespace: shizuha-hive
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["hive", "hive-canary", "hive-codex-refresh"]
+    verbs: ["get", "watch", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["hive-canary"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["hive", "hive-direct", "hive-tail", "hive-connect-delivery", "hive-canary"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["hive-canary"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["hive-tiers"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames:
+      - hive-usage-outbox-dispatcher
+      - hive-identity-reconciler
+      - fleet-agent-liveness-reconciler
+      - hive-claw-isolation-reconcile
+      - hive-harness-autoupgrade
+      - hive-on-demand-reconciler
+      - hive-github-identity-reconciler
+      - hive-forgejo-token-reconciler
+      - hive-hosted-claw-wan-egress-smoke
+      - hive-compute-billing
+      # HIVE-580 golden-path arming: the recovery re-claims the full fleet
+      # surface after a rollback; run 2459's recovery failed fail-closed on
+      # this missing grant.
+      - hive-golden-path-validation
+    verbs: ["get", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    resourceNames: ["allow-intra-namespace", "allow-node-healthchecks", "allow-connect-delivery-ingress", "allow-platform-egress"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules"]
+    resourceNames:
+      - hive-codex-refresh
+      - hive-runtime-lane
+      - hive-runtime-contract
+      - hive-usage-outbox
+      - hive-golden-path
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "endpoints"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-recover
+  namespace: shizuha-hive
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-recover, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-recover}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-shizuha-proof
+  namespace: shizuha
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["hive-connect-hmac"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-shizuha-proof
+  namespace: shizuha
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-execute, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-shizuha-proof}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-monitoring
+  namespace: monitoring
+rules:
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["probes", "prometheusrules", "servicemonitors"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-monitoring
+  namespace: monitoring
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-execute, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-monitoring}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-ring-monitoring-recover
+  namespace: monitoring
+rules:
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["probes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheusrules"]
+    resourceNames: ["hive-on-demand-reconcile", "hive-claw-isolation-reconcile", "hive-hosted-claw-wan-egress-smoke", "hive-claw-idle"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
+    resourceNames: ["hive-claw-idle"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-ring-monitoring-recover
+  namespace: monitoring
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-recover, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: hive-ring-monitoring-recover}
+---
+# Read-only cross-service proof surfaces used by the existing release gates.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hive-ring-proof-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "endpoints", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hive-ring-proof-reader
+subjects:
+  - {kind: ServiceAccount, name: hive-ring-execute, namespace: origin}
+  - {kind: ServiceAccount, name: hive-ring-recover, namespace: origin}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: hive-ring-proof-reader}

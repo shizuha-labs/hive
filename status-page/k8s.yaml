@@ -1,0 +1,120 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: customer
+---
+# HIVE-333 P1-2: the status generator runs as a SIDECAR in the nginx pod with a
+# shared emptyDir (served as /live/), replacing the original CronJob whose
+# job-local emptyDir was discarded on exit — the page could never update.
+# Sidecar + emptyDir also avoids an RWX PVC (PLAT-1252 Longhorn regression).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: status-page
+  namespace: customer
+  labels:
+    app: status-page
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: status-page
+  template:
+    metadata:
+      labels:
+        app: status-page
+    spec:
+      containers:
+      - name: nginx
+        # HIVE-333 P2: pinned tag on the canonical in-cluster registry host
+        # (no :latest); HIVE-328 bumps the tag on redeploys.
+        image: localhost:30500/status-page:v0.1.0
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: status-live
+          mountPath: /usr/share/nginx/html/live
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 3
+          periodSeconds: 10
+      - name: generator
+        image: localhost:30500/status-generator:v0.1.0
+        env:
+        # HIVE-328: the kube-prometheus-stack Prometheus lives in the
+        # `monitoring` namespace and its Service is
+        # kube-prometheus-kube-prome-prometheus (verified reachable/healthy from
+        # this sidecar). The previous value (…-prometheus.shizuha.svc) does not
+        # resolve, so every component fell back to Unknown/degraded.
+        - name: PROMETHEUS_URL
+          value: "http://kube-prometheus-kube-prome-prometheus.monitoring.svc:9090"
+        - name: STATUS_DIR
+          value: "/data"
+        volumeMounts:
+        - name: status-live
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 50m
+            memory: 64Mi
+      volumes:
+      - name: status-live
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: status-page
+  namespace: customer
+spec:
+  selector:
+    app: status-page
+  ports:
+  - port: 80
+    targetPort: 80
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: status-page
+  namespace: customer
+  # HIVE-328: this cluster has NO cert-manager and NO per-ingress TLS. Public
+  # *.shizuha.com HTTPS is terminated at the edge nginx by a wildcard
+  # CN=*.shizuha.com Let's Encrypt cert, which proxies to the ingress NodePort
+  # (same pattern as origin/chat/cortex — none carry a tls block or cert-manager
+  # annotation). A cert-manager annotation is a dead no-op here and a tls block
+  # referencing a nonexistent secret only makes ingress-nginx serve a fake cert.
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: status.shizuha.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: status-page
+            port:
+              number: 80

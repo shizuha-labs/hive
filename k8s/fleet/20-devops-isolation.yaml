@@ -1,0 +1,266 @@
+# PLAT-151 / EPIC PLAT-146 — DevOps-agent (ichi/ni) namespace isolation + RBAC.
+# HLD PLAT-147 v0.2 (wiki 84b482e6) §3 (Q1b) + §11 R3.
+#
+# DevOps agents carry host-plane reach (SSH/Tailscale). A compromised DevOps pod
+# ≈ node/host compromise, so they are carved out of the shared fleet ns into
+# `shizuha-fleet-devops` with their own RBAC. The structural isolation property:
+#   * the fleet-ssh Secret lives ONLY in this namespace;
+#   * Roles are namespace-scoped and NO shizuha-fleet ServiceAccount has any
+#     RoleBinding into this namespace;
+#   * agent pods set automountServiceAccountToken: false (no kube-API path at all);
+#   => an ordinary shizuha-fleet agent cannot read the fleet-ssh Secret by any
+#      in-cluster API path. Only the kubelet mounts it into the DevOps pod.
+#
+# NOTE: the fleet-ssh *mechanism* (raw key vs short-TTL SSH cert vs Tailscale-ACL)
+# is GATED on Akira's R3 security review (PLAT-156 / HLD M2). The Secret shape and
+# the host-plane egress rule below are PLACEHOLDERS — do NOT finalize/apply until
+# that review lands. This file ships the namespace + RBAC + default-deny now.
+---
+# Dedicated ServiceAccount for DevOps agents. automountServiceAccountToken: false
+# is also set on the pod spec by the provisioner; pinned here as defense-in-depth.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fleet-devops-agent
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet-devops
+automountServiceAccountToken: false
+---
+# Zero-standing-privilege Role: the DevOps agent has NO kube-API permissions.
+# Its host reach comes from the (gated) SSH/Tailscale mechanism, never from the
+# kube API. An explicit empty Role makes the zero-privilege posture auditable.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fleet-devops-agent-noauthz
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+rules: []   # intentionally empty — no get/list/watch on any resource
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fleet-devops-agent-noauthz
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+subjects:
+  - kind: ServiceAccount
+    name: fleet-devops-agent
+    namespace: shizuha-fleet-devops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: fleet-devops-agent-noauthz
+---
+# Default-deny ALL ingress/egress in the DevOps ns (same posture as the fleet ns).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet-devops
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS egress (CoreDNS).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Platform egress (ns shizuha) — DevOps agents are also platform clients.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-egress
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shizuha
+      ports:
+        - { protocol: TCP, port: 8000 }
+        - { protocol: TCP, port: 8002 }
+        - { protocol: TCP, port: 8013 }
+        - { protocol: TCP, port: 8019 }
+---
+# External LLM HTTPS egress — DevOps agents (ichi/ni) are still LLM-driven and
+# need Anthropic/OpenAI-style outbound. Same allowlist as the fleet ns: 443 to
+# public internet, minus all internal ranges.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-llm-https-egress
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# In-cluster Cortex/vLLM egress for DevOps agents (same as the fleet ns).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cortex-llm-egress
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shizuha-cortex
+      ports:
+        - { protocol: TCP, port: 8040 }
+# ---------------------------------------------------------------------------
+# PLAT-156 DECIDED (Ren/Security, Aoi co-sign, wiki 74b498f3) — FINALIZED BELOW.
+# Posture: Tailscale-ACL per-identity node reach (axis ii) +
+#           Tailscale SSH preferred / short-TTL cert fallback (axis iii).
+#           NO long-lived raw bearer key at rest.
+# ---------------------------------------------------------------------------
+# (A) Host-plane egress NetworkPolicies — TEMPLATE ONLY.
+#
+#     !! LIVE OBJECTS ARE PROVISIONER-EMITTED !!
+#     The fleet provisioner (fleet/provisioner.py::_create_ssh_egress_network_policies)
+#     emits these NetworkPolicies into each isolated agent's per-agent namespace
+#     (fleet-<username>, e.g. fleet-ichi) at provisioning time.
+#     The shizuha-fleet-devops namespace below does NOT host DevOps agent pods;
+#     it is kept for the ServiceAccount + RBAC objects above only.
+#     Do NOT kubectl apply these NetworkPolicy objects directly — use the provisioner.
+#
+#     Two policies are emitted per isolated agent (P1-C fix, aoi review 2026-06-11):
+#
+#     1. allow-hostplane-ssh-egress  — tailnet /32 addresses only.
+#        Both this NetworkPolicy AND the Tailscale/Headscale ACL must allow a
+#        connection, preserving the per-identity boundary (PLAT-156 axis-ii).
+#        s1: 100.64.0.3/32 — k3s InternalIP = tailnet address (already on Tailscale).
+#        Add additional gx10 /32s here when PLAT-178 adds Tailscale SSH to those nodes.
+#
+#     2. allow-hostplane-ssh-bootstrap-lan  — LAN path for gx10 nodes not yet on
+#        Tailscale.  Label shizuha.io/plat178-retire=true; PLAT-178 deletes this
+#        policy when Tailscale SSH is active on all gx10 nodes.
+#
+# (template follows — do not apply directly)
+---
+# TEMPLATE — live object provisioner-emitted into fleet-<username> namespace.
+# See fleet/provisioner.py::_create_ssh_egress_network_policies.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-hostplane-ssh-egress
+  namespace: shizuha-fleet-devops   # template; live ns = fleet-<username>
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet-devops
+spec:
+  podSelector:
+    matchLabels:
+      shizuha.io/agent-role: devops-ssh
+  policyTypes: [Egress]
+  egress:
+    # s1 — Tailscale/tailnet node. Both this NetworkPolicy AND Headscale ACL
+    # must allow the connection (identity boundary preserved).
+    - to:
+        - ipBlock: { cidr: 100.64.0.3/32 }
+      ports:
+        - { protocol: TCP, port: 22 }
+    # Add gx10-N /32 tailnet addresses here when PLAT-178 puts them on Tailscale.
+---
+# TEMPLATE — live object provisioner-emitted into fleet-<username> namespace.
+# RETIRED BY PLAT-178 (Tailscale SSH on gx10 nodes).
+# Label shizuha.io/plat178-retire=true makes it machine-discoverable for cleanup.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-hostplane-ssh-bootstrap-lan
+  namespace: shizuha-fleet-devops   # template; live ns = fleet-<username>
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet-devops
+    shizuha.io/plat178-retire: "true"
+  annotations:
+    shizuha.io/retire-with: PLAT-178
+spec:
+  podSelector:
+    matchLabels:
+      shizuha.io/agent-role: devops-ssh
+  policyTypes: [Egress]
+  egress:
+    # gx10-1..12 cluster management LAN — bootstrap path until PLAT-178 completes.
+    # Once Tailscale SSH is active on all gx10 nodes, delete this policy and
+    # enumerate their /32 tailnet addresses in allow-hostplane-ssh-egress above.
+    - to:
+        - ipBlock: { cidr: 10.200.10.0/24 }
+      ports:
+        - { protocol: TCP, port: 22 }
+# ---------------------------------------------------------------------------
+# (B) Fleet-SSH Secret shape (PLAT-156 decided — PLAT-174 provisioner guidance):
+#
+#   PREFERRED — Tailscale SSH (axis iii, no static key at rest):
+#     The DevOps pod runs a Tailscale sidecar that joins the tailnet as its own
+#     identity (auth key stored as a Secret in THIS ns, one-time-use). Headscale
+#     ACLs gate which nodes the pod can reach over SSH. No bearer key stored.
+#
+#       Secret shape (Tailscale auth key, one-time-use):
+#         fleet-ts-authkey-<agent>   e.g. fleet-ts-authkey-ichi
+#           tailscale-auth-key: "<headscale-preauth-key>"  # one-time-use, ephemeral
+#
+#   FALLBACK — short-TTL SSH certificate minted on demand from the broker CA:
+#     CA signing key lives in the broker/control-plane ONLY. Minted certs have
+#     TTL 15–60m, forced-command, from= source scoping, and per-node principals.
+#     The agent pod NEVER holds the CA key — it only holds the ephemeral signed cert.
+#
+#       Secret shape (populated by the broker at mint-time, rotated every ~30m):
+#         fleet-ssh-cert-<agent>   e.g. fleet-ssh-cert-ichi
+#           ssh-cert: "<minted-short-ttl-cert>"
+#           ssh-known-hosts: "<cluster-node-host-keys>"
+#
+#   REJECTED — long-lived raw private key in a Secret. Per PLAT-156, this is the
+#     last-resort bootstrap fallback ONLY. Must be retired; use Tailscale SSH or
+#     short-TTL certs as the standing posture.

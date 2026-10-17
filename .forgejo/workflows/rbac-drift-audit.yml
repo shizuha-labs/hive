@@ -1,0 +1,45 @@
+# RBAC bound-surface drift audit (PLAT-11410 / PLAT-10277 fix-contract item 3).
+# Pages when a CI lane identity's bound RBAC surface SHRINKS: any
+# RoleBinding/ClusterRoleBinding removal, or any verb/resource narrowing,
+# relative to the last-known-good baseline in k8s/rbac-drift-baseline.json.
+#
+# Renewing the baseline (growth is expected, not a page):
+#   python -m security.rbac_drift_audit --capture k8s/rbac-drift-baseline.json
+# Run on a seat with cluster access, then commit the updated baseline.
+name: rbac-drift-audit
+
+on:
+  schedule:
+    # Daily stagger; the single shared runner is capacity 2, and a queued
+    # run does not occupy a slot (ORIG-71).
+    - cron: '15 3 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: rbac-drift-audit-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  rbac-drift-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit-test drift harness (no cluster access required)
+        run: python -m unittest security.tests.test_rbac_drift_audit -v
+      - name: Live bound-surface audit (requires cluster kubeconfig)
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KUBE_CONFIG_B64}" ]; then
+            echo "KUBE_CONFIG_B64 not set on this repo — skipping live audit leg (unit leg still gates)."
+            exit 0
+          fi
+          echo "${KUBE_CONFIG_B64}" | base64 -d > "$HOME/.kubeconfig"
+          chmod 600 "$HOME/.kubeconfig"
+          KUBECONFIG="$HOME/.kubeconfig" python -m security.rbac_drift_audit \
+            --baseline k8s/rbac-drift-baseline.json

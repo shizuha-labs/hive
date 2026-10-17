@@ -1,0 +1,53 @@
+{
+  "name": "shizuha-hive-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test:runtime-reconcile": "node src/lib/runtimeReconcile.test.mjs",
+    "test:browser-org-switcher": "node scripts/org-switcher-browser-regression.mjs",
+    "test:browser-agent-drawer": "node scripts/agent-drawer-browser-regression.mjs",
+    "test:browser-openclaw-dashboard": "node scripts/openclaw-dashboard-browser-regression.mjs",
+    "test:browser-operations-empty": "node scripts/operations-empty-state-browser-regression.mjs",
+    "test": "vitest run --environment jsdom",
+    "preview": "vite preview",
+    "lint": "eslint src --ext js,jsx --report-unused-disable-directives --max-warnings 0"
+  },
+  "dependencies": {
+    "@shizuha/ui": "file:vendor/ui.tgz",
+    "@tanstack/react-query": "^5.17.0",
+    "axios": "^1.20.0",
+    "clsx": "^2.1.0",
+    "date-fns": "^3.2.0",
+    "lucide-react": "^0.303.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^7.18.2",
+    "tailwind-merge": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.16",
+    "eslint": "^8.55.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "jsdom": "^24.1.3",
+    "playwright-core": "1.58.2",
+    "postcss": "^8.5.18",
+    "tailwindcss": "^3.4.0",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "brace-expansion": "1.1.18",
+    "esbuild": "^0.25.0",
+    "js-yaml": "^4.3.1",
+    "nanoid": "3.3.18",
+    "postcss": "^8.5.18"
+  }
+}

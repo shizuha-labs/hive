@@ -1,0 +1,973 @@
+#!/usr/bin/env python3
+"""Fenced kubectl facade used only inside the ring executor.
+
+It rejects untyped targets before invoking the real client, revalidates the
+stable Lease, and requires/stamps the exact generation on every protected
+object.  The runner never receives this write path.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from ring_fence import Conflict, Fence, FenceError, Holder, Kubectl
+from ring_executor import target_is_protected
+
+
+MUTATING = {"apply", "create", "delete", "patch", "replace", "label", "annotate", "set", "scale"}
+READ_SUBCOMMANDS = {"get", "logs", "wait", "rollout", "auth", "exec", "describe", "top", "version", "api-resources"}
+SERVICE_ALLOCATOR_FIELDS = {
+    "allocateLoadBalancerNodePorts",
+    "clusterIP",
+    "clusterIPs",
+    "healthCheckNodePort",
+    "ipFamilies",
+    "ipFamilyPolicy",
+}
+PROTECTED_METADATA_KEYS = {
+    "annotations": {
+        "batch.kubernetes.io/job-tracking",
+        "deployment.kubernetes.io/revision",
+        "kubectl.kubernetes.io/last-applied-configuration",
+        "shizuha.io/delete-intent",
+        "shizuha.io/fence-token",
+        "shizuha.io/ring-generation",
+    },
+    "labels": {
+        "apps.kubernetes.io/pod-index",
+        "batch.kubernetes.io/controller-uid",
+        "batch.kubernetes.io/job-name",
+        "controller-revision-hash",
+        "controller-uid",
+        "job-name",
+        "pod-template-hash",
+        "statefulset.kubernetes.io/pod-name",
+    },
+}
+
+
+def command(args: list[str]) -> str:
+    known = MUTATING | READ_SUBCOMMANDS
+    for item in args:
+        if item in known:
+            return item
+    raise FenceError("kubectl command is missing or not allowlisted")
+
+
+def namespace(args: list[str], default: str = "default") -> str:
+    for index, item in enumerate(args):
+        if item in {"-n", "--namespace"} and index + 1 < len(args):
+            return args[index + 1]
+        if item.startswith("--namespace="):
+            return item.split("=", 1)[1]
+    return default
+
+
+def normalized_kind(kind: str) -> str:
+    kind = kind.lower().split("/", 1)[0]
+    return {
+        "deploy": "deployment", "deployments": "deployment",
+        "deployment.apps": "deployment", "deployments.apps": "deployment",
+        "svc": "service", "services": "service",
+        "networkpolicies": "networkpolicy", "netpol": "networkpolicy",
+        "cronjobs": "cronjob", "jobs": "job", "configmaps": "configmap",
+        "secrets": "secret",
+        "probe": "probe.monitoring.coreos.com",
+        "probes": "probe.monitoring.coreos.com",
+        "probe.monitoring.coreos.com": "probe.monitoring.coreos.com",
+        "probes.monitoring.coreos.com": "probe.monitoring.coreos.com",
+        "prometheusrule": "prometheusrule",
+        "prometheusrules": "prometheusrule",
+        "prometheusrule.monitoring.coreos.com": "prometheusrule",
+        "prometheusrules.monitoring.coreos.com": "prometheusrule",
+    }.get(kind, kind)
+
+
+def allowed(holder: Holder, ns: str, kind: str, name: str) -> bool:
+    kind = normalized_kind(kind)
+    return target_is_protected(holder, ns, kind, name)
+
+
+def manifest_targets(args: list[str], stdin: str) -> tuple[list[dict[str, Any]], str | None]:
+    files: list[str] = []
+    for index, item in enumerate(args):
+        if item in {"-f", "--filename"} and index + 1 < len(args):
+            files.append(args[index + 1])
+        elif item.startswith("--filename="):
+            files.append(item.split("=", 1)[1])
+    if not files:
+        return [], None
+    documents: list[dict[str, Any]] = []
+    for item in files:
+        content = stdin if item == "-" else Path(item).read_text()
+        documents.extend(value for value in yaml.safe_load_all(content) if value)
+    return documents, files[0] if len(files) == 1 else None
+
+
+def simple_targets(args: list[str], cmd: str) -> list[tuple[str, str, str]]:
+    ns = namespace(args)
+    try:
+        offset = args.index(cmd) + 1
+    except ValueError:
+        return []
+    # Global flags are accepted on either side of the verb (`kubectl patch -n
+    # ns ...` is emitted by the fleet script).  Strip only options whose value
+    # shape is known; never reinterpret an arbitrary option value as a target.
+    value_options = {
+        "-n", "--namespace", "-o", "--output", "-p", "--patch",
+        "--patch-file", "-l", "--selector", "--field-manager",
+        "--timeout", "--request-timeout", "--context", "--kubeconfig",
+    }
+    pos: list[str] = []
+    index = offset
+    while index < len(args):
+        item = args[index]
+        if item in value_options:
+            index += 2
+            continue
+        if item.startswith("-"):
+            index += 1
+            continue
+        pos.append(item)
+        index += 1
+    if cmd == "set":
+        pos = pos[1:]  # image/env
+    if not pos:
+        return []
+    first = pos[0]
+    if "/" in first:
+        kind, name = first.split("/", 1)
+        return [(ns, normalized_kind(kind), name)]
+    if len(pos) < 2:
+        return []
+    kind = normalized_kind(first)
+    # Every non-manifest mutation in the release scripts has exactly one
+    # explicit object.  Treating option values as more names is dangerous
+    # (for example ``patch ... -p '{...}'``), so resolve only that object.
+    return [(ns, kind, pos[1].split("/", 1)[-1])]
+
+
+def with_server_dry_run(args: list[str]) -> list[str]:
+    result = []
+    skip = False
+    for item in args:
+        if skip:
+            skip = False
+            continue
+        if item in {"-o", "--output"}:
+            skip = True
+            continue
+        if item.startswith("--output=") or item.startswith("--dry-run="):
+            continue
+        result.append(item)
+    if command(args) == "apply":
+        # Client-side apply serializes the complete input back into the legacy
+        # last-applied annotation. Evidence ConfigMaps can be valid near the
+        # object-size limit while that duplicate annotation alone exceeds the
+        # 256 KiB annotation ceiling. The facade performs its own fenced CAS,
+        # so server-side apply is the correct validation renderer and does not
+        # need the client-side bookkeeping annotation.
+        if "--server-side" not in result:
+            result.append("--server-side")
+        if "--force-conflicts" not in result:
+            result.append("--force-conflicts")
+        if not any(
+            item == "--field-manager" or item.startswith("--field-manager=")
+            for item in result
+        ):
+            result.append("--field-manager=hive-ring-dry-run")
+    result.extend(["--dry-run=server", "-o", "json"])
+    return result
+
+
+def selector_targets(fence: Fence, args: list[str], cmd: str) -> list[tuple[str, str, str]]:
+    if cmd != "delete":
+        return []
+    selector = None
+    for index, item in enumerate(args):
+        if item in {"-l", "--selector"} and index + 1 < len(args):
+            selector = args[index + 1]
+        elif item.startswith("--selector="):
+            selector = item.split("=", 1)[1]
+    if not selector:
+        return []
+    pos = [item for item in args if not item.startswith("-")]
+    offset = pos.index(cmd) + 1
+    if offset >= len(pos):
+        raise FenceError("selector delete kind is missing")
+    kind = normalized_kind(pos[offset])
+    ns = namespace(args)
+    allowed_selectors = {
+        ("monitoring", "probe.monitoring.coreos.com", "service=hive,release_ring=canary"),
+        ("monitoring", "probe.monitoring.coreos.com", "service=hive,release_ring=fleet"),
+        (
+            "monitoring", "probe.monitoring.coreos.com",
+            "service=hive-reconcile,release_ring=reconcile-canary",
+        ),
+    }
+    if (ns, kind, selector) not in allowed_selectors:
+        raise FenceError("selector delete is not an allowlisted ring operation")
+    result = fence.api.run(["-n", ns, "get", kind, "-l", selector, "-o", "json"])
+    return [(ns, kind, item["metadata"]["name"]) for item in json.loads(result.stdout).get("items", [])]
+
+
+def has_selector(args: list[str]) -> bool:
+    return any(
+        item in {"-l", "--selector"} or item.startswith("--selector=")
+        for item in args
+    )
+
+
+def desired_objects(raw: str) -> list[dict[str, Any]]:
+    values = [value for value in yaml.safe_load_all(raw) if value]
+    result: list[dict[str, Any]] = []
+    for value in values:
+        if value.get("kind") == "List":
+            result.extend(value.get("items", []))
+        else:
+            result.append(value)
+    return result
+
+
+def cas_replace(fence: Fence, current: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
+    original_desired = json.loads(json.dumps(desired))
+    meta = original_desired["metadata"]
+    ns = meta.get("namespace", "default")
+    kind = normalized_kind(str(original_desired["kind"]))
+    name = meta["name"]
+    last_error: FenceError | None = None
+
+    # Deployment controllers update status/resourceVersion immediately after
+    # an apply. Kubernetes reports a failed JSON Patch `test` as a generic 422
+    # Invalid rather than Conflict, so the following adjacent `set image` used
+    # to roll back a healthy release. Retry only when a fresh owned read proves
+    # that resourceVersion advanced; unchanged invalid requests still fail on
+    # the first attempt, and every retry revalidates holder/token ownership.
+    for attempt in range(8):
+        candidate = json.loads(json.dumps(original_desired))
+        metadata = candidate.setdefault("metadata", {})
+        current_metadata = current.get("metadata", {})
+        labels = {**current_metadata.get("labels", {}), **metadata.get("labels", {})}
+        annotations = {
+            **current_metadata.get("annotations", {}),
+            **metadata.get("annotations", {}),
+        }
+        if labels:
+            metadata["labels"] = labels
+        metadata["annotations"] = annotations
+        annotations["shizuha.io/ring-generation"] = fence.holder.generation
+        annotations["shizuha.io/fence-token"] = str(fence.token)
+        operations = fence.target_tests(current)
+        for key in ("labels", "annotations", "finalizers", "ownerReferences"):
+            if key in metadata:
+                path = f"/metadata/{key}"
+                operations.append({
+                    "op": "replace" if key in current_metadata else "add",
+                    "path": path, "value": metadata[key],
+                })
+        for key in ("spec", "data", "binaryData", "stringData"):
+            if key in candidate:
+                if key == "spec" and kind == "service":
+                    # A server-side dry-run response includes allocator-owned
+                    # Service identity. Preserve that identity and patch only
+                    # fields owned by the release manifest.
+                    current_spec = current.get("spec", {})
+                    for field, value in candidate["spec"].items():
+                        if field in SERVICE_ALLOCATOR_FIELDS:
+                            continue
+                        escaped = field.replace("~", "~0").replace("/", "~1")
+                        operations.append({
+                            "op": "replace" if field in current_spec else "add",
+                            "path": f"/spec/{escaped}", "value": value,
+                        })
+                    continue
+                operations.append({
+                    "op": "replace" if key in current else "add",
+                    "path": f"/{key}", "value": candidate[key],
+                })
+        try:
+            return fence.api.json_patch(ns, kind, name, operations)
+        except FenceError as exc:
+            last_error = exc
+        refreshed_result = fence.api.run(
+            ["-n", ns, "get", kind, name, "-o", "json"], check=False,
+        )
+        if refreshed_result.returncode:
+            break
+        refreshed = json.loads(refreshed_result.stdout)
+        fence.target_tests(refreshed)
+        if (
+            refreshed.get("metadata", {}).get("uid")
+            != current_metadata.get("uid")
+            or str(refreshed.get("metadata", {}).get("resourceVersion"))
+            == str(current_metadata.get("resourceVersion"))
+        ):
+            break
+        current = refreshed
+        if attempt < 7:
+            time.sleep(0.1)
+
+    assert last_error is not None
+    message = f"CAS update rejected for {ns}/{kind}/{name}: {last_error}"
+    if isinstance(last_error, Conflict):
+        raise Conflict(message) from last_error
+    raise FenceError(message) from last_error
+
+
+def _pointer(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+_MISSING = object()
+
+
+def _at(value: Any, path: list[str]) -> Any:
+    current = value
+    for item in path:
+        if isinstance(current, dict):
+            if item not in current:
+                return _MISSING
+            current = current[item]
+        elif isinstance(current, list) and item.isdigit() and int(item) < len(current):
+            current = current[int(item)]
+        else:
+            return _MISSING
+    return current
+
+
+def _path(path: list[str]) -> str:
+    return "/" + "/".join(_pointer(item) for item in path)
+
+
+def _parse_pointer(pointer: str) -> list[str]:
+    """Decode one canonical JSON Pointer or fail closed on aliasing."""
+    if not pointer.startswith("/") or pointer.endswith("/-"):
+        raise FenceError("JSON patch path must be an exact existing field")
+    encoded = pointer[1:].split("/")
+    if any(re.search(r"~(?![01])", item) for item in encoded):
+        raise FenceError("JSON patch path contains a non-canonical escape")
+    path = [item.replace("~1", "/").replace("~0", "~") for item in encoded]
+    if _path(path) != pointer:
+        raise FenceError("JSON patch path is not canonically escaped")
+    return path
+
+
+def _exact_operation(current: dict[str, Any], desired: dict[str, Any], path: list[str]) -> list[dict[str, Any]]:
+    """Patch one command-declared field, never a server-dry-run parent object."""
+    before = _at(current, path)
+    after = _at(desired, path)
+    pointer = _path(path)
+    if after is _MISSING:
+        return [] if before is _MISSING else [{"op": "remove", "path": pointer}]
+    if before is _MISSING:
+        return [{"op": "add", "path": pointer, "value": after}]
+    if before == after:
+        return []
+    return [{"op": "replace", "path": pointer, "value": after}]
+
+
+def _option(args: list[str], *names: str) -> str | None:
+    for index, item in enumerate(args):
+        if item in names and index + 1 < len(args):
+            return args[index + 1]
+        for name in names:
+            if item.startswith(f"{name}="):
+                return item.split("=", 1)[1]
+    return None
+
+
+def _metadata_keys(args: list[str], cmd: str) -> list[str]:
+    offset = args.index(cmd) + 1
+    keys: list[str] = []
+    for item in args[offset:]:
+        if item.startswith("-"):
+            continue
+        if "=" in item:
+            keys.append(item.split("=", 1)[0])
+        elif item.endswith("-"):
+            keys.append(item[:-1])
+    return keys
+
+
+def _containers(value: dict[str, Any], collection: str) -> list[dict[str, Any]]:
+    result = _at(value, ["spec", "template", "spec", collection])
+    return result if isinstance(result, list) else []
+
+
+def _set_operations(args: list[str], current: dict[str, Any], desired: dict[str, Any]) -> list[dict[str, Any]]:
+    index = args.index("set")
+    if index + 1 >= len(args):
+        raise FenceError("set mutation is missing its typed subcommand")
+    subcommand = args[index + 1]
+    operations: list[dict[str, Any]] = []
+    if subcommand == "image":
+        requested = {
+            item.split("=", 1)[0]
+            for item in args[index + 2:]
+            if not item.startswith("-") and "=" in item
+        }
+        if not requested:
+            raise FenceError("set image has no named-container intent")
+        matched = 0
+        for collection in ("containers", "initContainers"):
+            before = _containers(current, collection)
+            after = {item.get("name"): item for item in _containers(desired, collection)}
+            for container_index, container in enumerate(before):
+                name = container.get("name")
+                if name in requested or "*" in requested:
+                    matched += 1
+                    if name not in after or "image" not in after[name]:
+                        raise FenceError(f"set image dry-run omitted named container {name!r}")
+                    change = _exact_operation(
+                        current, desired,
+                        ["spec", "template", "spec", collection, str(container_index), "image"],
+                    )
+                    if change:
+                        operations.append({
+                            "op": "test",
+                            "path": _path([
+                                "spec", "template", "spec", collection,
+                                str(container_index), "name",
+                            ]),
+                            "value": name,
+                        })
+                        operations.extend(change)
+        unresolved = requested - {"*"} - {
+            item.get("name")
+            for collection in ("containers", "initContainers")
+            for item in _containers(current, collection)
+        }
+        if unresolved:
+            raise FenceError(f"set image named unknown container(s): {sorted(unresolved)}")
+        if not matched:
+            raise FenceError("set image matched no containers")
+        return operations
+    if subcommand == "env":
+        selected = _option(args, "--containers")
+        names = None if selected in {None, "*"} else set(selected.split(","))
+        matched: set[str] = set()
+        for collection in ("containers", "initContainers"):
+            before = _containers(current, collection)
+            after = {item.get("name"): item for item in _containers(desired, collection)}
+            for container_index, container in enumerate(before):
+                name = container.get("name")
+                if names is not None and name not in names:
+                    continue
+                matched.add(str(name))
+                if name not in after:
+                    raise FenceError(f"set env dry-run omitted named container {name!r}")
+                change = _exact_operation(
+                    current, desired,
+                    ["spec", "template", "spec", collection, str(container_index), "env"],
+                )
+                if change:
+                    operations.append({
+                        "op": "test",
+                        "path": _path([
+                            "spec", "template", "spec", collection,
+                            str(container_index), "name",
+                        ]),
+                        "value": name,
+                    })
+                    operations.extend(change)
+        if names is not None and names - matched:
+            raise FenceError(f"set env named unknown container(s): {sorted(names - matched)}")
+        if not matched:
+            raise FenceError("set env matched no containers")
+        return operations
+    raise FenceError(f"set subcommand {subcommand!r} is not a typed ring operation")
+
+
+def _patch_text(args: list[str], stdin: str) -> str:
+    inline = _option(args, "-p", "--patch")
+    if inline is not None:
+        return inline
+    filename = _option(args, "--patch-file")
+    if filename in {"-", "/dev/stdin"}:
+        return stdin
+    if filename:
+        return Path(filename).read_text()
+    raise FenceError("typed patch is missing --patch or --patch-file")
+
+
+def _declared_paths(value: Any, prefix: list[str] | None = None) -> list[list[str]]:
+    prefix = prefix or []
+    if not isinstance(value, dict) or not value:
+        return [prefix]
+    if "$patch" in value:
+        return [prefix]
+    result: list[list[str]] = []
+    for key, child in value.items():
+        result.extend(_declared_paths(child, [*prefix, str(key)]))
+    return result
+
+
+def _validate_imperative_path(path: list[str], op: str | None = None) -> None:
+    if not path or path[0] not in {"metadata", "spec", "data", "binaryData", "stringData"}:
+        raise FenceError(f"imperative patch path is outside the protected object: {_path(path)}")
+    if path in (["metadata"], ["spec"]):
+        raise FenceError(f"whole-object imperative patch is forbidden: {_path(path)}")
+    if path[0] == "metadata":
+        # CAS test of the live object identity. record-successful-release.py
+        # stamps last-successful-sha with a JSON Patch that tests
+        # /metadata/resourceVersion first (Origin 38401: fleet gate PASS, then
+        # "refusing to advance release anchor" because this path was rejected).
+        if path == ["metadata", "resourceVersion"]:
+            if op != "test":
+                raise FenceError(
+                    f"imperative command cannot rewrite resourceVersion: {_path(path)}"
+                )
+            return
+        if len(path) != 3 or path[1] not in {"labels", "annotations"}:
+            raise FenceError(f"imperative metadata path is not an exact allowlisted key: {_path(path)}")
+        if path[2] in PROTECTED_METADATA_KEYS[path[1]]:
+            raise FenceError(f"imperative command cannot rewrite guard-owned metadata: {_path(path)}")
+
+
+def _patch_operations(
+    args: list[str], stdin: str, current: dict[str, Any], desired: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        patch = json.loads(_patch_text(args, stdin))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FenceError("typed patch payload is unreadable JSON") from exc
+    patch_type = (_option(args, "--type") or "strategic").lower()
+    if patch_type == "json":
+        if not isinstance(patch, list) or not patch:
+            raise FenceError("JSON patch must be a non-empty operation list")
+        result: list[dict[str, Any]] = []
+        for operation in patch:
+            if not isinstance(operation, dict) or operation.get("op") not in {"add", "remove", "replace", "test"}:
+                raise FenceError("JSON patch operation is not allowlisted")
+            pointer = str(operation.get("path", ""))
+            path = _parse_pointer(pointer)
+            _validate_imperative_path(path, op=str(operation.get("op") or ""))
+            result.append(operation)
+        return result
+    if patch_type not in {"merge", "strategic"} or not isinstance(patch, dict):
+        raise FenceError(f"patch type {patch_type!r} is not supported by the typed ring facade")
+    operations: list[dict[str, Any]] = []
+    for path in _declared_paths(patch):
+        _validate_imperative_path(path)
+        operations.extend(_exact_operation(current, desired, path))
+    return operations
+
+
+def cas_imperative_update(
+    fence: Fence, current: dict[str, Any], desired: dict[str, Any],
+    args: list[str], stdin: str,
+) -> dict[str, Any]:
+    """Compile command-specific intent; never diff an admitted full object.
+
+    Annotate/set/patch after a Deployment rollout races the controller's
+    status resourceVersion bump. k3s reports a failed JSON Patch `test` as
+    generic 422 Invalid (Hive fleet 2026-09-06: STREAM SHAs rolled the image
+    then died on the next imperative write). Retry only when a fresh owned
+    read proves resourceVersion advanced; unchanged invalid requests still
+    fail on the first attempt.
+    """
+    cmd = command(args)
+    meta = desired["metadata"]
+    ns = meta.get("namespace", "default")
+    kind = normalized_kind(str(desired["kind"]))
+    name = str(meta.get("name", ""))
+    working = current
+    last_error: FenceError | None = None
+    original_uid = str((working.get("metadata") or {}).get("uid", ""))
+
+    def _compile(live: dict[str, Any]) -> list[dict[str, Any]]:
+        compiled: list[dict[str, Any]] = []
+        if cmd in {"label", "annotate"}:
+            collection = "labels" if cmd == "label" else "annotations"
+            keys = _metadata_keys(args, cmd)
+            if not keys:
+                raise FenceError(f"{cmd} has no key-scoped intent")
+            for key in keys:
+                path = ["metadata", collection, key]
+                _validate_imperative_path(path)
+                compiled.extend(_exact_operation(live, desired, path))
+        elif cmd == "scale":
+            compiled.extend(_exact_operation(live, desired, ["spec", "replicas"]))
+        elif cmd == "set":
+            compiled.extend(_set_operations(args, live, desired))
+        elif cmd == "patch":
+            compiled.extend(_patch_operations(args, stdin, live, desired))
+        else:
+            raise FenceError(f"imperative command {cmd!r} has no typed compiler")
+        return compiled
+
+    for attempt in range(8):
+        compiled = _compile(working)
+        if not any(item.get("op") != "test" for item in compiled):
+            # The authoritative live read already proves the exact requested state;
+            # do not emit an empty metadata-only write just to manufacture change.
+            return working
+        operations = fence.target_tests(working) + compiled
+        try:
+            return fence.api.json_patch(ns, kind, name, operations)
+        except FenceError as exc:
+            last_error = exc
+        run = getattr(fence.api, "run", None)
+        if not callable(run):
+            break
+        refreshed_result = run(
+            ["-n", ns, "get", kind, name, "-o", "json"], check=False,
+        )
+        if getattr(refreshed_result, "returncode", 1):
+            break
+        refreshed = json.loads(refreshed_result.stdout)
+        fence.target_tests(refreshed)
+        refreshed_meta = refreshed.get("metadata") or {}
+        working_meta = working.get("metadata") or {}
+        if (
+            original_uid
+            and str(refreshed_meta.get("uid", "")) != original_uid
+        ) or str(refreshed_meta.get("resourceVersion")) == str(
+            working_meta.get("resourceVersion")
+        ):
+            break
+        working = refreshed
+        if attempt < 7:
+            time.sleep(0.1)
+    assert last_error is not None
+    raise last_error
+
+
+def clean_for_create(desired: dict[str, Any]) -> dict[str, Any]:
+    result = json.loads(json.dumps(desired))
+    result.pop("status", None)
+    metadata = result.setdefault("metadata", {})
+    for key in (
+        "creationTimestamp", "deletionGracePeriodSeconds", "deletionTimestamp",
+        "generation", "managedFields", "resourceVersion", "selfLink", "uid",
+    ):
+        metadata.pop(key, None)
+    if normalized_kind(str(result.get("kind", ""))) == "job":
+        # A server-side dry-run of a Job injects a synthetic controller UID,
+        # selector, and matching template labels. Those values belong only to
+        # the discarded dry-run object; sending them in the real create makes
+        # the Job controller reject the manifest as a manual selector.
+        generated_labels = {
+            "batch.kubernetes.io/controller-uid",
+            "batch.kubernetes.io/job-name",
+            "controller-uid",
+            "job-name",
+        }
+        for labels in (
+            metadata.get("labels", {}),
+            result.get("spec", {}).get("template", {}).get("metadata", {}).get("labels", {}),
+        ):
+            for key in generated_labels:
+                labels.pop(key, None)
+        result.get("spec", {}).pop("selector", None)
+    if normalized_kind(str(result.get("kind", ""))) == "service":
+        # Kubernetes server dry-run fills clusterIP fields with the sentinel
+        # 10.43.0.0. That value is evidence of allocation intent, not a valid
+        # address to submit in the subsequent real create.
+        spec = result.get("spec", {})
+        for key in (
+            "clusterIP", "clusterIPs", "healthCheckNodePort",
+            "ipFamilies", "ipFamilyPolicy",
+        ):
+            spec.pop(key, None)
+        for port in spec.get("ports", []):
+            port.pop("nodePort", None)
+    return result
+
+
+def has_server_dry_run(args: list[str]) -> bool:
+    for index, item in enumerate(args):
+        if item == "--dry-run=server":
+            return True
+        if item == "--dry-run" and index + 1 < len(args) and args[index + 1] == "server":
+            return True
+    return False
+
+
+def ignores_not_found(args: list[str]) -> bool:
+    return "--ignore-not-found" in args or "--ignore-not-found=true" in args
+
+
+def waits_for_delete(args: list[str]) -> bool:
+    for index, item in enumerate(args):
+        if item == "--wait=false":
+            return False
+        if item == "--wait" and index + 1 < len(args) and args[index + 1] == "false":
+            return False
+    return True
+
+
+def adopt_generationless_pod(
+    fence: Fence, ns: str, kind: str, name: str, value: dict[str, Any],
+) -> None:
+    """Stamp fence ownership onto an allowlisted pod that predates fencing.
+
+    Orphaned old-ReplicaSet pods (HIVE-2567) are created by the ReplicaSet
+    controller, never by a release, so they carry no ring-generation and the
+    strict predecessor-ownership test would hold fail-closed on them forever
+    (run 3071). Adoption is bounded to pods — every other kind keeps the
+    strict semantics — stamps only ownership metadata under a
+    resourceVersion CAS, and the subsequent delete still carries uid +
+    resourceVersion preconditions read after the stamp. Objects that already
+    carry a generation keep the strict cross-generation Conflict semantics.
+    """
+    if kind != "pod":
+        return
+    metadata = value.get("metadata", {})
+    annotations = metadata.get("annotations") or {}
+    if annotations.get("shizuha.io/ring-generation") is not None:
+        return
+    claims = {
+        "shizuha.io/ring-generation": fence.holder.generation,
+        "shizuha.io/fence-token": str(fence.token),
+    }
+    if "annotations" in metadata:
+        ops = [
+            {
+                "op": "add",
+                "path": f"/metadata/annotations/{key.replace('/', '~1')}",
+                "value": claim,
+            }
+            for key, claim in claims.items()
+        ]
+    else:
+        ops = [{"op": "add", "path": "/metadata/annotations", "value": claims}]
+    ops.insert(0, {
+        "op": "test",
+        "path": "/metadata/resourceVersion",
+        "value": str(metadata["resourceVersion"]),
+    })
+    fence.validate()
+    marked = fence.api.json_patch(ns, kind, name, ops)
+    value.clear()
+    value.update(marked)
+
+
+def dry_run_manifest(real: str, args: list[str], desired: dict[str, Any]) -> dict[str, Any]:
+    rendered: list[str] = []
+    skip = False
+    for item in with_server_dry_run(args):
+        if skip:
+            skip = False
+            continue
+        if item in {"-f", "--filename"}:
+            rendered.extend([item, "-"])
+            skip = True
+            continue
+        if item.startswith("--filename="):
+            rendered.append("--filename=-")
+            continue
+        rendered.append(item)
+    result = subprocess.run(
+        [real, *rendered], input=json.dumps(desired), text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        raise FenceError(f"server dry-run failed: {result.stderr[-500:]}")
+    values = desired_objects(result.stdout)
+    if len(values) != 1:
+        raise FenceError("server dry-run did not return exactly one object")
+    return values[0]
+
+
+def raw_delete(
+    fence: Fence, namespace_name: str, kind: str, name: str,
+    current: dict[str, Any], *, wait_for_delete: bool,
+) -> None:
+    group_paths = {
+        "deployment": ("/apis/apps/v1", "deployments"),
+        "service": ("/api/v1", "services"),
+        # HIVE-2579 (run 3071): the cutover gate's orphaned old-RS pod delete
+        # is a fenced mutation like any other — preconditioned, foreground.
+        "pod": ("/api/v1", "pods"),
+        "job": ("/apis/batch/v1", "jobs"),
+        "cronjob": ("/apis/batch/v1", "cronjobs"),
+        "configmap": ("/api/v1", "configmaps"),
+        "secret": ("/api/v1", "secrets"),
+        "networkpolicy": ("/apis/networking.k8s.io/v1", "networkpolicies"),
+        "probe.monitoring.coreos.com": ("/apis/monitoring.coreos.com/v1", "probes"),
+        "prometheusrule": ("/apis/monitoring.coreos.com/v1", "prometheusrules"),
+    }
+    prefix, plural = group_paths[kind]
+    uri = f"{prefix}/namespaces/{namespace_name}/{plural}/{name}"
+    for attempt in range(5):
+        try:
+            operations = fence.target_tests(current)
+            operations.append({
+                "op": "add", "path": "/metadata/annotations/shizuha.io~1delete-intent",
+                "value": fence.holder.generation,
+            })
+            marked = fence.api.json_patch(namespace_name, kind, name, operations)
+            body = json.dumps({
+                "apiVersion": "v1", "kind": "DeleteOptions",
+                "preconditions": {
+                    "uid": marked["metadata"]["uid"],
+                    "resourceVersion": str(marked["metadata"]["resourceVersion"]),
+                },
+                "propagationPolicy": "Foreground",
+            })
+            fence.validate()
+            fence.api.run(["delete", f"--raw={uri}", "-f", "-"], stdin=body)
+            break
+        except Conflict:
+            if attempt == 4:
+                raise
+            # Deployment controllers can advance status/resourceVersion
+            # between the read, intent mark, and preconditioned delete. Retry
+            # only after revalidating both the Lease and target generation.
+            fence.validate()
+            refreshed = fence.api.run(
+                ["-n", namespace_name, "get", kind, name, "-o", "json"],
+                check=False,
+            )
+            if refreshed.returncode:
+                if "NotFound" in refreshed.stderr:
+                    return
+                raise FenceError(f"target refresh failed or absence ambiguous: {namespace_name}/{kind}/{name}")
+            current = json.loads(refreshed.stdout)
+            fence.target_tests(current)
+            time.sleep(0.1)
+    if wait_for_delete:
+        fence.api.run([
+            "-n", namespace_name, "wait", "--for=delete", f"{kind}/{name}",
+            "--timeout=600s",
+        ])
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    real = os.environ.get("RING_KUBECTL_REAL", "/usr/local/bin/kubectl")
+    try:
+        cmd = command(args)
+    except FenceError as exc:
+        print(f"::error::fenced kubectl rejected operation: {exc}", file=sys.stderr)
+        return 2
+    if cmd not in MUTATING:
+        if cmd not in READ_SUBCOMMANDS:
+            print(f"::error::kubectl operation {cmd!r} is not allowlisted", file=sys.stderr)
+            return 2
+        return subprocess.call([real, *args])
+    if "--dry-run=client" in args:
+        # Local rendering has no API-side effect; the piped apply is fenced.
+        return subprocess.call([real, *args])
+
+    try:
+        holder = Holder.from_env()
+        fence = Fence(holder, Kubectl(real))
+        fence.token = int(os.environ["RING_FENCE_TOKEN"])
+        fence.validate()
+        stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
+        manifests, _ = manifest_targets(args, stdin)
+        targets: list[tuple[str, str, str]] = []
+        for item in manifests:
+            meta = item.setdefault("metadata", {})
+            ns = meta.get("namespace", namespace(args))
+            kind = normalized_kind(str(item.get("kind", "")))
+            name = str(meta.get("name", ""))
+            targets.append((ns, kind, name))
+            annotations = meta.setdefault("annotations", {})
+            annotations["shizuha.io/ring-generation"] = holder.generation
+            annotations["shizuha.io/fence-token"] = str(fence.token)
+        selector_mutation = cmd == "delete" and has_selector(args)
+        if not targets:
+            targets = selector_targets(fence, args, cmd)
+        if not targets and not selector_mutation:
+            targets = simple_targets(args, cmd)
+        if not targets:
+            if selector_mutation:
+                # An allowlisted selector matching zero objects is the exact
+                # `--ignore-not-found` postcondition, not an untyped mutation.
+                fence.validate()
+                return 0
+            raise FenceError("could not resolve a typed mutation target")
+        current_by_target: dict[tuple[str, str, str], dict[str, Any] | None] = {}
+        for ns, kind, name in targets:
+            if not allowed(holder, ns, kind, name):
+                raise FenceError(f"protected target is not allowlisted: {ns}/{kind}/{name}")
+            current = fence.api.run(["-n", ns, "get", kind, name, "-o", "json"], check=False)
+            if current.returncode == 0:
+                value = json.loads(current.stdout)
+                if cmd == "delete":
+                    adopt_generationless_pod(fence, ns, kind, name, value)
+                fence.target_tests(value)
+                current_by_target[(ns, kind, name)] = value
+            elif "NotFound" not in current.stderr or not (
+                cmd in {"apply", "create"}
+                or (cmd == "delete" and ignores_not_found(args))
+            ):
+                raise FenceError(f"target read failed or absence ambiguous: {ns}/{kind}/{name}")
+            else:
+                current_by_target[(ns, kind, name)] = None
+        fence.validate()
+        if has_server_dry_run(args):
+            # Validation is still mandatory, but a caller-requested dry-run
+            # must never be promoted into a persisted CAS mutation.
+            return subprocess.run([real, *args], input=stdin or None, text=True).returncode
+        if cmd == "create" and any(value is not None for value in current_by_target.values()):
+            # A create-once artifact must be born with final identity. Never
+            # silently reinterpret a name collision as declarative update.
+            raise FenceError("create target already exists; collision reuse is forbidden")
+        if cmd == "delete":
+            for target in targets:
+                current = current_by_target[target]
+                if current is not None:
+                    raw_delete(
+                        fence, *target, current,
+                        wait_for_delete=waits_for_delete(args),
+                    )
+            return 0
+
+        manifest_mutation = bool(manifests)
+        if manifests:
+            manifests = [dry_run_manifest(real, args, item) for item in manifests]
+        else:
+            dry = subprocess.run(
+                [real, *with_server_dry_run(args)], input=stdin or None,
+                text=True, capture_output=True,
+            )
+            if dry.returncode:
+                raise FenceError(f"server dry-run failed: {dry.stderr[-500:]}")
+            manifests = desired_objects(dry.stdout)
+        updated = []
+        for desired in manifests:
+            meta = desired.setdefault("metadata", {})
+            ns = meta.setdefault("namespace", namespace(args))
+            kind = normalized_kind(str(desired.get("kind", "")))
+            name = str(meta.get("name", ""))
+            target = (ns, kind, name)
+            if target not in current_by_target:
+                raise FenceError(f"dry-run returned an unapproved target: {target}")
+            current = current_by_target[target]
+            annotations = meta.setdefault("annotations", {})
+            annotations["shizuha.io/ring-generation"] = holder.generation
+            annotations["shizuha.io/fence-token"] = str(fence.token)
+            fence.validate()
+            if current is None:
+                created = fence.api.run(
+                    ["create", "-f", "-", "-o", "json"],
+                    stdin=json.dumps(clean_for_create(desired)),
+                )
+                updated.append(json.loads(created.stdout))
+            elif not manifest_mutation:
+                updated.append(cas_imperative_update(fence, current, desired, args, stdin))
+            else:
+                updated.append(cas_replace(fence, current, desired))
+        if "-o" in args or any(item.startswith("--output") for item in args):
+            print(json.dumps(updated[0] if len(updated) == 1 else {"kind": "List", "items": updated}))
+        return 0
+    except (FenceError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        print(f"::error::fenced kubectl rejected mutation: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

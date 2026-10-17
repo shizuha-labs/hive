@@ -1,0 +1,383 @@
+# Fleet-agent liveness reconciler (operator 2026-07-12: "ensure all our agents
+# keep working, loop every 15-30 min").
+#
+# WHY THIS EXISTS: agents can wedge in-pod — the container stays Running (2/2,
+# broker sidecar healthy) but the agent's heartbeat/work loop dies (observed:
+# DeepSeek-V4-Flash slow-TTFT stall, codex model-manager hangs). k8s never
+# restarts them because the readiness probe only checks the MCP-proxy socket,
+# not loop liveness. This backstop detects the dead loop and restarts it. The
+# eventual k8s-native fix is a heartbeat-freshness livenessProbe (PLAT-4210);
+# this CronJob is the interim, and stays useful as defence-in-depth.
+#
+# SILENCE SIGNAL: in-pod shizuha.log mtime (SCLI pino file) combined with kube stdout.
+# ACTIVITY CLOCK: only embedded timestamps from recognized runtime/audit/turn
+# records advance last_active_at; startup stdout and copied mtimes never do.
+# Kube stdout goes silent after "AgentAvailability set active=true" — pino
+# writes to ~/.config/shizuha/logs/shizuha.log. Treating kube silence as a
+# dead loop bounced GLM lease holders hourly (agent-kei 2026-09-04: 50m
+# "log-silence" while Cortex served 165k-token turns → 0% cache rebuild).
+# Fail OPEN when neither signal is readable: kube-log silence is not proof
+# the loop is dead. We deliberately do NOT use FleetAgent.last_active_at as
+# the restart gate — it has a known false-stale bug (PLAT-906 class).
+#
+# SAFETY: per-agent 60-min restart cooldown (deployment annotation) bounds churn
+# to <=1 restart/hr/agent even under a persistent fault; DRY_RUN env for probing.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fleet-agent-liveness-reconciler-script
+  namespace: shizuha-hive
+  labels:
+    app: hive
+    app.kubernetes.io/component: liveness-reconciler
+data:
+  reconcile_liveness.py: |
+    import datetime, os
+    from fleet.models import FleetAgent
+    from django.db.models import Q
+    from fleet import provisioner
+    from fleet.timeutils import naive_utc
+    from fleet.liveness_activity import (
+        classify_exec_error,
+        remote_probe_source,
+        stdout_activity_epoch,
+        unwrap_text,
+    )
+    from kubernetes.client.rest import ApiException
+    from kubernetes.stream import stream
+
+    WEDGE_SECONDS = int(os.environ.get('WEDGE_SECONDS', '2100'))      # 35 min silence => loop dead
+    COOLDOWN_SECONDS = int(os.environ.get('COOLDOWN_SECONDS', '3600')) # <=1 restart/hr/agent
+    LOG_LOOKBACK = int(os.environ.get('LOG_LOOKBACK', '3600'))
+    DRY_RUN = os.environ.get('DRY_RUN', '').lower() in ('1', 'true', 'yes')
+    # Probe the cortex path agent runtimes actually depend on: the in-cluster
+    # cortex Service (:8040, allowed by the allow-cortex-llm-egress fence).
+    # The former default (https://cortex.shizuha.com/v1/models) is hairpinned
+    # by coredns-custom to the LAN VIP (192.168.88.250), which the agent SSRF
+    # fence (allow-llm-https-egress, excepts 192.168.0.0/16) blocks — so the
+    # probe could never pass from inside an agent pod and every run with a
+    # RUNNING agent exited non-zero (KubeJobFailed every schedule tick).
+    # Override via env to probe a different vantage deliberately.
+    VIP_PROBE_URL = os.environ.get(
+        'VIP_PROBE_URL',
+        'http://cortex.shizuha-cortex.svc.cluster.local:8040/v1/models')
+
+    # aware UTC — Hive runs USE_TZ=False (django timezone.now() would be naive),
+    # but every timestamp we compare against (pod.status.start_time, k8s log
+    # timestamps, our own annotations) is offset-aware.
+    now = datetime.datetime.now(datetime.timezone.utc)
+    core_v1, apps_v1, _ = provisioner.get_k8s_client()
+
+    def kube_log_signal(ns, pod):
+        try:
+            raw = core_v1.read_namespaced_pod_log(
+                pod, ns, container='agent', tail_lines=1,
+                timestamps=True, since_seconds=LOG_LOOKBACK)
+        except ApiException:
+            return None, None
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', 'replace')
+        line = (raw or '').strip()
+        # This k8s client build returns the REPR of bytes ("b'...\\n'") as a str;
+        # unwrap it back to the real text before parsing the leading timestamp.
+        if line[:2] in ("b'", 'b"'):
+            import ast
+            try:
+                line = ast.literal_eval(line).decode('utf-8', 'replace').strip()
+            except Exception:
+                return None, None
+        if not line:
+            return None, None
+        ts = line.split(' ', 1)[0].replace('Z', '+00:00')
+        if '.' in ts:
+            head, rest = ts.split('.', 1)
+            tz = '+00:00'
+            for suf in ('+00:00', '-00:00'):
+                if rest.endswith(suf):
+                    rest, tz = rest[:-len(suf)], suf
+            ts = f'{head}.{rest[:6]}{tz}'
+        try:
+            return (now - datetime.datetime.fromisoformat(ts)).total_seconds(), stdout_activity_epoch(line)
+        except Exception:
+            return None, None
+
+    def file_log_signal(ns, pod):
+        # SCLI pino writes to ~/.config/shizuha/logs/shizuha.log, NOT stdout.
+        # kube log-silence after "AgentAvailability set active=true" is the
+        # steady state of a WORKING agent (agent-kei 2026-09-04: 8 stdout
+        # lines at boot, then 50m "silence" while Cortex served 165k-token
+        # turns). Restarting on kube silence destroys the prefix cache.
+        try:
+            raw = stream(
+                core_v1.connect_get_namespaced_pod_exec,
+                pod, ns,
+                command=['python3', '-c', remote_probe_source()],
+                container='agent', stderr=True, stdin=False, stdout=True, tty=False,
+            )
+        except Exception as exc:
+            cls = classify_exec_error(exc)
+            probe_errors[cls] += 1
+            print(f'FILELOG_ERROR {ns}/{pod}: vip_probe_error={cls}: '
+                  f'{type(exc).__name__}: {exc}')
+            return None, None
+        try:
+            import math
+            # ApiClient may deserialize remote JSON and then stringify the dict
+            # as Python repr. Preserve native mappings and use the same safe
+            # transport decoder as the runtime readiness caller.
+            signal = provisioner._decode_exec_mapping(raw if isinstance(raw, dict) else unwrap_text(raw))
+            mtime = signal.get('file_mtime')
+            file_age = None
+            if type(mtime) in (int, float) and math.isfinite(mtime) and mtime > 0:
+                file_age = max(0.0, now.timestamp() - mtime)
+            activity = signal.get('activity_epoch')
+            if type(activity) not in (int, float) or not math.isfinite(activity):
+                activity = None
+            if activity is not None and (activity <= 0 or activity > datetime.datetime.now(datetime.timezone.utc).timestamp()):
+                activity = None
+            return file_age, activity
+        except (TypeError, ValueError, AttributeError) as exc:
+            # Missing/undecodable source payload (PLAT-9950): an exec that ran
+            # but returned nothing decodable is a probe-classification error
+            # (missing_source), not a live-activity signal — typed, counted,
+            # and never silently swallowed into "no signal".
+            probe_errors['missing_source'] += 1
+            print(f'FILELOG_DECODE_ERROR {ns}/{pod}: '
+                  f'vip_probe_error=missing_source: {type(exc).__name__}: {exc}')
+            return None, None
+
+    def vip_reachable(ns, pod):
+        # Execute inside the real runtime network namespace. Do not use --fail:
+        # any HTTP response proves DNS/TCP/TLS reachability; rc=7 is the PLAT-4549
+        # refusal class. Positional $1 keeps the operator-controlled URL out of
+        # shell syntax.
+        command = [
+            'sh', '-lc',
+            'if curl -skS -o /dev/null --connect-timeout 3 --max-time 8 "$1"; '
+            'then echo __VIP_OK__; else rc=$?; echo __VIP_FAIL__:$rc; fi',
+            'vip-probe', VIP_PROBE_URL,
+        ]
+        try:
+            out = stream(
+                core_v1.connect_get_namespaced_pod_exec,
+                pod, ns, container='agent', command=command,
+                stderr=True, stdin=False, stdout=True, tty=False,
+            )
+        except Exception as exc:
+            cls = classify_exec_error(exc)
+            # Typed classification (PLAT-9950): the probe never ran, so this is
+            # NOT evidence of a dead runtime. Fail open as INDETERMINATE with an
+            # actionable reason — transport crash vs RBAC/exec denial (the
+            # isolated-namespace class cured only via PLAT-9114's scoped
+            # bootstrap). Never a bare NoneType.decode crash string.
+            return None, f'vip_probe_error={cls}:{type(exc).__name__}: {exc}'
+        text = (out or '').strip().replace(chr(10), ' ')
+        return '__VIP_OK__' in text, text[-300:]
+
+    healthy = wedged = restarted = skipped = nopod = errors = vip_failed = 0
+    vip_transport_errors = 0
+    probe_errors = {'transport': 0, 'exec_denied': 0, 'missing_source': 0}
+    running = list(FleetAgent.objects.filter(status=FleetAgent.Status.RUNNING))
+    for a in running:
+        try:
+            ns = a.namespace or provisioner.agent_namespace(a)
+            dep = f'agent-{a.agent_username}'
+            pods = []
+            try:
+                pods = core_v1.list_namespaced_pod(
+                    ns, label_selector=f'shizuha.io/agent={a.agent_username}').items
+            except ApiException:
+                pass
+            if not pods:
+                try:
+                    pods = [p for p in core_v1.list_namespaced_pod(ns).items
+                            if p.metadata.name.startswith(dep + '-')]
+                except ApiException:
+                    pods = []
+            run_pods = [p for p in pods if (p.status.phase == 'Running')]
+            if not run_pods:
+                nopod += 1
+                print(f'NOPOD {a.agent_username} ns={ns} phases={[p.status.phase for p in pods] or "none"}')
+                continue
+            pod = run_pods[0]
+            reachable, vip_detail = vip_reachable(ns, pod.metadata.name)
+            if reachable is None:
+                # Indeterminate: transport died before the probe ran. This is
+                # NOT evidence of a dead runtime — count it separately from
+                # vip_failed (never a page/restart trigger on its own), but do
+                # NOT skip the agent: the PLAT-4924 contract keeps the VIP probe
+                # advisory to the activity clock, so the per-agent flow must
+                # still run exactly as it does after a VIP-REFUSED.
+                vip_transport_errors += 1
+                print(f'VIP-TRANSPORT-ERROR {a.agent_username} ns={ns} '
+                      f'pod={pod.metadata.name} detail={vip_detail} '
+                      f'(fail-open; probe never ran, not evidence of a dead runtime)')
+            if not reachable:
+                vip_failed += 1
+                print(f'VIP-REFUSED {a.agent_username} ns={ns} '
+                      f'pod={pod.metadata.name} detail={vip_detail}')
+            kube_age, kube_activity = kube_log_signal(ns, pod.metadata.name)
+            file_age, file_activity = file_log_signal(ns, pod.metadata.name)
+            # Runtime event time is a distinct clock from transport/file silence.
+            # Bootstrap chatter and copied-file mtimes cannot advance product activity.
+            activity_times = [x for x in (kube_activity, file_activity) if x is not None]
+            if activity_times:
+                try:
+                    measured = naive_utc(datetime.datetime.fromtimestamp(max(activity_times), datetime.timezone.utc))
+                    # The pod read may outlive a write by another producer.
+                    # Compare the current DB clock atomically, not the sweep snapshot.
+                    FleetAgent.objects.filter(pk=a.pk).filter(
+                        Q(last_active_at__isnull=True) | Q(last_active_at__lt=measured)
+                    ).update(last_active_at=measured)
+                except Exception as exc:
+                    errors += 1
+                    print(f'ACTIVITY_UPDATE_ERROR {a.agent_username}: {type(exc).__name__}: {exc}')
+            ages = [x for x in (kube_age, file_age) if x is not None]
+            pod_age = (now - pod.status.start_time).total_seconds() if pod.status.start_time else 0
+            if not ages:
+                if pod_age < WEDGE_SECONDS:
+                    healthy += 1; continue  # too new to judge
+                skipped += 1
+                print(f'SKIP {a.agent_username} no-activity-signal pod_age={pod_age/60:.0f}m '
+                      f'(fail-open; kube-log silence is not a dead loop)')
+                continue
+            age = min(ages)
+            src = 'file' if file_age is not None and (kube_age is None or file_age <= kube_age) else 'kube'
+            if age < WEDGE_SECONDS:
+                healthy += 1; continue
+            wedged += 1
+            try:
+                dobj = apps_v1.read_namespaced_deployment(dep, ns)
+            except ApiException:
+                print(f'WEDGED {a.agent_username} silent={age/60:.0f}m — no deployment, skip'); continue
+            lr = (dobj.metadata.annotations or {}).get('shizuha.io/last-auto-restart')
+            if lr:
+                try:
+                    if (now - datetime.datetime.fromisoformat(lr)).total_seconds() < COOLDOWN_SECONDS:
+                        skipped += 1
+                        print(f'COOLDOWN {a.agent_username} silent={age/60:.0f}m (restarted recently)')
+                        continue
+                except Exception:
+                    pass
+            if DRY_RUN:
+                print(f'WOULD-RESTART {a.agent_username} silent={age/60:.0f}m src={src} pod={pod.metadata.name}')
+                continue
+            patch = {'metadata': {'annotations': {'shizuha.io/last-auto-restart': now.isoformat()}},
+                     'spec': {'template': {'metadata': {'annotations': {
+                         'shizuha.io/restartedAt': now.isoformat(),
+                         'shizuha.io/restart-reason': f'liveness-reconciler: {age/60:.0f}m {src}-log-silence'}}}}}
+            apps_v1.patch_namespaced_deployment(dep, ns, patch)
+            restarted += 1
+            print(f'RESTARTED {a.agent_username} silent={age/60:.0f}m src={src} pod={pod.metadata.name}')
+        except Exception as exc:
+            errors += 1
+            print(f'ERROR {a.agent_username}: {type(exc).__name__}: {exc}')
+
+    print(f'SUMMARY dry_run={DRY_RUN} running={len(running)} healthy={healthy} '
+          f'wedged={wedged} restarted={restarted} cooldown_skipped={skipped} '
+          f'nopod={nopod} errors={errors} vip_failed={vip_failed} '
+          f'vip_transport_errors={vip_transport_errors} '
+          f'vip_probe_errors=transport={probe_errors["transport"]} '
+          f'exec_denied={probe_errors["exec_denied"]} '
+          f'missing_source={probe_errors["missing_source"]}')
+
+    # PLAT-4924 contract (fail-loud on monitoring blindness): if transport
+    # errors left the detector with not one positively-probed agent, the run
+    # must still end with the detector's SystemExit — silent monitoring
+    # failure must never look green. Partial transport errors among healthy
+    # positively-probed agents stay page-free (the 2026-09-27 false-page fix).
+    if vip_transport_errors and not (healthy + wedged + restarted + vip_failed):
+        raise SystemExit(f'{vip_transport_errors} agent runtime(s) cannot reach '
+                         f'{VIP_PROBE_URL} (transport blind, no positive probe)')
+
+    # PLAT-4722: converge k8s observation TO Hive's authoritative intent for
+    # non-running agents. A FleetAgent Hive already thinks is stopped/hibernated
+    # but whose Deployment is still scaled to 1 is an orphan neither the
+    # on-demand reconciler nor the harness roller corrects. Scale it back to 0.
+    try:
+        drift = provisioner.reconcile_stopped_agent_drift(dry_run=DRY_RUN)
+        print(f'DRIFT-SUMMARY dry_run={DRY_RUN} checked={drift["checked"]} '
+              f'drifted={drift["drifted"]} scaled={drift["scaled"]} errors={drift["errors"]}')
+    except Exception as exc:
+        print(f'DRIFT-ERROR {type(exc).__name__}: {exc}')
+
+    if vip_failed:
+        # Existing KubeJobFailed alerting now becomes the runtime-specific alarm;
+        # every failure line carries the exact agent/namespace/pod for first response.
+        raise SystemExit(f'{vip_failed} agent runtime(s) cannot reach {VIP_PROBE_URL}')
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fleet-agent-liveness-reconciler
+  namespace: shizuha-hive
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: liveness-reconciler
+spec:
+  schedule: "*/20 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 240
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hive
+            app.kubernetes.io/component: liveness-reconciler
+        spec:
+          restartPolicy: Never
+          serviceAccountName: hive-controller
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: shizuha.io/platform
+                        operator: In
+                        values: ["true"]
+                      - key: kubernetes.io/hostname
+                        operator: NotIn
+                        values: ["s1"]
+          tolerations:
+            - key: node.shizuha/workstation
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: reconciler
+              image: localhost:30500/shizuha-hive:hive-60739d7
+              imagePullPolicy: IfNotPresent
+              command: ["sh", "-c", "python manage.py shell < /scripts/reconcile_liveness.py"]
+              env:
+                - name: WEDGE_SECONDS
+                  value: "2100"
+                - name: COOLDOWN_SECONDS
+                  value: "3600"
+                - name: DB_NAME
+                  value: shizuha_hive
+                - name: DB_USER
+                  value: postgres
+                - name: DB_PASSWORD
+                  valueFrom: {secretKeyRef: {name: shizuha-infra-postgresql, key: postgres-password}}
+                - name: DB_HOST
+                  value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+                - name: DB_PORT
+                  value: "5432"
+                - name: JWT_SECRET_KEY
+                  valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+                - name: SHIZUHA_PLATFORM_URL
+                  value: http://shizuha-nginx.shizuha.svc.cluster.local
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {cpu: 500m, memory: 512Mi}
+              volumeMounts:
+                - {name: script, mountPath: /scripts}
+          volumes:
+            - name: script
+              configMap:
+                name: fleet-agent-liveness-reconciler-script

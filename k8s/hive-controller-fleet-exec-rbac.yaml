@@ -1,0 +1,55 @@
+# PLAT-4924 / PLAT-4549: least-privilege pods/exec for hive-controller in the
+# fleet agent namespace only.
+#
+# Live provenance (read-only, 2026-07-23 via SA hive-controller SSRR/CRB list):
+#   - SA shizuha-hive/hive-controller exists (kubectl last-applied, 2026-04-18)
+#   - CRB hive-controller-admin -> ClusterRole/cluster-admin (hand-applied;
+#     NOT touched by this manifest — separate least-privilege hardening)
+#   - No namespaced Role/RoleBinding in shizuha-fleet currently subjects
+#     hive-controller; pods/exec today is allowed only via that CRB
+#   - fleet-agent-liveness-reconciler CronJob runs as hive-controller and
+#     (PLAT-4549) execs curl inside each shizuha-fleet agent pod
+#
+# This Role grants ONLY create on pods/exec in shizuha-fleet. It does not
+# widen any ClusterRole. Rollback: delete the RoleBinding (or both objects);
+# existing controller grants are untouched.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-controller-fleet-pods-exec
+  namespace: shizuha-fleet
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: fleet-liveness-exec
+    shizuha.io/task: PLAT-4924
+rules:
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    # "get" is required by the kubernetes-python-client websocket exec path
+    # (connect_get_namespaced_pod_exec issues GET /pods/{name}/exec) — used by
+    # the fleet-agent-liveness-reconciler probes (PLAT-4549). "create" covers
+    # the kubectl/SPDY POST path. Until 2026-09-27 the GET path was covered
+    # only by the hand-applied hive-controller-admin cluster-admin CRB; when
+    # that least-privilege hardening removed the CRB, every reconciler exec
+    # started failing 403 (masked as AttributeError None.decode in the client).
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-controller-fleet-pods-exec
+  namespace: shizuha-fleet
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: fleet-liveness-exec
+    shizuha.io/task: PLAT-4924
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-controller-fleet-pods-exec
+subjects:
+  - kind: ServiceAccount
+    name: hive-controller
+    namespace: shizuha-hive

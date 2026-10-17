@@ -1,0 +1,91 @@
+# HIVE-580 contract clause 3: "A skipped or missing run is also RED."
+#
+# The CronJob itself cannot report its own absence — a cycle that never fires
+# emits nothing, which is exactly the failure mode EVOL-39 audits for. These
+# rules make the absence loud from outside the workload.
+#
+# Alertmanager routes team=engineering to the Engineering Connect recipient and
+# these carry owner_group so the QA lead is notified on a red or missing cycle
+# (contract clause 3, PLAT-1254 fail-loud).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-golden-path
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+    shizuha.io/task: HIVE-580
+spec:
+  groups:
+    - name: hive-golden-path
+      rules:
+        # A weekly schedule that has not succeeded in well over a week means the
+        # cycle silently stopped running. Nine days gives one missed firing plus
+        # slack for a long run, so a single late cycle does not page.
+        - alert: HiveGoldenPathValidationMissed
+          expr: >-
+            time() - kube_cronjob_status_last_successful_time{cronjob="hive-golden-path-validation",namespace="shizuha-hive"}
+            > 60 * 60 * 24 * 9
+          for: 1h
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive golden-path validation has not completed in over 9 days"
+            description: >-
+              The HIVE-580 weekly golden-path CronJob has not recorded a
+              successful completion for more than nine days. Per the HIVE-580
+              contract a skipped or missing run counts as RED — HIVE-423 cycles
+              are reporting nothing rather than reporting red. Check
+              `kubectl -n shizuha-hive get cronjob hive-golden-path-validation`
+              for suspend/schedule drift and the last Job's pod logs for the
+              scorecard.
+
+        # The CronJob existing at all is itself load-bearing: if the object is
+        # deleted or was never installed, the staleness rule above has no series
+        # to evaluate and would stay silent forever.
+        - alert: HiveGoldenPathValidationAbsent
+          expr: >-
+            absent(kube_cronjob_status_last_successful_time{cronjob="hive-golden-path-validation",namespace="shizuha-hive"})
+          for: 6h
+          labels:
+            severity: warning
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive golden-path validation CronJob is absent"
+            description: >-
+              No kube_cronjob_status_last_successful_time series exists for
+              hive-golden-path-validation in shizuha-hive. Either the CronJob
+              was never installed by the Hive deploy workflow, it has been
+              deleted, or it has never completed successfully since creation.
+              A cycle that cannot run is RED under the HIVE-580 contract.
+
+        # Distinct from "missed": the job ran and reported RED (exit 2) or was
+        # refused for a missing credential (exit 3). That is a real result and
+        # must be visible, but it is the DESIGNED steady state today — HIVE-566
+        # deliberately stops provisioning at manual_review, so stages 3-5 are
+        # unreachable. Kept at info so it informs without paging.
+        - alert: HiveGoldenPathValidationRed
+          expr: >-
+            kube_job_status_failed{namespace="shizuha-hive",job_name=~"hive-golden-path-validation.*"} > 0
+          for: 5m
+          labels:
+            severity: info
+            team: engineering
+            owner_group: engineering
+            service: shizuha-hive
+          annotations:
+            summary: "Hive golden-path scorecard is RED"
+            description: >-
+              A golden-path validation Job failed, meaning the scorecard came
+              back RED/BLOCKED (exit 2) or the scoped validation credential was
+              missing or empty (exit 3). The scorecard is printed between the
+              BEGIN/END GOLDEN PATH SCORECARD markers in the pod logs. This is
+              expected while HIVE-566 remains deferred; it becomes actionable
+              when the real provisioning path lands and the accepted
+              N >= 5 consecutive-green gate is being pursued under HIVE-418.

@@ -1,0 +1,92 @@
+# PLAT-151 / EPIC PLAT-146 — k3s-native agent runtime: fleet namespaces.
+# HLD PLAT-147 v0.2 (wiki 84b482e6) §3 (Q1/Q1b).
+#
+# Two namespaces, NOT per-agent namespaces. The fleet is single-tenant, so the
+# security boundary is NOT the namespace (unlike HIVE-1/2 multi-tenant). "Shared
+# ns is safe" is made structurally true by:
+#   (a) automountServiceAccountToken: false on every agent pod (set in the pod
+#       spec by the provisioner) — removes the in-cluster kube-API path by which
+#       one pod could enumerate siblings' Secrets;
+#   (b) DevOps SSH-bearing agents (ichi/ni) live in their OWN namespace
+#       (shizuha-fleet-devops) so the fleet-ssh Secret is not reachable from the
+#       general fleet ns (see 20-devops-isolation.yaml).
+#   (c) per-agent RWO PVC already closes volume-sharing (PLAT-86); ns was never that lever.
+#
+# Additive only: this does NOT touch the existing host-docker rt-fleet (ns rt-fleet).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shizuha-fleet
+  labels:
+    app.kubernetes.io/name: shizuha-fleet
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet
+    # Agents never run --privileged (HLD §3). Enforce the Baseline Pod Security
+    # Standard; warn/audit at Restricted to surface tightening opportunities.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# Harden the auto-created `default` ServiceAccount: pods that omit
+# serviceAccountName get `default`, so disabling automount here closes the
+# kube-API path even if a pod spec forgets to set it (HLD §3 Q1a; the per-agent
+# pod template ALSO sets automountServiceAccountToken:false — defense in depth).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: shizuha-fleet
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/name: shizuha-fleet-devops
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet-devops
+    # DevOps agents reach the host plane via SSH/Tailscale, NOT via a privileged
+    # pod — so Baseline still applies (no --privileged, no hostPath escape).
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# Same default-SA hardening for the isolated DevOps namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: shizuha-fleet-devops
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+automountServiceAccountToken: false
+---
+# PLAT-536 / BRW-12 — per-agent browser-worker pods (shizuha-browser image,
+# pwuser uid 1000, port 18116, /data PVC for Chromium browser profile).
+# These pods fully satisfy the Kubernetes Restricted Pod Security Standard:
+# runAsNonRoot + capabilities.drop=ALL + allowPrivilegeEscalation=false +
+# seccompProfile=RuntimeDefault are all set in the pod template (BRW-12 C7).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shizuha-browser
+  labels:
+    app.kubernetes.io/name: shizuha-browser
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: browser
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: default
+  namespace: shizuha-browser
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+automountServiceAccountToken: false

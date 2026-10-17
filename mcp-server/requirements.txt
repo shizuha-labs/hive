@@ -1,0 +1,8 @@
+# Shizuha Hive MCP Server Dependencies (HIVE-MCP-1)
+# Security floor: GHSA-9h52-p55h-vw2f patched in mcp 1.23.0; GHSA-j975-95f5-7wqh in 1.10.0.
+# Cap <2.0.0: mcp 2.x removed mcp.server.fastmcp (Alert #24412 / deploy-hive-mcp run 1618
+# CrashLoopBackOff: ModuleNotFoundError: No module named 'mcp.server.fastmcp').
+# Mirror pulse mcp-server pin (shizuha-tasks).
+mcp>=1.23.0,<2.0.0
+requests>=2.28.0
+PyJWT>=2.8.0

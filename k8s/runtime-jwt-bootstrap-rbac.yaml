@@ -1,0 +1,30 @@
+# Apply via the privileged RBAC lane before Hive rollout.
+# The immutable v2 Secret is provisioned separately; CI may only verify it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: origin-ci-runtime-jwt-bootstrap
+  namespace: rt-fleet
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [shizuha-runtime-fleet]
+    verbs: [get]
+  - apiGroups: ['']
+    resources: [secrets]
+    resourceNames: [runtime-platform-jwt-v2]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: origin-ci-runtime-jwt-bootstrap
+  namespace: rt-fleet
+subjects:
+  - kind: ServiceAccount
+    name: origin-ci-deployer
+    namespace: origin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: origin-ci-runtime-jwt-bootstrap

@@ -1,0 +1,63 @@
+# The native runtime census lists ReplicaSets in every agent namespace, plus
+# Jobs and CronJobs in shizuha-hive. hive-controller could already list
+# Deployments and Pods, so the snapshot died Forbidden and the release
+# publisher never updated the ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: hive-controller-native-census
+  labels:
+    app: hive
+rules:
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hive-controller-native-census
+  labels:
+    app: hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-controller
+    namespace: shizuha-hive
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: hive-controller-native-census
+---
+# The native runtime census lists ReplicaSets, Jobs, and CronJobs in this
+# namespace. hive-controller could already list Deployments and Pods, so the
+# snapshot died Forbidden and the release publisher never updated the ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hive-controller-native-census
+  namespace: shizuha-hive
+  labels:
+    app: hive
+rules:
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hive-controller-native-census
+  namespace: shizuha-hive
+  labels:
+    app: hive
+subjects:
+  - kind: ServiceAccount
+    name: hive-controller
+    namespace: shizuha-hive
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: hive-controller-native-census

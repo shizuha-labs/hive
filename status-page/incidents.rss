@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Shizuha Platform Incidents</title>
+    <link>https://status.shizuha.com</link>
+    <description>Real-time incident notifications for the Shizuha platform</description>
+    <language>en</language>
+    <lastBuildDate>Sat, 03 Jul 2026 12:00:00 +0530</lastBuildDate>
+    <atom:link href="https://status.shizuha.com/incidents.rss" rel="self" type="application/rss+xml"/>
+    <item>
+      <title>All systems operational</title>
+      <link>https://status.shizuha.com</link>
+      <description>No active incidents. All platform services are operating normally.</description>
+      <pubDate>Sat, 03 Jul 2026 12:00:00 +0530</pubDate>
+      <guid>all-clear-20260703</guid>
+    </item>
+  </channel>
+</rss>

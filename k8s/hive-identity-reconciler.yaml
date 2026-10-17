@@ -1,0 +1,78 @@
+# HIVE-599: identity reconciler.
+#
+# Hive is the source of truth for which accounts are agents. This CronJob
+# sweeps managed FleetAgents hourly and asks Shizuha-ID to correct any user
+# mis-tagged account_type!=agent (which otherwise shows a false "Identity
+# drift" badge in the Hive UI). It NEVER creates ID users. Stopped,
+# never-provisioned identity orphans retire through Hive's durable tombstone
+# after a safety grace period. It does not change credentials or privileges.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hive-identity-reconciler
+  namespace: shizuha-hive
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: identity-reconciler
+    shizuha.io/task: HIVE-599
+spec:
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app: hive
+            app.kubernetes.io/name: hive
+            app.kubernetes.io/component: identity-reconciler
+        spec:
+          restartPolicy: Never
+          serviceAccountName: hive-controller
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: shizuha.io/platform
+                        operator: In
+                        values: ["true"]
+                      - key: kubernetes.io/hostname
+                        operator: NotIn
+                        values: ["s1"]
+          tolerations:
+            - key: node.shizuha/workstation
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: reconciler
+              image: localhost:30500/shizuha-hive:latest
+              imagePullPolicy: Always
+              command:
+                - python
+                - manage.py
+                - reconcile_agent_identities
+                - --reap-archived-tombstones
+                - --reap-stale-orphans
+              env:
+                - name: DB_NAME
+                  value: shizuha_hive
+                - name: DB_USER
+                  value: postgres
+                - name: DB_PASSWORD
+                  valueFrom: {secretKeyRef: {name: shizuha-infra-postgresql, key: postgres-password}}
+                - name: DB_HOST
+                  value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+                - name: DB_PORT
+                  value: "5432"
+                - name: JWT_SECRET_KEY
+                  valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+                - name: SHIZUHA_ID_INTERNAL_URL
+                  value: http://shizuha-id.shizuha.svc.cluster.local:8001

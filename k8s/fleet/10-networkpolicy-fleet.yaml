@@ -1,0 +1,151 @@
+# PLAT-151 / EPIC PLAT-146 — NetworkPolicies for ns shizuha-fleet.
+# HLD PLAT-147 v0.2 (wiki 84b482e6) §7 (Networking).
+#
+# Posture: egress-centric. Agents dial OUT to the platform (Connect WS, Pulse,
+# MCP, shizuha-id), external remote-LLM endpoints, and (kubelet-level) the
+# registry. They accept NO ingress and have NO agent-to-agent path.
+#
+# Enforcement note: k3s enforces NetworkPolicy via its embedded controller
+# (kube-router). Default-deny below applies to every pod in the namespace.
+#
+# Probe note: keep agent readiness/liveness probes as `exec` or `tcpSocket`
+# (not httpGet). Default-deny ingress can drop kubelet httpGet probes depending
+# on CNI/source-IP handling; exec/tcpSocket avoid needing any ingress allow.
+---
+# 1) Default-deny ALL ingress and egress for every pod in the namespace.
+#    This is the load-bearing rule: no agent-to-agent, no ingress, nothing out
+#    unless explicitly re-allowed by an additive policy below (policies are OR-ed).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: shizuha-fleet
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/tier: fleet
+spec:
+  podSelector: {}            # all pods
+  policyTypes: [Ingress, Egress]
+  # no ingress/egress rules => deny all
+---
+# 2) Allow DNS egress to kube-dns (CoreDNS) so Service names resolve.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: shizuha-fleet
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# 3) Allow egress to in-cluster platform Services (ns `shizuha`): shizuha-id,
+#    Connect, Pulse, MCP servers, wiki, drive, etc. Agents are clients of these.
+#    Scoped to the platform namespace (a trusted boundary). Can be tightened to
+#    specific Service ports in a follow-up if desired.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-egress
+  namespace: shizuha-fleet
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shizuha
+      ports:
+        - { protocol: TCP, port: 8000 }   # shizuha-id (and platform HTTP APIs)
+        - { protocol: TCP, port: 8002 }   # pulse
+        - { protocol: TCP, port: 8013 }   # wiki
+        - { protocol: TCP, port: 8019 }   # connect (DM/messaging API + WS)
+        # If a needed platform Service uses another port, add it here (kept an
+        # explicit allowlist rather than all-ports for least privilege).
+---
+# 4) Allow HTTPS egress to EXTERNAL remote-LLM endpoints (Anthropic/OpenAI/etc.).
+#    Provider CIDRs are large/dynamic, so we allow 443 to the public internet
+#    but EXCLUDE all internal ranges — this preserves default-deny against
+#    lateral movement to cluster/Tailscale/private hosts while permitting LLM
+#    egress. Per-agent provider-CIDR tightening is a documented follow-up.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-llm-https-egress
+  namespace: shizuha-fleet
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8         # RFC1918 (incl. k3s pod 10.42/16 + svc 10.43/16)
+              - 172.16.0.0/12      # RFC1918
+              - 192.168.0.0/16     # RFC1918
+              - 169.254.0.0/16     # link-local (incl. cloud metadata 169.254.169.254)
+              - 100.64.0.0/10      # CGNAT / Tailscale tailnet — keep internal nodes unreachable
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# 5) Allow egress to the in-cluster Cortex/vLLM inference Service.
+#    Repo default VLLM_BASE_URL = http://cortex.shizuha-cortex.svc.cluster.local:8040
+#    (hive_project/settings.py). Its ClusterIP is RFC1918 (so excluded by the 443
+#    rule's `except: 10.0.0.0/8`) and it is NOT ns `shizuha`, so without this rule
+#    local-model agents resolve the Service but cannot connect. Scoped to the
+#    Cortex namespace + port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cortex-llm-egress
+  namespace: shizuha-fleet
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: shizuha-cortex
+      ports:
+        - { protocol: TCP, port: 8040 }
+---
+# 6) Registry egress (gx10-1:30500) — image pulls are performed by the kubelet
+#    on the node, which is NOT subject to pod NetworkPolicy, so no rule is needed
+#    for normal pod startup. If an agent process must reach the registry HTTP API
+#    at runtime, uncomment and set the gx10-1 node/registry CIDR (DevOps to
+#    confirm the exact address — left unset to avoid shipping a wrong IP):
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-registry-egress
+#   namespace: shizuha-fleet
+# spec:
+#   podSelector: {}
+#   policyTypes: [Egress]
+#   egress:
+#     - to:
+#         - ipBlock: { cidr: <GX10-1-NODE-IP>/32 }
+#       ports:
+#         - { protocol: TCP, port: 30500 }

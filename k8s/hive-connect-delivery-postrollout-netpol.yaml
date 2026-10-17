@@ -1,0 +1,21 @@
+# HIVE-725 post-rollout health policy. The new Hive backend uses localhost exec
+# probes, so kubelet/CNI source-NAT behavior must not require pod-CIDR ingress.
+# This definition is kept equal to the canonical allow-node-healthchecks policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-node-healthchecks
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/managed-by: shizuha-hive
+    shizuha.io/policy: data-isolation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 100.64.0.0/10 }
+        - ipBlock: { cidr: 10.200.10.0/24 }
+      ports:
+        - { protocol: TCP, port: 8030 }
+        - { protocol: TCP, port: 80 }

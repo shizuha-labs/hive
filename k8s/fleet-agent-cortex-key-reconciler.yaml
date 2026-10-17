@@ -1,0 +1,113 @@
+# Per-agent Cortex key reconciler.
+#
+# WHY THIS EXISTS (2026-08-05): every fleet agent authenticates to Cortex with
+# ITS OWN key, so usage, leases and billing attribute to `agent-<username>`.
+# Nothing guaranteed the key existed. The agent container referenced it as
+# `secretKeyRef {<user>-agent-creds, CORTEX_API_KEY, optional: true}`, and
+# `optional: true` turns a MISSING key into an EMPTY STRING rather than a failed
+# Pod. So an uncredentialed agent starts, goes Ready, registers, heartbeats
+# every 900s, holds a model lease — and returns
+# `vLLM error 401: Authentication credentials were not provided` on every single
+# turn.
+#
+# rei did exactly that for five weeks (provisioned 2026-06-27, before per-agent
+# keys existed). The only symptom anywhere was a detail-less "Runtime unhealthy"
+# chip on the Hive Agents page. A sweep found 10 of 51 `*-agent-creds` Secrets
+# with no CORTEX_API_KEY.
+#
+# WHY IT WAS NEVER SELF-HEALING: Hive already had mint code (the Claw path), but
+# it authenticated with `CORTEX_API_KEY` — Hive's own customer-tier inference
+# key. Cortex grants the trusted-service identity that `/v1/internal/api-keys`
+# requires only to a token equal to CORTEX's own CORTEX_API_KEY, so every mint
+# returned 403 and was logged as a warning and dropped. The automation existed
+# and had never once succeeded. `HIVE_CORTEX_LEASE_API_KEY` is the credential
+# provisioned for this exact class of trusted call (the model-lease scheduler
+# hit the identical trap — see hive-backend-live.yaml) and is verified to match.
+#
+# `provisioner.ensure_agent_image` mints on the lifecycle path (start, wake,
+# harness roll), which covers agents as they move. This CronJob covers the rest:
+# an agent that simply sits Running never hits a lifecycle event, and a gap that
+# appears between rolls would otherwise wait for one.
+#
+# Operator 2026-08-05: "hive manages its agents underneath .. and each agent
+# uses their own key .. so you shouldn't have to do it .. let hive/fleet
+# daemon/agent handle this .. and yea sweep the class".
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fleet-agent-cortex-key-reconciler
+  namespace: shizuha-hive
+  labels:
+    app: hive
+    app.kubernetes.io/name: hive
+    app.kubernetes.io/component: cortex-key-reconciler
+spec:
+  # Hourly is ample: this closes a provisioning gap, it is not a hot path. A
+  # missing key already blocks Pod start (the secretKeyRef is mandatory), so the
+  # failure mode is a pod that will not start — loud — not one that runs blind.
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: hive
+            app.kubernetes.io/component: cortex-key-reconciler
+        spec:
+          restartPolicy: Never
+          serviceAccountName: hive-controller
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: shizuha.io/platform
+                        operator: In
+                        values: ["true"]
+                      - key: kubernetes.io/hostname
+                        operator: NotIn
+                        values: ["s1"]
+          tolerations:
+            - key: node.shizuha/workstation
+              operator: Equal
+              value: "true"
+              effect: NoSchedule
+          containers:
+            - name: reconciler
+              image: localhost:30500/shizuha-hive:hive-dcad8e8
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - |
+                  python manage.py reconcile_agent_cortex_keys --apply
+                  python manage.py reconcile_agent_forgejo_tokens --apply
+              env:
+                - name: DB_NAME
+                  value: shizuha_hive
+                - name: DB_USER
+                  value: postgres
+                - name: DB_PASSWORD
+                  valueFrom: {secretKeyRef: {name: shizuha-infra-postgresql, key: postgres-password}}
+                - name: DB_HOST
+                  value: shizuha-infra-postgresql.shizuha.svc.cluster.local
+                - name: DB_PORT
+                  value: "5432"
+                - name: JWT_SECRET_KEY
+                  valueFrom: {secretKeyRef: {name: hive-secrets, key: jwt-secret}}
+                - name: SHIZUHA_PLATFORM_URL
+                  value: http://shizuha-nginx.shizuha.svc.cluster.local
+                - name: VLLM_BASE_URL
+                  value: http://cortex.shizuha-cortex.svc.cluster.local:8040
+                # The trusted-service credential. NOT hive-secrets/CORTEX_API_KEY
+                # — that key 403s on the internal mint endpoint (see header).
+                - name: HIVE_CORTEX_LEASE_API_KEY
+                  valueFrom: {secretKeyRef: {name: hive-secrets, key: HIVE_CORTEX_LEASE_API_KEY}}
+              resources:
+                requests: {cpu: 50m, memory: 128Mi}
+                limits: {cpu: 500m, memory: 512Mi}
