@@ -1266,3 +1266,203 @@ class NativeRuntimeReleaseCallerTests(TestCase):
         self.assertEqual(self.deployment.spec.template.spec.node_selector, previous_selector)
         self.assertEqual(self.deployment.spec.template.spec.affinity, previous_affinity)
         self.apps.replace_namespaced_deployment.assert_not_called()
+
+
+@override_settings(HIVE_NATIVE_RUNTIME_RELEASE_ENABLED=True)
+class NativeRuntimeSnapshotHistoryTests(TestCase):
+    """Actual ORM/SDK census producer; retained history never means an executor."""
+    setUp = NativeRuntimeReleaseCallerTests.setUp
+    anchor = NativeRuntimeReleaseCallerTests.anchor
+    start_patch = NativeRuntimeReleaseCallerTests.start_patch
+    cm = NativeRuntimeReleaseCallerTests.cm
+    pod = NativeRuntimeReleaseCallerTests.pod
+    retained_terminal_pod = NativeRuntimeReleaseCallerTests.retained_terminal_pod
+    replace = NativeRuntimeReleaseCallerTests.replace
+    wire = NativeRuntimeReleaseCallerTests.wire
+
+    def snapshot_row(self):
+        return nr.runtime_snapshot()['census'][0]
+
+    def test_proven_terminal_history_is_audited_separately_from_current_ready_executor(self):
+        retained = self.retained_terminal_pod()
+        original = deepcopy(retained)
+        self.pods.append(retained)
+        row = self.snapshot_row()
+        self.assertEqual([pod['uid'] for pod in row['pods']], ['pod-1'])
+        self.assertEqual([pod['uid'] for pod in row['inactive_history']], ['retained-uid'])
+        audit = row['inactive_history'][0]
+        self.assertEqual(audit['phase'], 'Failed')
+        self.assertEqual(audit['replica_set_uid'], 'rs-1')
+        self.assertEqual(audit['deployment_uid'], 'deployment-1')
+        self.assertEqual(audit['replica_set_owner_references'][0]['uid'], 'deployment-1')
+        for status, original_status in zip(audit['container_statuses'], original.status.container_statuses):
+            self.assertEqual(status['name'], original_status.name)
+            self.assertEqual(status['container_id'], original_status.container_id)
+            self.assertIs(status['ready'], False)
+            self.assertIs(status['started'], False)
+            self.assertEqual(status['state']['terminated'], {
+                key: str(getattr(original_status.state.terminated, key)) if key in {'started_at', 'finished_at'}
+                else getattr(original_status.state.terminated, key)
+                for key in ('container_id', 'exit_code', 'reason', 'started_at', 'finished_at')})
+        self.assertEqual(audit['declared_containers'], {'containers': ['agent', 'broker'], 'init_containers': [], 'ephemeral_containers': []})
+        self.assertEqual(retained, original)
+        json.dumps(row)  # The management command must retain a valid JSON wire contract.
+        self.apps.replace_namespaced_deployment.assert_not_called()
+        self.stream.assert_not_called()
+
+    def test_complete_init_and_ephemeral_history_remain_fully_auditable(self):
+        retained = self.retained_terminal_pod()
+        for field, status_field, name in (('init_containers', 'init_container_statuses', 'init'),
+                                         ('ephemeral_containers', 'ephemeral_container_statuses', 'debug')):
+            cls = client.V1EphemeralContainer if name == 'debug' else client.V1Container
+            setattr(retained.spec, field, [cls(name=name)])
+            status = deepcopy(retained.status.container_statuses[0])
+            status.name = name
+            status.container_id = 'containerd://' + name
+            status.state.terminated.container_id = status.container_id
+            setattr(retained.status, status_field, [status])
+        self.pods.append(retained)
+        row = self.snapshot_row()
+        self.assertEqual(len(row['pods']), 1)
+        audit = row['inactive_history'][0]
+        self.assertEqual(audit['init_container_statuses'][0]['name'], 'init')
+        self.assertEqual(audit['ephemeral_container_statuses'][0]['name'], 'debug')
+        self.assertEqual(audit['declared_containers']['ephemeral_containers'], ['debug'])
+        json.dumps(row)
+
+    def test_uncertain_regular_process_history_stays_in_guarded_pod_count(self):
+        mutations = {
+            'pending': lambda pod: setattr(pod.status, 'phase', 'Pending'),
+            'unknown-phase': lambda pod: setattr(pod.status, 'phase', 'Unknown'),
+            'missing-uid': lambda pod: setattr(pod.metadata, 'uid', None),
+            'deleting': lambda pod: setattr(pod.metadata, 'deletion_timestamp', time.time()),
+            'ready': lambda pod: setattr(pod.status.conditions[0], 'status', 'True'),
+            'missing-ready': lambda pod: setattr(pod.status, 'conditions', []),
+            'missing-regular': lambda pod: pod.status.container_statuses.pop(),
+            'started': lambda pod: setattr(pod.status.container_statuses[1], 'started', True),
+            'unknown-started': lambda pod: setattr(pod.status.container_statuses[1], 'started', None),
+            'container-ready': lambda pod: setattr(pod.status.container_statuses[1], 'ready', True),
+            'running': lambda pod: setattr(pod.status.container_statuses[1], 'state', client.V1ContainerState(running=client.V1ContainerStateRunning())),
+            'waiting': lambda pod: setattr(pod.status.container_statuses[1], 'state', client.V1ContainerState(waiting=client.V1ContainerStateWaiting())),
+            'missing-finish': lambda pod: setattr(pod.status.container_statuses[1].state.terminated, 'finished_at', None),
+            'unknown-termination': lambda pod: setattr(pod.status.container_statuses[1].state.terminated, 'reason', 'ContainerStatusUnknown'),
+            'boolean-exit': lambda pod: setattr(pod.status.container_statuses[1].state.terminated, 'exit_code', True),
+            'wrong-process-id': lambda pod: setattr(pod.status.container_statuses[1].state.terminated, 'container_id', 'other'),
+            'duplicate-process-id': lambda pod: (setattr(pod.status.container_statuses[1], 'container_id', 'containerd://agent'), setattr(pod.status.container_statuses[1].state.terminated, 'container_id', 'containerd://agent')),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                retained = self.retained_terminal_pod()
+                mutate(retained)
+                self.pods = [self.pod(), retained]
+                row = self.snapshot_row()
+                self.assertEqual(len(row['pods']), 2)
+                self.assertEqual(row['inactive_history'], [])
+
+    def test_unobserved_or_partial_init_and_ephemeral_stay_guarded(self):
+        for field, statuses_field, name in (('init_containers', 'init_container_statuses', 'init'),
+                                           ('ephemeral_containers', 'ephemeral_container_statuses', 'debug')):
+            for mode in ('missing', 'running', 'boolean-exit'):
+                with self.subTest(group=field, mode=mode):
+                    retained = self.retained_terminal_pod()
+                    cls = client.V1EphemeralContainer if name == 'debug' else client.V1Container
+                    setattr(retained.spec, field, [cls(name=name)])
+                    if mode != 'missing':
+                        status = deepcopy(retained.status.container_statuses[0])
+                        status.name = name
+                        status.container_id = 'containerd://' + name
+                        status.state.terminated.container_id = status.container_id
+                        if mode == 'running':
+                            status.state = client.V1ContainerState(running=client.V1ContainerStateRunning())
+                        else:
+                            status.state.terminated.exit_code = True
+                        setattr(retained.status, statuses_field, [status])
+                    self.pods = [self.pod(), retained]
+                    row = self.snapshot_row()
+                    self.assertEqual(len(row['pods']), 2)
+                    self.assertEqual(row['inactive_history'], [])
+
+    def test_fresh_owner_read_mismatch_or_refusal_never_proves_history(self):
+        for kind in ('wrong-rs-uid', 'foreign-deployment', 'deleting-rs', 'read-refused'):
+            with self.subTest(kind=kind):
+                replica_set = deepcopy(self.rs)
+                self.apps.read_namespaced_replica_set.side_effect = None
+                if kind == 'wrong-rs-uid': replica_set.metadata.uid = 'different'
+                if kind == 'foreign-deployment': replica_set.metadata.owner_references[0].uid = 'foreign'
+                if kind == 'deleting-rs': replica_set.metadata.deletion_timestamp = time.time()
+                if kind == 'read-refused': self.apps.read_namespaced_replica_set.side_effect = ApiException(status=403)
+                self.apps.read_namespaced_replica_set.return_value = replica_set
+                self.pods = [self.pod(), self.retained_terminal_pod()]
+                row = self.snapshot_row()
+                self.assertEqual(len(row['pods']), 2)
+                self.assertEqual(row['inactive_history'], [])
+
+    def test_selector_matched_unprovable_owner_chain_refuses_successful_absence(self):
+        for kind in ('missing-owner', 'unobserved-rs', 'multiple-controller-owners'):
+            with self.subTest(kind=kind):
+                retained = self.retained_terminal_pod()
+                retained.metadata.labels = dict(self.deployment.spec.selector.match_labels)
+                if kind == 'missing-owner': retained.metadata.owner_references = []
+                if kind == 'unobserved-rs': retained.metadata.owner_references[0].uid = 'unknown'
+                if kind == 'multiple-controller-owners': retained.metadata.owner_references.append(deepcopy(retained.metadata.owner_references[0]))
+                self.pods = [self.pod(), retained]
+                with self.assertRaises(nr.RuntimeReleaseProjectionUnavailable):
+                    self.snapshot_row()
+
+    def test_no_history_preserves_single_ready_executor_and_empty_audit(self):
+        row = self.snapshot_row()
+        self.assertEqual([pod['uid'] for pod in row['pods']], ['pod-1'])
+        self.assertEqual(row['inactive_history'], [])
+
+    def test_zero_replica_history_is_audited_without_claiming_start_or_mutation(self):
+        self.deployment.spec.replicas = 0
+        self.deployment.status.ready_replicas = 0
+        self.pods = [self.retained_terminal_pod()]
+        row = self.snapshot_row()
+        self.assertEqual(row['replicas'], 0)
+        self.assertEqual(row['pods'], [])
+        self.assertEqual([pod['uid'] for pod in row['inactive_history']], ['retained-uid'])
+        self.apps.replace_namespaced_deployment.assert_not_called()
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def test_other_agent_selector_is_not_inferred_owned_from_runtime_image(self):
+        foreign = self.retained_terminal_pod()
+        foreign.metadata.labels = {'shizuha.io/agent': 'different-agent'}
+        foreign.metadata.owner_references[0].uid = 'unrelated-owner'
+        self.pods.append(foreign)
+        row = self.snapshot_row()
+        self.assertEqual([pod['uid'] for pod in row['pods']], ['pod-1'])
+        self.assertEqual(row['inactive_history'], [])
+
+    def test_retired_and_other_lifecycle_deployments_keep_excluded_boundary(self):
+        for kind in ('retired', 'other-lifecycle'):
+            with self.subTest(kind=kind):
+                self.agent.status = 'deleted' if kind == 'retired' else 'running'
+                self.agent.save(update_fields=['status'])
+                self.deployment.metadata.labels['app.kubernetes.io/managed-by'] = (
+                    nr.MANAGED_BY if kind == 'retired' else 'shizuha-runtime-fleet')
+                self.pods = [self.retained_terminal_pod()]
+                snapshot = nr.runtime_snapshot()
+                self.assertEqual(snapshot['census'], [])
+                self.assertEqual(snapshot['excluded'][0]['uid'], 'deployment-1')
+                self.assertEqual(snapshot['excluded'][0]['reason'], (
+                    'retired_hive_row' if kind == 'retired' else 'different_lifecycle_owner'))
+                self.apps.read_namespaced_replica_set.assert_not_called()
+
+    def test_history_audit_never_exports_free_form_messages_or_runtime_configuration(self):
+        retained = self.retained_terminal_pod()
+        canary = 'SYNTHETIC_PRIVATE_DATA_MUST_NOT_BE_EXPORTED'
+        retained.spec.containers[0].env = [client.V1EnvVar(name='PRIVATE_RUNTIME_INPUT', value=canary)]
+        retained.spec.containers[0].args = [canary]
+        retained.status.message = canary
+        retained.status.conditions[0].message = canary
+        retained.status.container_statuses[0].state.terminated.message = canary
+        self.pods.append(retained)
+        audit = self.snapshot_row()['inactive_history'][0]
+        self.assertNotIn(canary, json.dumps(audit))
+        self.assertEqual(set(audit), {
+            'name', 'uid', 'image', 'image_id', 'deleting', 'ready', 'phase',
+            'owner_references', 'replica_set_uid', 'replica_set_owner_references', 'deployment_uid', 'conditions',
+            'declared_containers', 'container_statuses', 'init_container_statuses',
+            'ephemeral_container_statuses',
+        })

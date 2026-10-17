@@ -278,7 +278,7 @@ def runtime_snapshot(*, bootstrap: bool = False, include_pods: bool = True, incl
 def _runtime_snapshot(*, bootstrap: bool, include_pods: bool, include_writers: bool) -> dict:
     """Read-only authority and actual owner census; no lease, drain or actuation."""
     from .models import FleetAgent
-    from .provisioner import get_k8s_client, fleet_namespace
+    from .provisioner import get_k8s_client, fleet_namespace, _native_runtime_inactive_history
     authority = get_native_runtime_release(bootstrap=bootstrap)
     core, apps, _ = get_k8s_client()
     all_rows = list(FleetAgent.objects.all())
@@ -311,24 +311,60 @@ def _runtime_snapshot(*, bootstrap: bool, include_pods: bool, include_writers: b
             assert_owned_deployment(row, deployment)
             adopted = validate_applied_release(authority, deployment, allow_cold=True)
             found.add(key)
-            owned_pods = []
+            owned_pods, inactive_history = [], []
             for pod in pods:
-                owners = [o for o in (pod.metadata.owner_references or []) if o.controller and o.kind == 'ReplicaSet']
-                if len(owners) != 1:
-                    continue
-                rs = replica_sets.get(owners[0].uid)
-                if rs is None or not any(o.controller and o.kind == 'Deployment' and o.uid == deployment.metadata.uid
-                                         for o in (rs.metadata.owner_references or [])):
+                # Labels are never ownership proof. A plausible runtime selected
+                # by this exact Deployment cannot, however, disappear as proven
+                # absence when its owner chain is unavailable or ambiguous.
+                selector = deployment.spec.selector.match_labels or {}
+                labels = pod.metadata.labels or {}
+                selected_runtime = bool(selector) and all(labels.get(k) == v for k, v in selector.items()) and any(
+                    c.name in {'agent', row.agent_username} and is_managed_runtime_image_ref(c.image)
+                    for c in (pod.spec.containers or []))
+                owners = [o for o in (pod.metadata.owner_references or []) if o.controller]
+                rs = replica_sets.get(owners[0].uid) if len(owners) == 1 and owners[0].kind == 'ReplicaSet' else None
+                parents = [o for o in (rs.metadata.owner_references or []) if o.controller] if rs else []
+                if (rs is None or rs.metadata.name != owners[0].name or len(parents) != 1
+                        or parents[0].kind != 'Deployment' or parents[0].uid != deployment.metadata.uid):
+                    if selected_runtime:
+                        raise RuntimeReleaseProjectionUnavailable('Native census cannot prove a selected runtime Pod owner chain')
                     continue
                 images = [c.image for c in pod.spec.containers if c.name in {'agent', row.agent_username}]
                 if len(images) != 1:
                     raise RuntimeReleaseProjectionUnavailable('Native census has an ambiguous Pod runtime')
-                owned_pods.append({'name': pod.metadata.name, 'uid': pod.metadata.uid,
+                observation = {'name': pod.metadata.name, 'uid': pod.metadata.uid,
                                    'image': images[0], 'deleting': bool(pod.metadata.deletion_timestamp),
                                    'image_id': next((s.image_id for s in (pod.status.container_statuses or [])
                                                      if s.name in {'agent', row.agent_username}), ''),
                                    'ready': pod.status.phase == 'Running' and any(
-                                       c.type == 'Ready' and c.status == 'True' for c in (pod.status.conditions or []))})
+                                       c.type == 'Ready' and c.status == 'True' for c in (pod.status.conditions or []))}
+                if _native_runtime_inactive_history(pod, apps, ns, deployment.metadata.uid):
+                    # Only classifier evidence is exported. Free-form status
+                    # messages, termination logs and runtime configuration may
+                    # carry private values and do not prove process absence.
+                    audit = {**observation, 'phase': pod.status.phase,
+                             'conditions': [{'type': c.type, 'status': c.status}
+                                            for c in (pod.status.conditions or [])],
+                             'owner_references': [{key: getattr(o, key) for key in ('kind', 'name', 'uid', 'controller')}
+                                                  for o in (pod.metadata.owner_references or [])],
+                             'replica_set_uid': rs.metadata.uid,
+                             'replica_set_owner_references': [{key: getattr(o, key) for key in ('kind', 'name', 'uid', 'controller')}
+                                                              for o in (rs.metadata.owner_references or [])],
+                             'deployment_uid': deployment.metadata.uid,
+                             'declared_containers': {field: [c.name for c in (getattr(pod.spec, field) or [])]
+                                                     for field in ('containers', 'init_containers', 'ephemeral_containers')}}
+                    for field in ('container_statuses', 'init_container_statuses', 'ephemeral_container_statuses'):
+                        audit[field] = [
+                            {'name': status.name, 'container_id': status.container_id,
+                             'ready': status.ready, 'started': status.started,
+                             'state': {'running': None, 'waiting': None, 'terminated': {
+                                 key: getattr(status.state.terminated, key) for key in (
+                                     'container_id', 'exit_code', 'reason', 'started_at', 'finished_at')}}}
+                            for status in (getattr(pod.status, field) or [])]
+                    audit = json.loads(json.dumps(audit, default=str))
+                    inactive_history.append(audit)
+                else:
+                    owned_pods.append(observation)
             image = next(c.image for c in deployment.spec.template.spec.containers
                          if c.name in {'agent', row.agent_username})
             census.append({'agent_id': str(row.pk), 'username': row.agent_username, 'namespace': ns,
@@ -339,7 +375,8 @@ def _runtime_snapshot(*, bootstrap: bool, include_pods: bool, include_writers: b
                            'ready_replicas': deployment.status.ready_replicas or 0,
                            'adopted': adopted,
                            'deferred_until_start': deployment.spec.replicas == 0 and image != authority.release.deployment_image,
-                           'pods': sorted(owned_pods, key=lambda p: p['name'])})
+                           'pods': sorted(owned_pods, key=lambda p: p['name']),
+                           'inactive_history': sorted(inactive_history, key=lambda p: p['name'])})
     # Missing workloads may legitimately be pending initial provisioning. Their
     # source row must not be misreported as a deployed or successfully rolled seat.
     missing = [{'agent_id': str(row.pk), 'username': row.agent_username,
