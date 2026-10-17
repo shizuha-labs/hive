@@ -11,6 +11,8 @@ import logging
 import uuid
 from datetime import datetime, timezone as datetime_timezone
 
+from django.db.models import CharField
+from django.db.models.functions import Cast
 from django.utils.dateparse import parse_datetime
 
 from .models import FleetAgentActivitySnapshot
@@ -146,7 +148,13 @@ def load_activity_snapshot(agent, *, limit=ACTIVITY_SNAPSHOT_LIMIT):
     if agent_pk is None:
         return None
     try:
-        snap = FleetAgentActivitySnapshot.objects.filter(agent_id=agent_pk).first()
+        # PostgreSQL's text representation retains the stored UTC offset.
+        # USE_TZ=False ORM datetimes discard that offset (including DST fold),
+        # so preserve it at the database adapter before parsing canonical UTC.
+        snap = FleetAgentActivitySnapshot.objects.filter(agent_id=agent_pk).annotate(
+            captured_at_with_offset=Cast('captured_at', output_field=CharField()),
+            newest_event_at_with_offset=Cast('newest_event_at', output_field=CharField()),
+        ).first()
     except Exception:
         logger.warning(
             'activity snapshot load failed for %s',
@@ -161,8 +169,8 @@ def load_activity_snapshot(agent, *, limit=ACTIVITY_SNAPSHOT_LIMIT):
         return None
     return {
         'events': _sorted_unique(events, limit),
-        'captured_at': _iso(snap.captured_at),
-        'newest_event_at': _iso(snap.newest_event_at),
+        'captured_at': _iso(snap.captured_at_with_offset),
+        'newest_event_at': _iso(snap.newest_event_at_with_offset),
         'source': snap.source,
         'pod_name': snap.pod_name,
         'resource_uid': snap.resource_uid,

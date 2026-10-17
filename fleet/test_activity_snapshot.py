@@ -237,3 +237,92 @@ class ActivitySnapshotFailSoftTests(SimpleTestCase):
         merged = merge_activity_with_snapshot(agent, live, limit=50)
         self.assertEqual(merged['source_state'], 'live')
         self.assertEqual(merged['events'], [LIVE_EVENT])
+
+
+class ActivitySnapshotDatabaseTimezoneTests(TestCase):
+    """The JSON event clock is UTC; naive ORM fields use the DB connection zone."""
+
+    def test_real_postgres_roundtrip_preserves_snapshot_instants_in_both_dst_seasons(self):
+        from datetime import datetime, timezone as utc_timezone
+        from django.db import connection
+        from django.test import override_settings
+        from fleet.activity_snapshot import load_activity_snapshot
+
+        self.assertEqual(connection.vendor, 'postgresql')
+        with override_settings(USE_TZ=False, TIME_ZONE='America/Chicago'):
+            with connection.cursor() as cursor:
+                cursor.execute('SHOW TimeZone')
+                self.assertEqual(cursor.fetchone()[0], 'America/Chicago')
+            agent = FleetAgent.objects.create(agent_username='snapshot-db-clock')
+            for month, expected_local_hour in ((7, 17), (1, 16)):
+                with self.subTest(month=month):
+                    event = {'id': f'clock-{month}', 'ts': f'2026-{month:02d}-15T22:00:00Z',
+                             'type': 'tool_call', 'tool': 'synthetic-read'}
+                    FleetAgentActivitySnapshot.objects.filter(agent=agent).delete()
+                    persist_activity_snapshot(agent, {'events': [event], 'source_state': 'live'})
+                    stored = FleetAgentActivitySnapshot.objects.get(agent=agent)
+                    self.assertIsNone(stored.newest_event_at.tzinfo)
+                    self.assertEqual(stored.newest_event_at.hour, expected_local_hour)
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            'SELECT extract(epoch from captured_at) FROM fleet_fleetagentactivitysnapshot WHERE agent_id=%s',
+                            [str(agent.pk)],
+                        )
+                        captured_epoch = float(cursor.fetchone()[0])
+                    loaded = load_activity_snapshot(agent)
+                    self.assertEqual(loaded['events'], [event])
+                    self.assertEqual(loaded['newest_event_at'], event['ts'])
+                    captured = datetime.fromisoformat(loaded['captured_at'].replace('Z', '+00:00'))
+                    self.assertAlmostEqual(captured.timestamp(), captured_epoch, places=5)
+                    merged = merge_activity_with_snapshot(agent, {
+                        'source_state': 'unavailable', 'events': [], 'history_events': [], 'total': 0,
+                    })
+                    self.assertEqual(merged['source_state'], 'persisted')
+                    self.assertEqual(merged['newest_event_at'], event['ts'])
+                    self.assertEqual(merged['events'][0]['id'], event['id'])
+
+    def test_aware_database_values_and_live_event_clock_remain_utc(self):
+        from datetime import datetime, timezone as utc_timezone
+        from django.test import override_settings
+        from fleet.activity_snapshot import _iso, _parse_ts, _newest_ts
+
+        with override_settings(USE_TZ=False, TIME_ZONE='America/Chicago'):
+            value = datetime(2026, 7, 15, 22, tzinfo=utc_timezone.utc)
+            self.assertEqual(_iso(value), '2026-07-15T22:00:00Z')
+            self.assertIsNone(_iso(None))
+            self.assertEqual(_parse_ts('2026-07-15T22:00:00Z'), value)
+            self.assertEqual(_parse_ts('2026-07-15T22:00:00'), value)
+            self.assertEqual(_newest_ts([
+                {'ts': '2026-07-15T21:00:00Z'}, {'ts': '2026-07-15T22:00:00Z'},
+            ]), value)
+
+    def test_actual_postgres_both_dst_folds_keep_distinct_event_and_capture_instants(self):
+        from datetime import datetime
+        from django.db import connection
+        from django.test import override_settings
+        from fleet.activity_snapshot import load_activity_snapshot
+
+        self.assertEqual(connection.vendor, 'postgresql')
+        with override_settings(USE_TZ=False, TIME_ZONE='America/Chicago'):
+            with connection.cursor() as cursor:
+                cursor.execute('SHOW DateStyle')
+                self.assertTrue(cursor.fetchone()[0].startswith('ISO,'))
+            agent = FleetAgent.objects.create(agent_username='snapshot-fold-clock')
+            for hour in (6, 7):
+                with self.subTest(utc_hour=hour):
+                    text = f'2026-11-01T{hour:02d}:30:00Z'
+                    event = {'id': f'fold-{hour}', 'ts': text, 'type': 'tool_call'}
+                    instant = datetime.fromisoformat(text.replace('Z', '+00:00'))
+                    FleetAgentActivitySnapshot.objects.filter(agent=agent).delete()
+                    persist_activity_snapshot(agent, {'events': [event], 'source_state': 'live'})
+                    FleetAgentActivitySnapshot.objects.filter(agent=agent).update(captured_at=instant)
+                    raw = FleetAgentActivitySnapshot.objects.get(agent=agent)
+                    self.assertIsNone(raw.newest_event_at.tzinfo)
+                    self.assertEqual(raw.newest_event_at.hour, 1)
+                    self.assertEqual(raw.newest_event_at.fold, 0)
+                    loaded = load_activity_snapshot(agent)
+                    self.assertEqual(loaded['newest_event_at'], text)
+                    self.assertEqual(loaded['captured_at'], text)
+                    self.assertEqual(loaded['events'], [event])
+            FleetAgentActivitySnapshot.objects.filter(agent=agent).update(newest_event_at=None)
+            self.assertIsNone(load_activity_snapshot(agent)['newest_event_at'])
