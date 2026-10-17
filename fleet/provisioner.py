@@ -2098,6 +2098,71 @@ class NativeRuntimeRollReceipt:
     admission_version: int
 
 
+def _native_runtime_inactive_history(pod, apps, namespace, deployment_uid):
+    """Prove retained history has no container process, rather than trusting phase.
+
+    Failed can also mean a lost node. Only complete, explicit kubelet terminal
+    observations for every declared process qualify, with the same Deployment
+    owner chain as the live bridge. Any incomplete/uncertain history stays in
+    the process census and therefore refuses mutation.
+    """
+    try:
+        if (not deployment_uid or not pod.metadata.uid or pod.metadata.deletion_timestamp
+                or pod.status.phase not in {'Failed', 'Succeeded'}):
+            return False
+        ready = [c.status for c in (pod.status.conditions or []) if c.type == 'Ready']
+        if ready != ['False']:
+            return False
+        owners = [o for o in (pod.metadata.owner_references or []) if o.controller]
+        if len(owners) != 1 or owners[0].kind != 'ReplicaSet' or not owners[0].uid:
+            return False
+        replica_set = apps.read_namespaced_replica_set(owners[0].name, namespace, _request_timeout=(3, 5))
+        parent = [o for o in (replica_set.metadata.owner_references or []) if o.controller]
+        if (replica_set.metadata.uid != owners[0].uid or replica_set.metadata.deletion_timestamp
+                or len(parent) != 1 or parent[0].kind != 'Deployment'
+                or parent[0].uid != deployment_uid):
+            return False
+        groups = (
+            (pod.spec.containers, pod.status.container_statuses),
+            (pod.spec.init_containers, pod.status.init_container_statuses),
+            (pod.spec.ephemeral_containers, pod.status.ephemeral_container_statuses),
+        )
+        if not pod.spec.containers:
+            return False
+        seen_names, seen_ids = set(), set()
+        for declared, observed in groups:
+            names = [c.name for c in (declared or [])]
+            statuses = observed or []
+            if (any(not name for name in names) or len(set(names)) != len(names)
+                    or len(statuses) != len(names) or {s.name for s in statuses} != set(names)):
+                return False
+            if seen_names.intersection(names):
+                return False
+            seen_names.update(names)
+            for status in statuses:
+                if status.container_id in seen_ids:
+                    return False
+                seen_ids.add(status.container_id)
+                state = status.state
+                ended = state.terminated if state else None
+                if (status.ready is not False or status.started is not False or not ended
+                        or state.running is not None or state.waiting is not None
+                        or not status.container_id or ended.container_id != status.container_id
+                        or ended.reason == 'ContainerStatusUnknown'
+                        or isinstance(ended.exit_code, bool) or not isinstance(ended.exit_code, int)
+                        or not ended.started_at or not ended.finished_at
+                        or ended.finished_at < ended.started_at):
+                    return False
+        return True
+    except Exception:  # schema/read uncertainty is never evidence of process absence
+        return False
+
+
+def _native_runtime_process_pods(pods, apps, namespace, deployment_uid):
+    return [pod for pod in pods
+            if not _native_runtime_inactive_history(pod, apps, namespace, deployment_uid)]
+
+
 def native_agent_runtime_roll_ready(
     agent: FleetAgent, target_image: str, *,
     deployment_uid: str | None = None, return_receipt: bool = False,
@@ -2119,6 +2184,8 @@ def native_agent_runtime_roll_ready(
             label_selector=f'shizuha.io/agent={agent.agent_username}',
             field_selector='' if return_receipt else 'status.phase=Running',
         ).items
+        if return_receipt:
+            pods = _native_runtime_process_pods(pods, apps_v1, ns, deployment_uid)
         ready_pods = [
             pod for pod in pods
             if not pod.metadata.deletion_timestamp
@@ -2389,6 +2456,7 @@ def _replace_native_runtime(agent, core, apps, proposed, original, authority, *,
 
     if runtime_changed:
         pods = core.list_namespaced_pod(ns, label_selector=f'shizuha.io/agent={agent.agent_username}').items
+        pods = _native_runtime_process_pods(pods, apps, ns, original.metadata.uid)
         if pods:
             if original.spec.replicas != 1 or not lease_still_allows_start():
                 return False
@@ -2423,8 +2491,14 @@ def _replace_native_runtime(agent, core, apps, proposed, original, authority, *,
                 assert_still_current(authority)
                 pods = core.list_namespaced_pod(ns, label_selector=f'shizuha.io/agent={agent.agent_username}',
                                                 _request_timeout=(3, 5)).items
+                pods = _native_runtime_process_pods(pods, apps, ns, original.metadata.uid)
                 if pods or original.spec.replicas != 0:
                     return False
+                # Owner lookups above may block; intent/CAS do not lock the
+                # external release document or model-start lease.
+                if require_start_lease and not _lease_start_decision(agent).allowed:
+                    return False
+                assert_still_current(authority)
             else:
                 # Finish every source/admission read before collecting the
                 # final bridge/process proof; those reads can block long enough
@@ -2434,6 +2508,7 @@ def _replace_native_runtime(agent, core, apps, proposed, original, authority, *,
                 assert_still_current(authority)
                 pods = core.list_namespaced_pod(ns, label_selector=f'shizuha.io/agent={agent.agent_username}',
                                                 _request_timeout=(3, 5)).items
+                pods = _native_runtime_process_pods(pods, apps, ns, original.metadata.uid)
                 if len(pods) != 1:
                     return False
                 pod = pods[0]
@@ -2942,7 +3017,7 @@ def ensure_agent_image(agent: FleetAgent, *, _preserve_native_intent: bool = Fal
             if cold_materialization:
                 # Unknown dormant images are not adopted. Reconstruct from the
                 # qualified current source only at this existing lifecycle/config
-                # action; final replacement still requires zero replicas/no Pod.
+                # action; final replacement still requires zero replicas/no potentially live Pod.
                 deploy.spec.template = client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(labels=_base_labels(agent)), spec=_build_pod_spec(agent, forgejo_secret_name=forgejo_secret_name))
                 deploy.spec.strategy = client.V1DeploymentStrategy(type='Recreate')
@@ -3397,23 +3472,16 @@ def _scale(agent: FleetAgent, replicas: int, ok_if_missing: bool = False) -> boo
                     return True
                 if dep.spec.replicas != 0:
                     return False
-                # HIVE-2893: the concurrency fence must refuse only a LIVE
-                # leftover pod. Terminal husks (Failed/Evicted/Error husks
-                # and Succeeded one-shots) are left behind by a
-                # scaled-to-zero Deployment indefinitely — kubelet never
-                # garbage-collects them — so the unfiltered `.items` check
-                # silently refused every 0→1 scale for ni/zen/san while
-                # Error/Evicted pods from 14–25h ago sat beside the 0/0
-                # Deployment: floor holders stayed hibernated, manual
-                # enable 500'd with the generic prose, and no event or log
-                # line recorded why. Dead husks occupy no admission slot.
-                live_leftovers = [
-                    p for p in core.list_namespaced_pod(
+                # Preserve the single-process fence even for terminal phases:
+                # a lost-node Failed Pod is not proof that its containers ended.
+                # The same complete owned-process proof governs materialization,
+                # active drain reservations, and this cold scale boundary.
+                live_leftovers = _native_runtime_process_pods(
+                    core.list_namespaced_pod(
                         _live_ns(agent), label_selector=f'shizuha.io/agent={agent.agent_username}',
                         _request_timeout=(3, 5),
-                    ).items
-                    if getattr(p.status, 'phase', '') not in ('Succeeded', 'Failed')
-                ]
+                    ).items, apps_v1, _live_ns(agent), dep.metadata.uid,
+                )
                 if live_leftovers:
                     logger.warning(
                         'HIVE-2893: scale 0->1 for %s deferred — %d live leftover pod(s) beside the '
@@ -3433,23 +3501,22 @@ def _scale(agent: FleetAgent, replicas: int, ok_if_missing: bool = False) -> boo
                 if not _lease_start_decision(agent).allowed:
                     return False
                 assert_still_current(authority)
-                # Same HIVE-2893 fence, re-computed after the lease gate and
-                # this assertion: the first listing is stale by the time the
-                # write is authorized — a live pod may have been reclaimed (or
-                # a new one spawned) between the listing and the assertion, so
-                # reusing the in-memory list both refused boots whose pod was
-                # already reclaimed and green-lit boots that raced a fresh
-                # live pod past the fence. Terminal husks never block the
-                # write, only live pods do.
-                live_leftovers = [
-                    p for p in core.list_namespaced_pod(
+                # Recompute after every blocking source/lease read; never reuse
+                # a previous absence observation to authorize the scale CAS.
+                live_leftovers = _native_runtime_process_pods(
+                    core.list_namespaced_pod(
                         _live_ns(agent), label_selector=f'shizuha.io/agent={agent.agent_username}',
                         _request_timeout=(3, 5),
-                    ).items
-                    if getattr(p.status, 'phase', '') not in ('Succeeded', 'Failed')
-                ]
+                    ).items, apps_v1, _live_ns(agent), dep.metadata.uid,
+                )
                 if live_leftovers:
                     return False
+                # Complete terminated history cannot restart while these
+                # final authority reads run. Recheck external start/release
+                # authority after the potentially blocking owner proof.
+                if not _lease_start_decision(agent).allowed:
+                    return False
+                assert_still_current(authority)
                 apps_v1.patch_namespaced_deployment_scale(
                     name=agent.deployment_name, namespace=_live_ns(agent),
                     body={'metadata': {'uid': dep.metadata.uid, 'resourceVersion': dep.metadata.resource_version},

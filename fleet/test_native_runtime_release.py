@@ -112,6 +112,277 @@ class NativeRuntimeReleaseCallerTests(TestCase):
                              leaseUntil=time.time()*1000+60000)
         return json.dumps(self.response)+'\n__SHIZUHA_HTTP_STATUS__:200'
 
+    def retained_terminal_pod(self):
+        from datetime import datetime, timezone
+        pod = self.pod()
+        pod.metadata.name = 'retained-evicted'
+        pod.metadata.uid = 'retained-uid'
+        pod.status.phase = 'Failed'
+        pod.status.reason = 'Evicted'
+        pod.status.conditions = [client.V1PodCondition(type='Ready', status='False')]
+        pod.spec.containers.append(client.V1Container(name='broker', image='broker'))
+        pod.status.container_statuses = [client.V1ContainerStatus(
+            name=name, image='old', image_id='old-id', ready=False, started=False,
+            restart_count=0, container_id='containerd://' + name,
+            state=client.V1ContainerState(terminated=client.V1ContainerStateTerminated(
+                container_id='containerd://' + name, exit_code=143,
+                started_at=datetime(2026, 10, 17, 8, 40, tzinfo=timezone.utc),
+                finished_at=datetime(2026, 10, 17, 8, 44, tzinfo=timezone.utc), reason='Error')),
+        ) for name in ('agent', 'broker')]
+        return pod
+
+    def test_retained_terminated_history_allows_actual_reserved_promotion(self):
+        self.promote()
+        self.pods.append(self.retained_terminal_pod())
+        self.assertTrue(p.ensure_agent_image(self.agent))
+        self.apps.replace_namespaced_deployment.assert_called_once()
+        self.assertEqual(self.deployment.metadata.annotations[nr.GENERATION_ANNOTATION], '28')
+        self.assertEqual(self.stream.call_count, 2)  # one arm, same-reservation final proof
+        self.assertTrue(all(call.args[1] == 'pod1' for call in self.stream.call_args_list))
+
+    def test_completed_init_and_ephemeral_history_is_accounted_for(self):
+        self.promote()
+        retained = self.retained_terminal_pod()
+        retained.status.phase = 'Succeeded'
+        for spec_field, status_field, name in (
+                ('init_containers', 'init_container_statuses', 'init'),
+                ('ephemeral_containers', 'ephemeral_container_statuses', 'debug')):
+            container_type = client.V1EphemeralContainer if name == 'debug' else client.V1Container
+            setattr(retained.spec, spec_field, [container_type(name=name)])
+            status = deepcopy(retained.status.container_statuses[0])
+            status.name = name
+            status.container_id = 'containerd://' + name
+            status.state.terminated.container_id = status.container_id
+            setattr(retained.status, status_field, [status])
+        self.pods.append(retained)
+        self.assertTrue(p.ensure_agent_image(self.agent))
+        self.apps.replace_namespaced_deployment.assert_called_once()
+
+    def test_cold_start_with_proven_history_materializes_then_scales_with_cas(self):
+        self.promote()
+        self.deployment.spec.replicas = 0
+        self.pods = [self.retained_terminal_pod()]
+        self.agent.status = 'hibernated'
+        self.agent.save(update_fields=['status'])
+        with mock.patch('fleet.provisioner.ensure_agent_id_password_aligned', return_value='ok'):
+            self.assertTrue(p.start_agent(self.agent))
+        self.apps.replace_namespaced_deployment.assert_called_once()
+        self.apps.patch_namespaced_deployment_scale.assert_called_once()
+        self.assertEqual(self.apps.patch_namespaced_deployment_scale.call_args.kwargs['body'], {
+            'metadata': {'uid': 'deployment-1', 'resourceVersion': '2'}, 'spec': {'replicas': 1}})
+        self.stream.assert_not_called()
+
+    def test_cold_stage_with_proven_history_keeps_replicas_zero_without_lease(self):
+        self.promote()
+        self.deployment.spec.replicas = 0
+        self.pods = [self.retained_terminal_pod()]
+        self.assertTrue(p.ensure_agent_image(self.agent))
+        self.assertEqual(self.deployment.spec.replicas, 0)
+        self.apps.replace_namespaced_deployment.assert_called_once()
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+        self.lease.assert_not_called()
+        self.stream.assert_not_called()
+
+    def test_cold_materialization_rechecks_process_absence_before_cas(self):
+        self.promote()
+        self.deployment.spec.replicas = 0
+        calls = []
+        def observe(*args, **kwargs):
+            retained = self.retained_terminal_pod()
+            if calls:
+                retained.status.container_statuses[1].state = client.V1ContainerState(
+                    running=client.V1ContainerStateRunning())
+            calls.append(True)
+            return SimpleNamespace(items=[retained])
+        self.core.list_namespaced_pod.side_effect = observe
+        self.assertFalse(p.ensure_agent_image(self.agent))
+        self.assertGreater(len(calls), 1)
+        self.apps.replace_namespaced_deployment.assert_not_called()
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def prepare_reviewed_cold_scale(self):
+        self.deployment.spec.replicas = 0
+        p._bind_reviewed_runtime_image(self.agent)
+        authority = self.agent._native_runtime_release
+        nr.stamp_release(authority, self.deployment)
+        self.deployment.spec.template.spec.containers[0].image = authority.release.deployment_image
+
+    def test_cold_scale_refuses_uncertain_terminal_processes_before_any_write(self):
+        self.prepare_reviewed_cold_scale()
+        for kind in ('running', 'missing-status', 'unknown-exit', 'foreign-owner', 'deleting', 'pending'):
+            with self.subTest(kind=kind):
+                retained = self.retained_terminal_pod()
+                if kind == 'running':
+                    retained.status.container_statuses[1].state = client.V1ContainerState(
+                        running=client.V1ContainerStateRunning())
+                elif kind == 'missing-status':
+                    retained.status.container_statuses.pop()
+                elif kind == 'unknown-exit':
+                    retained.status.container_statuses[1].state.terminated.reason = 'ContainerStatusUnknown'
+                elif kind == 'foreign-owner':
+                    retained.metadata.owner_references[0].uid = 'foreign-rs'
+                elif kind == 'deleting':
+                    retained.metadata.deletion_timestamp = time.time()
+                else:
+                    retained.status.phase = 'Pending'
+                self.pods = [retained]
+                self.assertFalse(p._scale(self.agent, 1))
+                self.apps.patch_namespaced_deployment_scale.assert_not_called()
+                self.apps.replace_namespaced_deployment.assert_not_called()
+
+    def test_cold_scale_rechecks_history_after_lease_and_source_reads(self):
+        self.prepare_reviewed_cold_scale()
+        calls = []
+        def observe(*args, **kwargs):
+            retained = self.retained_terminal_pod()
+            if calls:
+                retained.status.container_statuses[0].state = client.V1ContainerState(
+                    running=client.V1ContainerStateRunning())
+            calls.append(True)
+            return SimpleNamespace(items=[retained])
+        self.core.list_namespaced_pod.side_effect = observe
+        self.assertFalse(p._scale(self.agent, 1))
+        self.assertEqual(len(calls), 2)
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def test_cold_start_history_does_not_override_lease_loss_after_materialization(self):
+        self.promote()
+        self.deployment.spec.replicas = 0
+        self.pods = [self.retained_terminal_pod()]
+        replace = self.replace
+        def replaced(*args, **kwargs):
+            replace(*args, **kwargs)
+            self.lease.return_value = SimpleNamespace(allowed=False)
+        self.apps.replace_namespaced_deployment.side_effect = replaced
+        with mock.patch('fleet.provisioner.ensure_agent_id_password_aligned', return_value='ok'):
+            self.assertFalse(p.start_agent(self.agent))
+        self.apps.replace_namespaced_deployment.assert_called_once()
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+        self.assertEqual(self.deployment.spec.replicas, 0)
+
+    def mutate_on_final_history_owner_read(self, kind):
+        reads = []
+        def owner(*args, **kwargs):
+            reads.append(kwargs.get('_request_timeout'))
+            if len(reads) == 2:
+                if kind == 'source':
+                    self.history.append(record(self.history[-1]['generation'] + 1, 'sha256:' + 'c' * 64, 'd' * 40))
+                elif kind == 'lease':
+                    self.lease.return_value = SimpleNamespace(allowed=False)
+            return self.rs
+        self.apps.read_namespaced_replica_set.side_effect = owner
+        return reads
+
+    def test_cold_scale_source_change_during_final_owner_read_refuses(self):
+        self.prepare_reviewed_cold_scale()
+        self.pods = [self.retained_terminal_pod()]
+        reads = self.mutate_on_final_history_owner_read('source')
+        with self.assertRaises(nr.RuntimeReleaseProjectionUnavailable):
+            p._scale(self.agent, 1)
+        self.assertEqual(len(reads), 2)
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def test_cold_scale_lease_loss_during_final_owner_read_refuses(self):
+        self.prepare_reviewed_cold_scale()
+        self.pods = [self.retained_terminal_pod()]
+        reads = self.mutate_on_final_history_owner_read('lease')
+        self.assertFalse(p._scale(self.agent, 1))
+        self.assertEqual(len(reads), 2)
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def test_history_owner_reads_use_existing_api_transport_bound(self):
+        self.prepare_reviewed_cold_scale()
+        self.pods = [self.retained_terminal_pod()]
+        reads = self.mutate_on_final_history_owner_read('unchanged')
+        self.assertTrue(p._scale(self.agent, 1))
+        self.assertEqual(reads, [(3, 5), (3, 5)])
+
+    def test_cold_materialization_source_change_during_final_owner_read_refuses(self):
+        self.promote()
+        self.deployment.spec.replicas = 0
+        self.pods = [self.retained_terminal_pod()]
+        reads = self.mutate_on_final_history_owner_read('source')
+        with self.assertRaises(nr.RuntimeReleaseProjectionUnavailable):
+            p.ensure_agent_image(self.agent)
+        self.assertEqual(len(reads), 2)
+        self.apps.replace_namespaced_deployment.assert_not_called()
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def test_cold_materialization_lease_loss_during_final_owner_read_refuses(self):
+        self.promote()
+        self.deployment.spec.replicas = 0
+        self.deployment.spec.template.spec.containers[0].image = 'localhost:30500/shizuha-agent-runtime:older'
+        self.pods = [self.retained_terminal_pod()]
+        reads = self.mutate_on_final_history_owner_read('lease')
+        with mock.patch('fleet.provisioner.ensure_agent_id_password_aligned', return_value='ok'):
+            self.assertFalse(p.start_agent(self.agent))
+        self.apps.replace_namespaced_deployment.assert_not_called()
+        self.apps.patch_namespaced_deployment_scale.assert_not_called()
+        self.assertEqual(len(reads), 2)
+
+    def test_retained_history_foreign_deployment_or_unreadable_owner_refuses(self):
+        self.promote()
+        self.pods.append(self.retained_terminal_pod())
+        for mode in ('foreign-deployment', 'unreadable-rs'):
+            with self.subTest(mode=mode):
+                if mode == 'foreign-deployment':
+                    self.rs.metadata.owner_references[0].uid = 'foreign-deployment'
+                else:
+                    self.apps.read_namespaced_replica_set.side_effect = ApiException(status=404)
+                self.assertFalse(p.ensure_agent_image(self.agent))
+                self.stream.assert_not_called()
+                self.apps.replace_namespaced_deployment.assert_not_called()
+
+    def test_uncertain_history_never_arms_or_mutates(self):
+        mutations = {
+            'pending': lambda pod: setattr(pod.status, 'phase', 'Pending'),
+            'unknown': lambda pod: setattr(pod.status, 'phase', 'Unknown'),
+            'deleting': lambda pod: setattr(pod.metadata, 'deletion_timestamp', time.time()),
+            'ready': lambda pod: setattr(pod.status.conditions[0], 'status', 'True'),
+            'missing-status': lambda pod: pod.status.container_statuses.pop(),
+            'running': lambda pod: setattr(pod.status.container_statuses[1], 'state',
+                                           client.V1ContainerState(running=client.V1ContainerStateRunning())),
+            'waiting': lambda pod: setattr(pod.status.container_statuses[1], 'state',
+                                           client.V1ContainerState(waiting=client.V1ContainerStateWaiting())),
+            'started': lambda pod: setattr(pod.status.container_statuses[1], 'started', True),
+            'missing-finish': lambda pod: setattr(pod.status.container_statuses[1].state.terminated, 'finished_at', None),
+            'unknown-termination': lambda pod: setattr(pod.status.container_statuses[1].state.terminated,
+                                                       'reason', 'ContainerStatusUnknown'),
+            'duplicate-process-id': lambda pod: (
+                setattr(pod.status.container_statuses[1], 'container_id', 'containerd://agent'),
+                setattr(pod.status.container_statuses[1].state.terminated, 'container_id', 'containerd://agent')),
+            'changed-container': lambda pod: setattr(pod.status.container_statuses[1].state.terminated,
+                                                     'container_id', 'different'),
+            'foreign-owner': lambda pod: setattr(pod.metadata.owner_references[0], 'uid', 'foreign-rs'),
+            'missing-owner': lambda pod: setattr(pod.metadata, 'owner_references', []),
+            'unobserved-init': lambda pod: setattr(pod.spec, 'init_containers', [client.V1Container(name='init')]),
+            'unobserved-ephemeral': lambda pod: setattr(pod.spec, 'ephemeral_containers',
+                                                        [client.V1EphemeralContainer(name='debug')]),
+        }
+        self.promote()
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                retained = self.retained_terminal_pod()
+                mutate(retained)
+                self.pods = [self.pod(), retained]
+                self.assertFalse(p.ensure_agent_image(self.agent))
+                self.apps.replace_namespaced_deployment.assert_not_called()
+                self.stream.assert_not_called()
+
+    def test_history_appearing_after_drain_refuses_final_cas(self):
+        self.promote()
+        self.pods.append(self.retained_terminal_pod())
+        wire = self.wire
+        def change(*args, **kwargs):
+            result = wire(*args, **kwargs)
+            self.pods[1].status.container_statuses[1].state = client.V1ContainerState(
+                running=client.V1ContainerStateRunning())
+            return result
+        self.stream.side_effect = change
+        self.assertFalse(p.ensure_agent_image(self.agent))
+        self.stream.assert_called_once()
+        self.apps.replace_namespaced_deployment.assert_not_called()
+
     def test_bootstrap_same_image_makes_no_mutation_or_drain_or_lease_call(self):
         self.assertTrue(p.ensure_agent_image(self.agent))
         self.apps.replace_namespaced_deployment.assert_not_called()
