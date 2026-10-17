@@ -1278,45 +1278,53 @@ class HeartbeatHealthTests(TransactionTestCase):
         )
 
     async def test_missed_heartbeats_degrade_then_down(self):
-        """After _MISS_DEGRADED missed intervals → degraded; after _MISS_DOWN → down."""
+        """Observe actual health writes at controlled source-clock boundaries."""
         import fleet.consumers as consumers_mod
         from channels.db import database_sync_to_async as _dsta
+        from types import SimpleNamespace
 
-        original_interval = consumers_mod._HEARTBEAT_INTERVAL_S
-        consumers_mod._HEARTBEAT_INTERVAL_S = 0.05  # accelerate heartbeat loop
-
-        try:
-            app = _make_app()
-            comm, _ = await _connect_and_register(app)
-
-            # Do NOT send any heartbeats — let missed-count accumulate.
-            # Hive sends a heartbeat every 0.05s; we need to wait long enough for
-            # _MISS_DEGRADED intervals to elapse without a daemon→Hive heartbeat.
-            get_status = _dsta(lambda: DaemonRegistry.objects.get(daemon_id=_TEST_DAEMON).status)
-
-            # Wait for degraded (3 missed intervals = 0.15s + buffer)
-            degraded = False
-            for _ in range(40):
-                await asyncio.sleep(0.05)
-                status = await get_status()
-                if status == 'degraded':
-                    degraded = True
-                    break
-            self.assertTrue(degraded, f"Expected degraded, got {status!r}")
-
-            # Continue waiting for down (5 missed intervals total)
-            downed = False
-            for _ in range(40):
-                await asyncio.sleep(0.05)
-                status = await get_status()
-                if status == 'down':
-                    downed = True
-                    break
-            self.assertTrue(downed, f"Expected down, got {status!r}")
-
-            await comm.disconnect()
-        finally:
-            consumers_mod._HEARTBEAT_INTERVAL_S = original_interval
+        channel = DaemonLinkConsumer()
+        channel._daemon_id = _TEST_DAEMON
+        channel._channel_name_at_register = 'health-clock-channel'
+        registry = await channel._db_upsert_registry(
+            _TEST_DAEMON, _TEST_FLEET, 'k8s', 'test-credential',
+            channel._channel_name_at_register,
+        )
+        channel._registry_pk = registry['pk']
+        channel.send_json = mock.AsyncMock()
+        get_status = _dsta(
+            lambda: DaemonRegistry.objects.get(daemon_id=_TEST_DAEMON).status
+        )
+        interval = consumers_mod._HEARTBEAT_INTERVAL_S
+        clock = [100.0]
+        channel._last_daemon_hb = clock[0]
+        # Replace only this source module's clock, never asyncio's own clock.
+        # Database/scheduler delays cannot make a poll miss the degraded state.
+        with mock.patch.object(consumers_mod, 'time',
+                               SimpleNamespace(monotonic=lambda: clock[0])):
+            for cycle in range(2):
+                baseline = clock[0]
+                for missed, expected in (
+                    (consumers_mod._MISS_DEGRADED - 1, 'connected'),
+                    (consumers_mod._MISS_DEGRADED, 'degraded'),
+                    (consumers_mod._MISS_DOWN - 1, 'degraded'),
+                    (consumers_mod._MISS_DOWN, 'down'),
+                ):
+                    clock[0] = baseline + missed * interval
+                    self.assertTrue(await channel._heartbeat_tick())
+                    self.assertEqual(await get_status(), expected,
+                                     (cycle, missed))
+                    self.assertEqual(channel.send_json.await_args.args[0]['type'],
+                                     'heartbeat')
+                # Actual inbound handling resets liveness and rearms the same
+                # consumer; a later lapse must still degrade and go down.
+                clock[0] += interval
+                await channel.receive_json({'type': 'heartbeat', 'seq': cycle + 1})
+                self.assertEqual(await get_status(), 'connected')
+                self.assertEqual(channel.send_json.await_args.args[0],
+                                 {'type': 'ack', 'seq': cycle + 1})
+                self.assertTrue(await channel._heartbeat_tick())
+                self.assertEqual(await get_status(), 'connected')
 
     async def test_heartbeat_resets_last_seen(self):
         """A daemon heartbeat frame updates last_seen in DaemonRegistry."""
