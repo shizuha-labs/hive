@@ -5219,8 +5219,12 @@ class FleetAgentListView(APIView):
         serializer = FleetAgentCreateSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        from .runtime_lane import RuntimeLaneError, validate_chat_model_output
         try:
+            validate_chat_model_output(serializer.validated_data.get('model', ''))
             agent = serializer.save()
+        except RuntimeLaneError as exc:
+            return Response({'error': exc.message, 'code': exc.code}, status=status.HTTP_400_BAD_REQUEST)
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -7269,7 +7273,10 @@ class FleetRuntimeOptionsView(APIView):
             payload = {'data': []}
             error = str(exc)
 
+        from .model_serviceability import explicitly_nontext_model
         for item in payload.get('data') or []:
+            if isinstance(item, dict) and explicitly_nontext_model(item):
+                continue
             raw_id = item.get('id') if isinstance(item, dict) else None
             if not raw_id:
                 continue

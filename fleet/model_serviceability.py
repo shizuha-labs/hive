@@ -47,8 +47,23 @@ def is_realtime_omni_model(model: str) -> bool:
     return _bare(model).startswith('grok-voice')
 
 
-def _fetch_served_model_ids() -> set[str] | None:
-    """Model ids Cortex currently advertises to the fleet, or None on failure."""
+def explicitly_nontext_model(item: dict) -> bool:
+    """Only explicit typed output metadata can disqualify an agent chat model.
+
+    Missing/legacy/malformed capabilities are unknown, not evidence that chat
+    is unsupported. Availability and tool support are separate contracts.
+    """
+    metadata = item.get('x_cortex')
+    outputs = metadata.get('output_modalities') if isinstance(metadata, dict) else None
+    return (
+        isinstance(outputs, list) and bool(outputs)
+        and all(isinstance(value, str) and value.strip() for value in outputs)
+        and 'text' not in {value.strip().casefold() for value in outputs}
+    )
+
+
+def fetch_cortex_model_catalog() -> list[dict] | None:
+    """Read the existing viewer-scoped catalog; preserve unknown on failure."""
     import requests
     from django.conf import settings
 
@@ -71,12 +86,31 @@ def _fetch_served_model_ids() -> set[str] | None:
             logger.warning('model-serviceability: /v1/models -> %s', response.status_code)
             return None
         data = response.json().get('data') or []
-        ids = {_bare(m.get('id')) for m in data if isinstance(m, dict) and m.get('id')}
-        # An empty catalog is indistinguishable from a broken one — fail open.
-        return ids or None
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else None
     except Exception as exc:  # noqa: BLE001
         logger.warning('model-serviceability: /v1/models fetch failed: %s', exc)
         return None
+
+
+def _fetch_served_model_ids() -> set[str] | None:
+    """Model ids Cortex currently advertises to the fleet, or None on failure."""
+    data = fetch_cortex_model_catalog()
+    ids = {_bare(item.get('id')) for item in data or [] if item.get('id')}
+    # An empty catalog is indistinguishable from a broken one — fail open.
+    return ids or None
+
+
+def explicitly_nontext_cortex_model(model: str) -> bool:
+    if not is_cortex_model(model):
+        return False
+    wanted = _bare(str(model).casefold())
+    for item in fetch_cortex_model_catalog() or []:
+        aliases = item.get('aliases')
+        names = [item.get('id')] + (aliases if isinstance(aliases, list) else [])
+        if any(isinstance(name, str) and _bare(name.casefold()) == wanted for name in names):
+            if explicitly_nontext_model(item):
+                return True
+    return False
 
 
 def served_cortex_model_ids(*, now: float | None = None) -> set[str] | None:
