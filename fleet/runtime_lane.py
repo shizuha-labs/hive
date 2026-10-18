@@ -380,8 +380,20 @@ def _credential_scopes(agent: Any) -> list[tuple[str, str]]:
     return scopes
 
 
+def validate_chat_model_output(model: str) -> None:
+    """Reject only known non-text Cortex output at desired-config admission."""
+    from .model_serviceability import explicitly_nontext_cortex_model
+
+    if explicitly_nontext_cortex_model(model):
+        raise RuntimeLaneError(
+            "MODEL_NOT_CHAT_CAPABLE",
+            "The selected Cortex model explicitly produces non-text output and cannot run an agent chat lane.",
+        )
+
+
 def preflight_runtime_lane(agent: Any, lane: dict[str, Any]) -> dict[str, Any]:
     """Call the broker's scoped, capability-only probe; no secret leaves it."""
+    validate_chat_model_output(lane.get('model', ''))
     required = list(lane.get("credential_requirements") or [])
     if not required:
         return {"state": "not_required", "required": []}
