@@ -1832,6 +1832,12 @@ def _scale_agent_to_zero(
                 'Released model lease(s) %s for %s agent %s',
                 lease_out['released'], event_type, agent.agent_username,
             )
+            # HIVE-2909: an automatic hibernate that frees a lease must not
+            # cost the seat its coverage priority — if it re-enables within
+            # one reconcile cycle, it wins the refill over unrelated idle
+            # seats (the floor seats coverage, not the stalest idle).
+            from .model_lease import mark_returning_floor_holder
+            mark_returning_floor_holder(agent.agent_username)
             # PLAT-9052: slot(s) freed — honor the DEFER promise by granting
             # the oldest outstanding deferred connect-wake, if any.
             from .wake_defers import reconcile_deferred_wakes
@@ -1844,6 +1850,13 @@ def _scale_agent_to_zero(
             logger.warning(
                 'model-lease release on %s %s: %s',
                 event_type, agent.agent_username, err,
+            )
+            # HIVE-2909: release errors are not silent residue — surface a
+            # typed event so the Agents drawer shows why the KV home may
+            # still be booked after the seat went to zero.
+            _log_event(
+                agent, 'model_lease_release_error',
+                f'model-lease release error: {err}',
             )
     except Exception as exc:  # noqa: BLE001 — never block stop on lease board
         logger.warning(
