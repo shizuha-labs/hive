@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Preserve only the reviewed installation-owned fields, never Secret values.
 set -euo pipefail
+# HIVE-2927: mirror stderr into the rollback fixture file (append; the file is
+# tailed bounded at evidence time). Best-effort — never block the gate.
+if { true 2>>/tmp/h725-fixture.err; } 2>/dev/null; then
+  exec 2> >(tee -a /tmp/h725-fixture.err >&2)
+fi
 KUBECTL="${KUBECTL:-.forgejo/scripts/kubectl}"
 NAMESPACE=shizuha-hive
 PROFILE=hive-installation-config
