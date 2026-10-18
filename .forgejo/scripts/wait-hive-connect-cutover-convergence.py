@@ -32,11 +32,51 @@ def _container(pod: dict[str, Any], name: str) -> dict[str, Any] | None:
     )
 
 
+def current_template_hash(
+    deployment: dict[str, Any],
+    rs_items: dict[str, Any],
+) -> str:
+    """Pod-template-hash of the current-revision ReplicaSet, or "" if ambiguous.
+
+    HIVE-2927: an old-revision ReplicaSet can retain a live surge pod with the
+    same image as the current ring (break-glass hand-promote class). Image
+    equality cannot distinguish such an orphan from a settled current pod, so
+    the typed discriminator is the owner ReplicaSet's revision annotation
+    versus the Deployment's revision annotation.
+    """
+    current_rev = str(
+        (deployment.get("metadata", {}).get("annotations") or {}).get(
+            "deployment.kubernetes.io/revision"
+        )
+        or ""
+    ).strip()
+    if not current_rev:
+        return ""
+    matches = [
+        rs
+        for rs in rs_items.get("items", [])
+        if str(
+            (rs.get("metadata", {}).get("annotations") or {}).get(
+                "deployment.kubernetes.io/revision"
+            )
+            or ""
+        ).strip()
+        == current_rev
+    ]
+    if len(matches) != 1:
+        return ""
+    return str(
+        matches[0].get("metadata", {}).get("labels", {}).get("pod-template-hash")
+        or ""
+    ).strip()
+
+
 def orphaned_image_mismatch_pods(
     deployment: dict[str, Any],
     pods: dict[str, Any],
     *,
     container_name: str = "hive",
+    template_hash: str = "",
 ) -> list[str]:
     """Names of live old-image ReplicaSet pods blocking a settled cutover.
 
@@ -82,7 +122,13 @@ def orphaned_image_mismatch_pods(
         if pod.get("metadata", {}).get("deletionTimestamp"):
             continue
         container = _container(pod, container_name)
-        if container is not None and container.get("image") != expected_image:
+        if container is None:
+            continue
+        image_mismatch = container.get("image") != expected_image
+        revision_mismatch = bool(template_hash) and str(
+            pod.get("metadata", {}).get("labels", {}).get("pod-template-hash") or ""
+        ).strip() != template_hash
+        if image_mismatch or revision_mismatch:
             name = str(pod.get("metadata", {}).get("name") or "")
             if name:
                 orphans.append(name)
@@ -95,6 +141,7 @@ def evaluate_snapshot(
     endpoint_slices: dict[str, Any],
     *,
     container_name: str = "hive",
+    template_hash: str = "",
 ) -> tuple[bool, str]:
     desired = int(deployment.get("spec", {}).get("replicas") or 0)
     status = deployment.get("status", {})
@@ -135,6 +182,10 @@ def evaluate_snapshot(
         container = _container(pod, container_name)
         if container is None:
             return False, f"pod {name} lacks container {container_name}"
+        if template_hash and str(
+            pod.get("metadata", {}).get("labels", {}).get("pod-template-hash") or ""
+        ).strip() != template_hash:
+            return False, f"old-revision ReplicaSet pod still live: {name}"
         env = {
             item.get("name"): item.get("value")
             for item in container.get("env", [])
@@ -218,6 +269,10 @@ def wait_for_convergence(
             pods = _kubectl_json(
                 "-n", namespace, "get", "pods", "-l", _selector(deployment)
             )
+            rs_items = _kubectl_json(
+                "-n", namespace, "get", "rs", "-l", _selector(deployment)
+            )
+            template_hash = current_template_hash(deployment, rs_items)
             endpoint_slices = _kubectl_json(
                 "-n",
                 namespace,
@@ -226,7 +281,9 @@ def wait_for_convergence(
                 "-l",
                 f"kubernetes.io/service-name={service_name}",
             )
-            for orphan in orphaned_image_mismatch_pods(deployment, pods):
+            for orphan in orphaned_image_mismatch_pods(
+                deployment, pods, template_hash=template_hash
+            ):
                 if orphan in reconciled or len(reconciled) >= max_reconciles:
                     continue
                 reconciled.add(orphan)
@@ -264,7 +321,7 @@ def wait_for_convergence(
                         file=sys.stderr,
                     )
             converged, last_reason = evaluate_snapshot(
-                deployment, pods, endpoint_slices
+                deployment, pods, endpoint_slices, template_hash=template_hash
             )
             if converged:
                 print(
@@ -315,6 +372,7 @@ def _classify_failure(reasons: list[str]) -> tuple[str, str]:
             "is not Ready" in r
             or "unsettled" in r
             or "still terminating" in r
+            or "still live" in r
             or "lacks container" in r
             or "image does not match" in r
         )
@@ -328,7 +386,36 @@ def _classify_failure(reasons: list[str]) -> tuple[str, str]:
     return "convergence not observed", reasons[-1]
 
 
+class _StderrTee:
+    """Write-through stderr proxy: real stderr first, fixture file second."""
+
+    def __init__(self, real, fixture):
+        self._real = real
+        self._fixture = fixture
+
+    def write(self, text):
+        self._real.write(text)
+        self._real.flush()
+        try:
+            self._fixture.write(text)
+            self._fixture.flush()
+        except OSError:
+            pass
+
+    def flush(self):
+        self._real.flush()
+
+
 def main() -> int:
+    # HIVE-2927: mirror stderr into the rollback fixture file so the delivered
+    # evidence names the first failing check instead of an empty fixture_stderr.
+    # Best-effort: capture failure must never delay fail-closed rollback.
+    fixture_path = "/tmp/h725-fixture.err"
+    try:
+        fixture = open(fixture_path, "a")
+        sys.stderr = _StderrTee(sys.stderr, fixture)
+    except OSError:
+        pass
     parser = argparse.ArgumentParser()
     parser.add_argument("--namespace", default="shizuha-hive")
     parser.add_argument("--deployment", default="hive")
