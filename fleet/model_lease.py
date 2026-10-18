@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 
 from django.core.cache import cache
@@ -70,6 +71,13 @@ PREEMPT_RETRY_CACHE_KEY = 'fleet:model-lease-preempt-retry'
 # row per pool per tick.
 CRITICAL_TEAM_POLICY_CACHE_KEY = 'fleet:lease-critical-team-policy'
 CRITICAL_TEAM_POLICY_TTL_S = 60
+# HIVE-2909: bare usernames whose critical-team-floor lease was released by an
+# automatic hibernate, with the epoch of that release. Hibernation must free
+# the Cortex KV home, but the seat that WAS the coverage should win the next
+# fill over unrelated idle seats when it re-enables within one reconcile
+# cycle — the floor seats coverage, not whoever happens to be stalest.
+FLOOR_RETURNING_CACHE_KEY = 'fleet:lease-floor-returning:v1'
+FLOOR_RETURNING_TTL_S = 60 * 60
 
 DEFAULT_MIN_HOLD_SECONDS = 15 * 60
 DEFAULT_MAX_HOLD_SECONDS = 45 * 60
@@ -214,6 +222,47 @@ def critical_team_policy() -> dict[str, int]:
     return policy
 
 
+def _floor_returning_book() -> dict:
+    """Fresh {bare_username: epoch} entries from the HIVE-2909 returning book.
+
+    Defensive on shape: a corrupt or foreign cache value reads as empty.
+    """
+    try:
+        raw = cache.get(FLOOR_RETURNING_CACHE_KEY)
+    except Exception:  # noqa: BLE001 — cache must never break leasing
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    return {
+        str(uname): float(ts) for uname, ts in raw.items()
+        if str(uname) and isinstance(ts, (int, float))
+        and 0 <= now - float(ts) <= FLOOR_RETURNING_TTL_S
+    }
+
+
+def mark_returning_floor_holder(username: str) -> None:
+    """Record that ``username``'s floor lease was released by a hibernate.
+
+    Best-effort by contract: failures are logged, never raised — the stop
+    path must not fail because coverage memory could not be written.
+    """
+    uname = str(username or '').strip().removeprefix('agent-')
+    if not uname:
+        return
+    book = _floor_returning_book()
+    book[uname] = time.time()
+    try:
+        cache.set(FLOOR_RETURNING_CACHE_KEY, book, FLOOR_RETURNING_TTL_S)
+    except Exception:  # noqa: BLE001
+        logger.warning('returning-floor book write failed for %s', uname, exc_info=True)
+
+
+def returning_floor_holders() -> set[str]:
+    """Bare usernames with a fresh hibernate-release of a floor lease."""
+    return set(_floor_returning_book())
+
+
 def critical_team_floor_state(
     *,
     members: list[PoolMember],
@@ -221,6 +270,7 @@ def critical_team_floor_state(
     holder_usernames: set[str],
     policy: dict[str, int],
     ready: set[str] | None = None,
+    returning: set[str] | None = None,
 ) -> dict:
     """Pure critical-team floor computation for one pool tick (HIVE-2841).
 
@@ -248,8 +298,16 @@ def critical_team_floor_state(
     that owns the board's urgent item has a waiter waiting behind it. None
     (default) preserves pure LRH selection.  Inter-target order also ranks
     ready-fielded targets ahead of idle-fielded ones before lease age.
+
+    ``returning`` (HIVE-2909) — bare usernames whose floor lease was released
+    by an automatic hibernate within the last ``FLOOR_RETURNING_TTL_S``.
+    A returning holder seats ahead of unrelated idle candidates (but never
+    ahead of a ready waiter): hibernation frees the KV home, yet the seat
+    that WAS the coverage must not lose the refill to a stalest-idle race.
+    None (default) preserves pure LRH below the ready tier.
     """
     ready = ready or set()
+    returning = returning or set()
     if not policy:
         return {'reserved': set(), 'targets': []}
     member_by_uname = {m.username: m for m in members}
@@ -291,12 +349,18 @@ def critical_team_floor_state(
                 and m.username not in holder_usernames
                 and slug in _team_slugs(m)
             ),
-            key=lambda m: (0 if m.username in ready else 1, m.last_held_at, m.username),
+            key=lambda m: (
+                0 if m.username in ready
+                else 1 if m.username in returning
+                else 2,
+                m.last_held_at, m.username,
+            ),
         )
         picked = [m.username for m in candidates[:max(0, deficit)]]
         if picked:
             best = candidates[0]
-            ranked.append((0 if best.username in ready else 1, best.last_held_at, slug, picked))
+            tier = 0 if best.username in ready else 1 if best.username in returning else 2
+            ranked.append((tier, best.last_held_at, slug, picked))
     ranked.sort(key=lambda row: (row[0], row[1], row[2]))
     targets = [(slug, picked) for _, _, slug, picked in ranked]
     return {'reserved': reserved, 'targets': targets}
@@ -2532,6 +2596,7 @@ def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, action
         holder_usernames=current_holder_usernames,
         policy=critical_team_policy(),
         ready=assigned,
+        returning=returning_floor_holders(),
     )
     reserved_usernames |= floor_state['reserved']
     for uname in reserved_usernames:
