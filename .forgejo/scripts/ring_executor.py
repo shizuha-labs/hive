@@ -810,16 +810,27 @@ def _renew_loop(fence: Fence, stop: threading.Event, failure: list[BaseException
             # that exact holder/token reaches committed, renewal must stop
             # without killing post-commit work. Any other conflict is genuine
             # ownership loss and remains cancellation-coupled.
-            try:
-                state = fence.read()
-                if (
-                    state.holder == fence.holder.serialized()
-                    and state.token == fence.token
-                    and state.phase == "committed"
-                ):
-                    return
-            except BaseException:
-                pass
+            if not getattr(exc, "ownership_lost", False):
+                try:
+                    # HIVE-2516 (second review): the committed-state
+                    # observation is bounded by the last-known renewal window
+                    # so the killpg below can never outlive the lease. The
+                    # committed-state exception stays best-effort: if the
+                    # bounded read fails or is declined, cancellation
+                    # proceeds (the pre-existing failure contract).
+                    state = fence.read(deadline=fence.window_deadline(), read_attempts=1)
+                    if (
+                        state.holder == fence.holder.serialized()
+                        and state.token == fence.token
+                        and state.phase == "committed"
+                    ):
+                        return
+                except BaseException:
+                    pass
+            # ownership_lost skips the observation entirely (fourth review):
+            # a successor holds the lease — the read cannot serve the INV-F
+            # check and its latency must not delay the cancellation past our
+            # own expiry.
             failure.append(exc)
             try:
                 os.killpg(child.pid, signal.SIGTERM)

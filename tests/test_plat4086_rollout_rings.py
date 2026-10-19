@@ -10,7 +10,9 @@ import sys
 import tempfile
 import textwrap
 import time
+import threading
 import unittest
+import datetime as dt
 from unittest import mock
 from pathlib import Path
 
@@ -1748,10 +1750,10 @@ class RingFenceContractTests(InstallationProfileCases, unittest.TestCase):
             self.lease = json.loads(json.dumps(lease))
             self.patches = []
 
-        def get_lease(self, _name):
+        def get_lease(self, _name, *, deadline=None, read_attempts=None):
             return json.loads(json.dumps(self.lease))
 
-        def json_patch(self, _namespace, _resource, _name, operations):
+        def json_patch(self, _namespace, _resource, _name, operations, deadline=None):
             self.patches.append(json.loads(json.dumps(operations)))
             for operation in operations:
                 parts = [
@@ -1789,6 +1791,711 @@ class RingFenceContractTests(InstallationProfileCases, unittest.TestCase):
                 "renewTime": renew_time,
             },
         }
+
+    def test_renew_retries_transient_patch_timeout_within_lease_window(self):
+        # HIVE-2516 (run 2667): one apiserver latency spike on the renew PATCH
+        # killed the renew loop and fail-closed rolled back a converged good
+        # release. A transient TimeoutExpired must be retried within the
+        # lease window, not treated as ownership loss.
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active"))
+
+        original_patch = api.json_patch
+        calls = {"n": 0}
+
+        def flaky_patch(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            return original_patch(*args, **kwargs)
+
+        api.json_patch = flaky_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        state = fence.renew()
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(state.token, 7)
+        self.assertEqual(state.holder, holder.serialized())
+
+    def test_renew_retry_conflict_resolves_via_ownership_recheck(self):
+        # A retry Conflict is ambiguous: the timed-out attempt may have landed
+        # with its response lost (resourceVersion advanced by our own renew).
+        # Ownership re-read is the verdict — still ours returns fresh state.
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active"))
+
+        original_patch = api.json_patch
+        calls = {"n": 0}
+
+        def ambiguous_patch(_ns, _res, _name, operations, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Landed server-side, response lost: apply the mutation and
+                # bump resourceVersion, then surface the timeout.
+                original_patch(_ns, _res, _name, operations)
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            # Retry CAS now fails on the advanced resourceVersion.
+            raise m.Conflict("Kubernetes CAS conflict: test failed")
+
+        api.json_patch = ambiguous_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        state = fence.renew()
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(state.holder, holder.serialized())
+        self.assertEqual(state.token, 7)
+
+    def test_renew_successor_takeover_during_retry_still_raises_conflict(self):
+        # The ambiguous-retry re-read must never mask a genuine takeover: the
+        # successor takes the lease BETWEEN the timed-out attempt and the
+        # retry, and the ownership re-read must surface the Conflict.
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        successor = self.holder(m, run="101")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active"))
+
+        calls = {"n": 0}
+
+        def takeover_patch(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Successor takes over while our attempt is in flight.
+                api.lease = self.lease(successor, token=9, phase="acquiring")
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            raise m.Conflict("Kubernetes CAS conflict: test failed")
+
+        api.json_patch = takeover_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        with self.assertRaisesRegex(m.Conflict, "holder/token changed"):
+            fence.renew()
+        self.assertEqual(calls["n"], 2)
+
+    def test_renew_window_exhausted_stops_retrying_fail_closed(self):
+        # Once a fresh renewTime could no longer land before the lease
+        # lapses, retrying would be unsound — surface the timeout (the
+        # executor then fail-closes exactly as before the fix).
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        stale = (
+            dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=80)
+        ).isoformat().replace("+00:00", "Z")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+
+        calls = {"n": 0}
+
+        def slow_patch(*args, **kwargs):
+            calls["n"] += 1
+            raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+
+        api.json_patch = slow_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        with self.assertRaises(subprocess.TimeoutExpired):
+            fence.renew()
+        self.assertEqual(calls["n"], 1)
+
+    def test_renew_budget_declines_attempt_that_cannot_finish_before_expiry(self):
+        # HIVE-2516 P1 (rei's deterministic repro): the guard must bound
+        # IN-FLIGHT work, not attempt starts. With real 45s attempt budgets
+        # on a deterministic clock: renewal at t=0, loop begins t=15, first
+        # PATCH times out at t=60 — the old guard permitted a second attempt
+        # at t=65 that ran to t=110 (30s past the t=90 lease expiry). The
+        # budget-aware guard must decline it and surface the failure at
+        # t=60, INSIDE the lease, so the executor cancels before expiry.
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        stale = (base - dt.timedelta(seconds=0)).isoformat().replace("+00:00", "Z")
+        # renewTime t=0; expiry t=90; guard deadline = renewTime + 90 - 20 = t=70.
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+
+        original_patch = api.json_patch
+        timeline: list[float] = []
+
+        def slow_real_budget_patch(*args, **kwargs):
+            # Consume the ACTUAL 45s attempt budget on the fake clock.
+            clock["t"] += dt.timedelta(seconds=45)
+            timeline.append(clock["t"].timestamp() - base.timestamp())
+            raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+
+        api.json_patch = slow_real_budget_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        sleeps: list[float] = []
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: (clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s)), sleeps.append(s))),
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                fence.renew()
+
+        self.assertEqual(timeline, [45.0])  # one attempt: decline instead of a t=45-START retry
+        self.assertEqual(sleeps, [])        # and no sleep after exhaustion
+
+    def test_renew_retry_fits_budget_only_by_clamped_sleep(self):
+        # The clamp must BIND: attempt-2 backoff (5*2=10s) is strictly
+        # greater than the remaining pre-budget room (5s). The fake patch
+        # enforces the window deadline the way the real clamped subprocess
+        # timeout does (an attempt that would outlive it is killed =>
+        # TimeoutExpired). Replacing min(a,b) with the raw backoff makes
+        # this test fail: the retry starts 5s too late and is killed.
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        # renewTime t=+22 => guard deadline t=92; expiry t=112. Attempt-1's
+        # requested backoff (5s) STRICTLY exceeds the remaining pre-budget
+        # room after its 45s attempt (92-90=2s) — the clamp must bind to 2.
+        stale = (base + dt.timedelta(seconds=22)).isoformat().replace("+00:00", "Z")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+        DEADLINE = base + dt.timedelta(seconds=92)
+
+        original_patch = api.json_patch
+        calls = {"n": 0}
+
+        def budgeted_patch(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                clock["t"] += dt.timedelta(seconds=45)  # t=45
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            # Real Kube.run clamps the subprocess timeout to the deadline:
+            # an attempt starting too late is killed instead of overrunning.
+            if clock["t"] + dt.timedelta(seconds=45) > DEADLINE:
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            clock["t"] += dt.timedelta(seconds=1)  # fast success
+            return original_patch(*args, **kwargs)
+
+        api.json_patch = budgeted_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        sleeps: list[float] = []
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: (clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s)), sleeps.append(s))),
+        ):
+            state = fence.renew()
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(state.token, 7)
+        # Attempt-1 backoff requests 5s; only 2s of room remains before the
+        # retry could no longer finish: the clamp must bind to 2 (the raw
+        # backoff would push the retry past its fit window and get it killed).
+        self.assertEqual(sleeps, [2.0])
+        self.assertLessEqual(clock["t"].timestamp() - base.timestamp(), 92.0)
+
+    def test_renew_ambiguous_reread_declined_when_it_cannot_fit_window(self):
+        # The post-Conflict re-read guard must BIND: attempt 1 times out
+        # (45s), the clamped retry starts inside the window, and the retry's
+        # Conflict arrives after real server latency — by which time no
+        # 45s-capable re-read can finish before the deadline. The Conflict
+        # is the fail-closed verdict and the re-read is declined. Forcing
+        # _renew_window_exhausted False makes this test fail (the re-read
+        # proceeds past the window).
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        # renewTime t=+23 => guard deadline t=93; expiry t=113.
+        stale = (base + dt.timedelta(seconds=23)).isoformat().replace("+00:00", "Z")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+
+        calls = {"n": 0}
+
+        def ambiguous_patch(_ns, _res, _name, operations, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                clock["t"] += dt.timedelta(seconds=45)  # t=45
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            clock["t"] += dt.timedelta(seconds=2)  # t=50: slow Conflict
+            raise m.Conflict("Kubernetes CAS conflict: test failed")
+
+        api.json_patch = ambiguous_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        rereads = {"n": 0}
+
+        original_get = api.get_lease
+
+        def counting_get(name, **_kwargs):
+            rereads["n"] += 1
+            return original_get(name)
+
+        api.get_lease = counting_get
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+        ):
+            with self.assertRaises(m.Conflict):
+                fence.renew()
+
+        # Entry validate reads once; the ambiguity re-read was declined.
+        self.assertEqual(rereads["n"], 1)
+
+    def _end_to_end_probe_fakes(self, api, clock, *, first_get_latency=40.0):
+        """Shared fake adapter for the end-to-end probes — models rei's
+        storm shape with real adapter timing: the FIRST lease GET succeeds
+        after `first_get_latency` seconds (40s in probe A: "GET succeeds
+        after 40s at 55"; fast in probe B so the Conflict lands inside the
+        window); every LATER GET is storm-killed, consuming its
+        (deadline-clamped) subprocess budget before surfacing
+        TimeoutExpired — which is what made the unbounded read retry for
+        170s. The mutating PATCH is clamped to its deadline the same way
+        (killed at the deadline, not running its full 45s past it)."""
+        gets = {"n": 0}
+
+        def get_lease(name, *, deadline=None, read_attempts=None):
+            gets["n"] += 1
+            if gets["n"] == 1:
+                clock["t"] += dt.timedelta(seconds=first_get_latency)
+                return json.loads(json.dumps(api.lease))
+            budget = 45.0
+            if deadline is not None:
+                remaining = (deadline - clock["t"]).total_seconds()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd="kubectl get", timeout=budget)
+                budget = min(budget, remaining)
+            clock["t"] += dt.timedelta(seconds=budget)  # killed at the cap
+            raise subprocess.TimeoutExpired(cmd="kubectl get", timeout=budget)
+
+        def json_patch(_ns, _res, _name, operations, deadline=None):
+            budget = 45.0
+            if deadline is not None:
+                remaining = (deadline - clock["t"]).total_seconds()
+                budget = min(budget, remaining)
+            clock["t"] += dt.timedelta(seconds=budget)  # killed at the cap
+            raise subprocess.TimeoutExpired(cmd="kubectl patch", timeout=budget)
+
+        api.get_lease = get_lease
+        api.json_patch = json_patch
+        return api, gets
+
+    def test_executor_end_to_end_slow_entry_get_and_first_patch_cancel_inside_lease(self):
+        # rei's end-to-end probe at the PREVIOUS sha killed the child at
+        # t=100 (expiry 90): tick t=15, entry GET succeeded after 40s at
+        # t=55, first PATCH consumed its full 45s unguarded. With the
+        # deadline plumbing the first PATCH is CLAMPED to the window guard
+        # deadline (t=70): the killpg lands at t=70, strictly inside the
+        # lease. Uses the normal 15s tick and real adapter timing (only
+        # subprocess, clock, sleep and killpg simulated).
+        e, m = self.executor_module, self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        stale = base.isoformat().replace("+00:00", "Z")  # renewed at t=0
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+        self._end_to_end_probe_fakes(api, clock)
+        fence = m.Fence(holder, api)
+        fence.token = 7
+
+        class OneTickStop:
+            def __init__(self):
+                self.waited = 0
+
+            def wait(self, timeout):
+                self.waited += 1
+                if self.waited == 1:
+                    clock["t"] += dt.timedelta(seconds=timeout)  # the 15s tick
+                    return False
+                return True
+
+        kills: list[float] = []
+        failure: list[BaseException] = []
+        child = type("Child", (), {"pid": 999})()
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+            mock.patch.object(e.os, "killpg", side_effect=lambda _pid, _sig: kills.append(clock["t"].timestamp() - base.timestamp())),
+        ):
+            e._renew_loop(fence, OneTickStop(), failure, child)
+
+        self.assertTrue(failure)   # renewal loss surfaced
+        self.assertTrue(kills)
+        # rei's overrun: killpg t=100 > expiry 90. Fixed: at the guard
+        # deadline t=70 — the first PATCH is clamped, not unguarded.
+        self.assertLess(kills[0], 90.0)
+        self.assertLessEqual(kills[0], 70.0)
+
+    def test_executor_conflict_path_observation_bounded_and_kill_inside_lease(self):
+        # rei's Conflict-path probe: PATCH raises Conflict at t=60, then the
+        # executor's committed-state observation previously retried reads on
+        # the 170s read budget (killpg t=230). The observation is now a
+        # single deadline-clamped attempt: it dies at the window deadline
+        # (t=70) and the killpg lands there — inside the lease, with the
+        # committed-state exception preserved as best-effort.
+        e, m = self.executor_module, self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        stale = base.isoformat().replace("+00:00", "Z")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+        calls = {"n": 0}
+
+        def conflict_patch(_ns, _res, _name, operations, deadline=None):
+            calls["n"] += 1
+            # rei's probe shape: the Conflict response itself arrives after a
+            # 45s-latency request (tick 15 + 45 => t=60; still inside the
+            # window guard deadline t=70, so no clamp triggers on the PATCH).
+            clock["t"] += dt.timedelta(seconds=45)
+            raise m.Conflict("Kubernetes CAS conflict: test failed")
+
+        self._end_to_end_probe_fakes(api, clock, first_get_latency=2.0)  # entry GET fast; later reads storm-killed
+        api.json_patch = conflict_patch  # 45s-latency Conflict at t=60 (rei's shape)
+        fence = m.Fence(holder, api)
+        fence.token = 7
+
+        class OneTickStop:
+            def __init__(self):
+                self.waited = 0
+
+            def wait(self, timeout):
+                self.waited += 1
+                if self.waited == 1:
+                    clock["t"] += dt.timedelta(seconds=timeout)
+                    return False
+                return True
+
+        kills: list[float] = []
+        failure: list[BaseException] = []
+        child = type("Child", (), {"pid": 999})()
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+            mock.patch.object(e.os, "killpg", side_effect=lambda _pid, _sig: kills.append(clock["t"].timestamp() - base.timestamp())),
+        ):
+            e._renew_loop(fence, OneTickStop(), failure, child)
+
+        self.assertTrue(failure)
+        self.assertTrue(kills)
+        self.assertLess(kills[0], 90.0)      # inside the lease
+        self.assertLessEqual(kills[0], 70.0)  # observation died at the window deadline
+
+    def _real_adapter_harness(self, clock, base):
+        """Real Kubectl + real Fence over a fake kubectl binary boundary:
+        subprocess.run is the only simulated layer. It models request
+        latency/kill semantics — a request consumes its (deadline-clamped)
+        timeout when storm-killed, or a configured latency when it
+        succeeds — and serves the lease store for real get/create/patch
+        verbs, so the REAL Kubectl.run deadline forwarding, retry loop,
+        Fence.renew window math and executor loop are all exercised."""
+        m = self.fence_module
+        store = {"lease": None}
+        modes = {"reads": "fast", "patch": "fast"}  # flipped per scenario
+        calls = {"get": 0, "patch": 0}
+
+        class Completed(subprocess.CompletedProcess):
+            pass
+
+        def fake_run(cmd, input=None, text=True, capture_output=True, timeout=None, env=None, **_kw):
+            args = cmd[1:]
+            latency = timeout if timeout is not None else 45.0
+            if "create" in args:
+                body = json.loads(input)
+                body.setdefault("metadata", {})["resourceVersion"] = "1"
+                store["lease"] = body
+                clock["t"] += dt.timedelta(seconds=min(latency, 2))
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(body), "")
+            if "patch" in args:
+                calls["patch"] += 1
+                if modes["patch"] == "slow-success":
+                    clock["t"] += dt.timedelta(seconds=max(latency - 1, 0))  # lands just inside
+                    operations = json.loads(input)
+                    lease = store["lease"]
+                    for operation in operations:
+                        parts = [part.replace("~1", "/").replace("~0", "~") for part in operation["path"].split("/")[1:]]
+                        cursor = lease
+                        for part in parts[:-1]:
+                            cursor = cursor[part]
+                        if operation["op"] == "test":
+                            assert cursor[parts[-1]] == operation["value"], "test failed"
+                        else:
+                            cursor[parts[-1]] = operation["value"]
+                    lease["metadata"]["resourceVersion"] = str(int(lease["metadata"]["resourceVersion"]) + 1)
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(lease), "")
+                clock["t"] += dt.timedelta(seconds=latency)  # storm-killed
+                raise subprocess.TimeoutExpired(cmd="kubectl patch", timeout=latency)
+            if "get" in args:
+                calls["get"] += 1
+                if store["lease"] is None:
+                    clock["t"] += dt.timedelta(seconds=min(latency, 2))
+                    return subprocess.CompletedProcess(cmd, 1, "", 'Error from server (NotFound): leases.coordination.k8s.io "x" not found')
+                if modes["reads"] == "storm" or (modes["reads"] == "storm-after-first" and calls["get"] > 1):
+                    clock["t"] += dt.timedelta(seconds=latency)  # killed at the cap
+                    raise subprocess.TimeoutExpired(cmd="kubectl get", timeout=latency)
+                if modes["reads"] == "storm-after-first":
+                    clock["t"] += dt.timedelta(seconds=40)  # rei's shape: succeeds after 40s
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(store["lease"]), "")
+                clock["t"] += dt.timedelta(seconds=min(latency, 2))
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(store["lease"]), "")
+            raise AssertionError("unexpected kubectl invocation: " + repr(args[:4]))
+
+        api = m.Kubectl()
+        return api, store, modes, calls, fake_run
+
+    def test_executor_real_adapter_success_renewal_refreshes_window_next_tick_uses_it(self):
+        # Third-review cache lifecycle: a slow-but-successful PATCH (44s of
+        # its 45s budget) returns renewTime captured at build time — the
+        # window deadline the NEXT tick must use is the FRESH one, not the
+        # acquisition-era cache. With the refresh missing, the next tick
+        # declines its GET against the stale deadline and kills a healthy
+        # child a full window early (rei's t=74 kill for deadline 85).
+        e, m = self.executor_module, self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        api, store, modes, calls, fake_run = self._real_adapter_harness(clock, base)
+        fence = m.Fence(holder, api)
+
+        kills: list[float] = []
+        failure: list[BaseException] = []
+        child = type("Child", (), {"pid": 31337})()
+        waited = {"n": 0}
+
+        class TickStop:
+            def wait(self, timeout):
+                waited["n"] += 1
+                if waited["n"] == 1:
+                    modes["patch"] = "slow-success"  # renew #1: slow but lands
+                    clock["t"] += dt.timedelta(seconds=timeout)  # 15s tick
+                    return False
+                if waited["n"] == 2:
+                    modes["reads"] = "storm"  # renew #2: the storm persists
+                    clock["t"] += dt.timedelta(seconds=timeout)
+                    return False
+                return True
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m, "utc_now", side_effect=lambda: clock["t"].isoformat().replace("+00:00", "Z")),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+            mock.patch.object(m.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(e.os, "killpg", side_effect=lambda _pid, _sig: kills.append(clock["t"].timestamp() - base.timestamp())),
+        ):
+            fence.acquire()  # creates the lease; initializes the window cache
+            self.assertIsNotNone(fence.window_deadline())
+            acquired_deadline = fence.window_deadline()
+            e._renew_loop(fence, TickStop(), failure, child)
+
+        # The successful slow renewal must have REFRESHED the cached window:
+        # fresh renewTime was stamped at patch-build (t≈17), so the new
+        # deadline ≈ 87 — not the acquisition-era 70.
+        self.assertIsNotNone(fence.window_deadline())
+        self.assertGreater(fence.window_deadline(), acquired_deadline + dt.timedelta(seconds=10))
+        # The next tick's storm-GET is bounded by the FRESH window: the
+        # killpg lands at/after the fresh deadline — never at the stale one.
+        self.assertTrue(failure)
+        self.assertTrue(kills)
+        fresh_deadline_s = (fence.window_deadline() - base).total_seconds()
+        self.assertGreaterEqual(kills[0], fresh_deadline_s - 0.5)  # not the stale-cache early kill
+        self.assertLess(kills[0], fresh_deadline_s + 30.0)          # inside the real lease
+
+    def test_executor_real_adapter_first_entry_conflict_observation_bounded(self):
+        # Third-review cache lifecycle, first-entry Conflict: the entry
+        # validate has NO cached window (never acquired/read), its storm-GET
+        # succeeds after 40s revealing phase=committed, and the Conflict
+        # fires. The executor's observation must be bounded by the window
+        # observed from THAT read (deadline 70) — with the validate-time
+        # observation missing, the observation is unbounded and killpg lands
+        # at t=100, past the 90s expiry.
+        e, m = self.executor_module, self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        api, store, modes, calls, fake_run = self._real_adapter_harness(clock, base)
+        modes["reads"] = "storm-after-first"  # entry GET slow-success; the observation GET storm-dies
+        lease = self.lease(holder, token=7, phase="committed")
+        lease["spec"]["renewTime"] = base.isoformat().replace("+00:00", "Z")
+        store["lease"] = lease
+        fence = m.Fence(holder, api)
+        fence.token = 7  # no acquire: the window cache is genuinely unset
+
+        kills: list[float] = []
+        failure: list[BaseException] = []
+        child = type("Child", (), {"pid": 31338})()
+        waited = {"n": 0}
+
+        class TickStop:
+            def wait(self, timeout):
+                waited["n"] += 1
+                if waited["n"] == 1:
+                    clock["t"] += dt.timedelta(seconds=timeout)  # 15s tick
+                    return False
+                return True
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m, "utc_now", side_effect=lambda: clock["t"].isoformat().replace("+00:00", "Z")),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+            mock.patch.object(m.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(e.os, "killpg", side_effect=lambda _pid, _sig: kills.append(clock["t"].timestamp() - base.timestamp())),
+        ):
+            e._renew_loop(fence, TickStop(), failure, child)
+
+        # The Conflict was raised from the committed phase, and the
+        # observation was bounded by the observed window (deadline 70):
+        # killpg strictly inside the 90s lease.
+        self.assertTrue(failure)
+        self.assertIsInstance(failure[0], m.Conflict)
+        self.assertTrue(kills)
+        self.assertLess(kills[0], 90.0)
+        self.assertLessEqual(kills[0], 70.0 + 0.5)
+
+    def test_executor_real_adapter_successor_takeover_cancels_on_own_clock(self):
+        # Fourth review (rei): the entry read observing a SUCCESSOR's lease
+        # must never extend our kill deadline to the successor's window.
+        # Probe shape: tick 15, entry GET succeeds after 40s (t=55) returning
+        # token 9 / renewTime 55 (successor deadline 125). With the
+        # successor-window cache the observation bounded at 125 and killpg
+        # landed at t=100 — past OUR 90s expiry. The ownership-loss Conflict
+        # now cancels immediately: killpg at t=55, on our own clock.
+        e, m = self.executor_module, self.fence_module
+        holder = self.holder(m, run="100")
+        successor = self.holder(m, run="101")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        api, store, modes, calls, fake_run = self._real_adapter_harness(clock, base)
+        modes["reads"] = "storm-after-first"  # entry GET slow-success at 40s
+        lease = self.lease(successor, token=9, phase="active")
+        lease["spec"]["renewTime"] = (base + dt.timedelta(seconds=55)).isoformat().replace("+00:00", "Z")
+        store["lease"] = lease
+        fence = m.Fence(holder, api)
+        fence.token = 7  # our (superseded) token; no acquire, no cached window
+
+        kills: list[float] = []
+        failure: list[BaseException] = []
+        child = type("Child", (), {"pid": 31339})()
+        waited = {"n": 0}
+
+        class TickStop:
+            def wait(self, timeout):
+                waited["n"] += 1
+                if waited["n"] == 1:
+                    clock["t"] += dt.timedelta(seconds=timeout)  # 15s tick
+                    return False
+                return True
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m, "utc_now", side_effect=lambda: clock["t"].isoformat().replace("+00:00", "Z")),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+            mock.patch.object(m.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(e.os, "killpg", side_effect=lambda _pid, _sig: kills.append(clock["t"].timestamp() - base.timestamp())),
+        ):
+            e._renew_loop(fence, TickStop(), failure, child)
+
+        self.assertTrue(failure)
+        self.assertIsInstance(failure[0], m.Conflict)
+        self.assertTrue(getattr(failure[0], "ownership_lost", False))
+        # The successor's window (125) never became our kill deadline: the
+        # cancellation is immediate on ownership loss — strictly inside our
+        # own 90s expiry.
+        self.assertTrue(kills)
+        self.assertLess(kills[0], 90.0)
+        self.assertLessEqual(kills[0], 55.0 + 0.5)
+
+    def test_renew_ambiguity_guard_is_load_bearing(self):
+        # Mutation test for the guard above: with the guard disabled, the
+        # re-read proceeds — proving the previous test exercises the guard
+        # and not incidental timing.
+        m = self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        stale = (base + dt.timedelta(seconds=23)).isoformat().replace("+00:00", "Z")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+
+        calls = {"n": 0}
+
+        def ambiguous_patch(_ns, _res, _name, operations, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                clock["t"] += dt.timedelta(seconds=45)
+                raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+            clock["t"] += dt.timedelta(seconds=2)
+            raise m.Conflict("Kubernetes CAS conflict: test failed")
+
+        api.json_patch = ambiguous_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+        rereads = {"n": 0}
+        original_get = api.get_lease
+
+        def counting_get(name, **_kwargs):
+            rereads["n"] += 1
+            return original_get(name)
+
+        api.get_lease = counting_get
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(m.time, "sleep", side_effect=lambda s: clock.__setitem__("t", clock["t"] + dt.timedelta(seconds=s))),
+            mock.patch.object(type(fence), "_renew_window_exhausted", lambda _self, _state: False),
+        ):
+            # Guard disabled: the ambiguity re-read RUNS (the real 45s+ read
+            # would overrun the window) and, the fixture lease still being
+            # ours, renew() returns success instead of failing closed.
+            state = fence.renew()
+
+        self.assertEqual(state.token, 7)
+        self.assertEqual(rereads["n"], 2)  # guard disabled => re-read happened
+
+    def test_executor_cancels_child_before_lease_expiry_on_budget_exhaustion(self):
+        # The renewal-loss cancellation coupling must land INSIDE our own
+        # lease: with the budget-aware guard, the failure surfaces at t=60
+        # (rei's repro), so killpg fires before the t=90 expiry — never in a
+        # successor's acquire window.
+        e, m = self.executor_module, self.fence_module
+        holder = self.holder(m, run="100")
+        base = dt.datetime.now(dt.timezone.utc)
+        clock = {"t": base}
+        stale = (base - dt.timedelta(seconds=0)).isoformat().replace("+00:00", "Z")
+        api = self.FakeApi(self.lease(holder, token=7, phase="active", renew_time=stale))
+
+        def slow_real_budget_patch(*args, **kwargs):
+            clock["t"] += dt.timedelta(seconds=45)
+            raise subprocess.TimeoutExpired(cmd="kubectl", timeout=45)
+
+        api.json_patch = slow_real_budget_patch
+        fence = m.Fence(holder, api)
+        fence.token = 7
+
+        kills: list[str] = []
+
+        class FakeChild:
+            pid = 4242
+
+        class OneTickStop:
+            def __init__(self):
+                self.waited = 0
+
+            def wait(self, _timeout):
+                self.waited += 1
+                return self.waited > 1  # run the loop body exactly once
+
+        stop = OneTickStop()
+        failure: list[BaseException] = []
+
+        with (
+            mock.patch.object(m, "_now", side_effect=lambda: clock["t"]),
+            mock.patch.object(e, "RENEW_INTERVAL_SECONDS", 0),
+            mock.patch.object(e.os, "killpg", side_effect=lambda pid, sig: kills.append((clock["t"].timestamp() - base.timestamp(), pid, sig))),
+        ):
+            e._renew_loop(fence, stop, failure, FakeChild())
+
+        self.assertTrue(failure)
+        self.assertTrue(kills)
+        kill_time, kill_pid, kill_sig = kills[0]
+        self.assertEqual(kill_pid, 4242)
+        self.assertLess(kill_time, 90.0)  # cancellation INSIDE the lease
+        self.assertLessEqual(kill_time, 45.0)  # at the budget-exhaustion instant
 
     def test_same_and_different_sha_successor_fence_resumed_predecessor(self):
         m = self.fence_module
@@ -3749,7 +4456,10 @@ class RingFenceContractTests(InstallationProfileCases, unittest.TestCase):
             def renew(self):
                 raise m.Conflict("resourceVersion race")
 
-            def read(self):
+            def window_deadline(self):
+                return None
+
+            def read(self, **_kwargs):
                 return m.FenceState(
                     holder=holder.serialized(), token=7, phase="committed",
                     resource_version="9", duration=90,

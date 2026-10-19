@@ -36,7 +36,19 @@ class FenceError(RuntimeError):
 
 
 class Conflict(FenceError):
-    """The Kubernetes API rejected a resourceVersion/test precondition."""
+    """The Kubernetes API rejected a resourceVersion/test precondition.
+
+    ownership_lost=True marks the holder/token variant: the observed lease
+    belongs to a SUCCESSOR, so no observation latency is justified — the
+    executor cancels immediately (our lease is gone; the killpg cannot
+    outlive a lease we no longer own). Phase conflicts on a still-ours
+    lease keep ownership_lost=False and keep the bounded committed-state
+    observation (INV-F).
+    """
+
+    def __init__(self, message: str, *, ownership_lost: bool = False):
+        super().__init__(message)
+        self.ownership_lost = ownership_lost
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,6 +161,15 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _now() -> dt.datetime:
+    """Wall-clock hook for the renew window guard.
+
+    Deterministic tests (HIVE-2516 P1) monkeypatch this instead of
+    dt.datetime to advance simulated time across real 45s timeouts.
+    """
+    return dt.datetime.now(dt.timezone.utc)
+
+
 class Kubectl:
     """Small JSON-only kubectl adapter; stderr is bounded and never logged raw."""
 
@@ -187,7 +208,15 @@ class Kubectl:
             return item in cls.READ_ONLY_VERBS
         return False
 
-    def run(self, args: list[str], *, stdin: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def run(self, args: list[str], *, stdin: str | None = None, check: bool = True,
+            deadline: dt.datetime | None = None,
+            read_attempts: int | None = None) -> subprocess.CompletedProcess[str]:
+        # HIVE-2516 P1 (second review): callers inside the renewal window pass
+        # an absolute deadline — the per-attempt subprocess timeout is clamped
+        # to the remaining time and the read-retry loop declines attempts that
+        # cannot start inside it. This is what bounds the whole
+        # renewal/cancellation operation (entry reads, first mutation,
+        # ambiguity re-reads) instead of only the retry starts.
         process_timeout = 45
         for item in args:
             match = re.fullmatch(r"--timeout=([0-9]+)s", item)
@@ -204,18 +233,27 @@ class Kubectl:
         # retry read-only probes with backoff (3 attempts, ~2 min total
         # window) before surfacing the timeout. Mutating commands and
         # definitive API errors still fail on first occurrence.
-        attempts = self.TIMEOUT_RETRIES if self._is_read_only(args) else 1
+        attempts = read_attempts if read_attempts is not None else (
+            self.TIMEOUT_RETRIES if self._is_read_only(args) else 1)
         backoff = self.TIMEOUT_BACKOFF_SECONDS
         for attempt in range(1, attempts + 1):
+            timeout = process_timeout
+            if deadline is not None:
+                remaining = (deadline - _now()).total_seconds()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd=" ".join(args[:2]), timeout=process_timeout)
+                timeout = min(timeout, remaining)
             try:
                 result = subprocess.run(
                     [self.binary, *args], input=stdin, text=True, capture_output=True,
-                    timeout=process_timeout,
+                    timeout=timeout,
                     env={**os.environ, "KUBECTL_EXTERNAL_DIFF": "/bin/false"},
                 )
                 break
             except subprocess.TimeoutExpired:
                 if attempt == attempts:
+                    raise
+                if deadline is not None and deadline <= _now():
                     raise
                 time.sleep(backoff)
                 backoff *= 2.5
@@ -254,8 +292,10 @@ class Kubectl:
             )
         return result
 
-    def get_lease(self, name: str) -> dict[str, Any]:
-        result = self.run(["-n", LEASE_NAMESPACE, "get", "lease", name, "-o", "json"], check=False)
+    def get_lease(self, name: str, *, deadline: dt.datetime | None = None,
+                  read_attempts: int | None = None) -> dict[str, Any]:
+        result = self.run(["-n", LEASE_NAMESPACE, "get", "lease", name, "-o", "json"], check=False,
+                          deadline=deadline, read_attempts=read_attempts)
         if result.returncode:
             # Absence is meaningful only when kubectl's typed status says so.
             if "NotFound" in result.stderr:
@@ -285,14 +325,15 @@ class Kubectl:
         result = self.run(["create", "-f", "-", "-o", "json"], stdin=json.dumps(body))
         return FenceState.from_lease(json.loads(result.stdout))
 
-    def json_patch(self, namespace: str, resource: str, name: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
+    def json_patch(self, namespace: str, resource: str, name: str, operations: list[dict[str, Any]],
+                   deadline: dt.datetime | None = None) -> dict[str, Any]:
         # ConfigMap evidence patches can approach the object-size limit. Stream
         # the patch through stdin so it never crosses Linux's argv ARG_MAX.
         patch = json.dumps(operations, separators=(",", ":"))
         result = self.run([
             "-n", namespace, "patch", resource, name, "--type=json", "-o", "json",
             "--patch-file=/dev/stdin",
-        ], stdin=patch)
+        ], stdin=patch, deadline=deadline)
         return json.loads(result.stdout)
 
 
@@ -305,8 +346,34 @@ class Fence:
         self.api = api
         self.token: int | None = None
 
-    def read(self) -> FenceState:
-        return FenceState.from_lease(self.api.get_lease(self.holder.lease_name))
+    def read(self, *, deadline: dt.datetime | None = None,
+             read_attempts: int | None = None) -> FenceState:
+        lease = (self.api.get_lease(self.holder.lease_name, deadline=deadline, read_attempts=read_attempts)
+                 if deadline is not None or read_attempts is not None
+                 else self.api.get_lease(self.holder.lease_name))
+        return FenceState.from_lease(lease)
+
+    def window_deadline(self) -> dt.datetime | None:
+        """Last-known renewal-window deadline (renewTime + duration - margin).
+
+        The executor uses this to bound its post-Conflict committed-state
+        observation so the killpg it issues can never outlive the lease.
+        """
+        return getattr(self, "_window_deadline", None)
+
+    def _observe_window(self, state: "FenceState") -> None:
+        """HIVE-2516 third review: refresh the cached window deadline from
+        any freshly-read lease state — acquisition, the renew entry read,
+        and every successful renewal. A stale cache (last acquisition's
+        window) makes the next tick decline its GET against a deadline that
+        no longer governs, killing a healthy child up to a full window
+        early; a never-set cache (first-entry Conflict) leaves the
+        executor's observation unbounded. Both are closed by observing the
+        window at every successful read."""
+        try:
+            self._window_deadline = self._renew_deadline(state)
+        except Conflict:
+            pass  # unreadable renewTime: keep the previous cache (fail-closed)
 
     def acquire(self, *, expected_prior_token: int | None = None) -> FenceState:
         try:
@@ -316,6 +383,7 @@ class Fence:
                 raise Conflict("ring Lease disappeared after request submission")
             state = self.api.create_lease(self.holder)
             self.token = state.token
+            self._observe_window(state)
             return state
         previous = FenceState.from_lease(lease)
         if expected_prior_token is not None and previous.token != expected_prior_token:
@@ -340,25 +408,122 @@ class Fence:
         updated = self.api.json_patch(LEASE_NAMESPACE, "lease", self.holder.lease_name, patch)
         state = FenceState.from_lease(updated)
         self.token = state.token
+        self._observe_window(state)
         return state
 
-    def validate(self, allowed_phases: Iterable[str] = ACTIVE_PHASES) -> FenceState:
+    def validate(self, allowed_phases: Iterable[str] = ACTIVE_PHASES, *,
+                 deadline: dt.datetime | None = None,
+                 read_attempts: int | None = None) -> FenceState:
         if self.token is None:
             raise FenceError("fence token not initialized")
-        state = self.read()
+        state = self.read(deadline=deadline, read_attempts=read_attempts)
+        # Observe the window ONLY from a still-ours read (fourth review): a
+        # successor's renewTime must never extend OUR kill deadline — after
+        # ownership loss the executor cancels on OUR clock (immediately),
+        # while the same-owner committed case keeps its observed window for
+        # the bounded INV-F observation.
         if state.holder != self.holder.serialized() or state.token != self.token:
-            raise Conflict("ring holder/token changed")
+            raise Conflict("ring holder/token changed", ownership_lost=True)
+        self._observe_window(state)
         if state.phase not in set(allowed_phases):
             raise Conflict(f"ring phase {state.phase} is not writable")
         return state
 
+    # HIVE-2516 (runs 2665/2667, 2026-09-08): one transient kube-apiserver
+    # latency spike during a renew window used to be fatal — the renew PATCH
+    # is a mutating verb (single attempt in the Kubectl adapter), so a single
+    # TimeoutExpired killed the renew loop, the executor process group, and
+    # the fail-closed path rolled back a release that may already have
+    # converged. Retry the renew within the lease window instead: after a
+    # successful renew there are ~75s of slack (duration 90s, tick 15s), so
+    # bounded retries fit comfortably. A Conflict on a RETRY is ambiguous —
+    # the previous attempt may have landed with its response lost — so
+    # re-read and let ownership be the verdict: still ours means the CAS loss
+    # was our own resourceVersion advance (fresh state is authoritative); a
+    # successor takeover still raises Conflict. The window guard keeps the
+    # fail-closed contract: once a fresh renewTime could no longer land
+    # before the current lease lapses, stop retrying and surface the timeout.
+    RENEW_RETRY_ATTEMPTS = 3
+    RENEW_RETRY_BACKOFF_SECONDS = 5.0
+    RENEW_SAFETY_MARGIN_SECONDS = 20
+    # HIVE-2516 P1 review (rei): the window guard must bound IN-FLIGHT work,
+    # not merely attempt starts. A mutating PATCH occupies the subprocess up
+    # to Kube.run's 45s timeout, so an attempt "permitted to start" just
+    # before the old deadline still runs ~45s past lease expiry — failure
+    # surfaces at t=120 for expiry t=90 (rei's deterministic repro) and the
+    # executor cancels its child into a successor's acquire window. Every
+    # retry attempt AND the ambiguous-CAS re-read must be able to FINISH
+    # before the deadline; when nothing fits, fail immediately without
+    # sleeping so cancellation lands inside our own lease.
+    RENEW_ATTEMPT_BUDGET_SECONDS = 45
+
     def renew(self) -> FenceState:
-        state = self.validate()
-        patch = self._lease_tests(state) + [
-            {"op": "replace", "path": "/spec/renewTime", "value": utc_now()},
-        ]
-        updated = self.api.json_patch(LEASE_NAMESPACE, "lease", self.holder.lease_name, patch)
-        return FenceState.from_lease(updated)
+        # HIVE-2516 P1 (second review): the WHOLE renewal operation is
+        # deadline-bounded — the entry read (single attempt, clamped to the
+        # last-known window), the first mutation (clamped to this window's
+        # guard deadline), and the ambiguity re-read. The executor's
+        # cancellation can therefore never outlive the lease.
+        cached = self.window_deadline()
+        state = (self.validate(deadline=cached, read_attempts=1)
+                 if cached is not None else self.validate(read_attempts=1))
+        self._window_deadline = self._renew_deadline(state)
+        last_exc: BaseException | None = None
+        for attempt in range(1, type(self).RENEW_RETRY_ATTEMPTS + 1):
+            if attempt > 1 and self._renew_window_exhausted(state):
+                break
+            try:
+                patch = self._lease_tests(state) + [
+                    {"op": "replace", "path": "/spec/renewTime", "value": utc_now()},
+                ]
+                updated = self.api.json_patch(
+                    LEASE_NAMESPACE, "lease", self.holder.lease_name, patch,
+                    deadline=self._renew_deadline(state),
+                )
+                fresh = FenceState.from_lease(updated)
+                self._observe_window(fresh)
+                return fresh
+            except subprocess.TimeoutExpired as exc:
+                last_exc = exc
+                # No attempt (and not even the backoff sleep) may run past
+                # the deadline: surface the timeout now — the executor's
+                # child cancellation stays inside our own lease.
+                if self._renew_window_exhausted(state):
+                    raise
+                room = (self._renew_deadline(state) - _now()).total_seconds()
+                time.sleep(min(
+                    type(self).RENEW_RETRY_BACKOFF_SECONDS * attempt,
+                    max(room - type(self).RENEW_ATTEMPT_BUDGET_SECONDS, 0.0),
+                ))
+            except Conflict:
+                if attempt == 1:
+                    raise
+                # Ambiguous CAS on a retry: re-read; ownership is the verdict.
+                # The re-read is itself a 45s-capable api call — it is bounded
+                # to the window deadline (single attempt), and when even that
+                # cannot finish inside the window, fail closed without it.
+                if self._renew_window_exhausted(state):
+                    raise
+                return self.validate(deadline=self._renew_deadline(state), read_attempts=1)
+        assert last_exc is not None
+        raise last_exc
+
+    def _renew_deadline(self, state: FenceState) -> dt.datetime:
+        if state.renew_time is None:
+            raise Conflict("renew window unreadable")
+        return state.renew_time + dt.timedelta(
+            seconds=LEASE_DURATION_SECONDS - type(self).RENEW_SAFETY_MARGIN_SECONDS,
+        )
+
+    def _renew_window_exhausted(self, state: FenceState) -> bool:
+        if state.renew_time is None:
+            # Fail-closed: an unreadable renewTime means we cannot bound the
+            # window — do not push luck past an unmeasurable deadline.
+            return True
+        # An attempt must be able to FINISH (in-flight budget included)
+        # before the deadline — starting inside the window is not enough.
+        return _now() + dt.timedelta(
+            seconds=type(self).RENEW_ATTEMPT_BUDGET_SECONDS,
+        ) > self._renew_deadline(state)
 
     def phase(self, next_phase: str, allowed_from: Iterable[str]) -> FenceState:
         state = self.validate(allowed_from)
