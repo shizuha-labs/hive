@@ -290,6 +290,37 @@ def _request_has_valid_daemon_credential(request) -> bool:
     ).exists()
 
 
+def _request_owns_runtime_agent(request, agent_id) -> bool:
+    """True only when the authenticated caller is the immutable owner_id.
+
+    Desktop daemons sign in as the human owner and poll effective-capabilities.
+    Org/team rows keep owner_id NULL and stay staff-or-daemon. Username and
+    email are not authority.
+    """
+    user = getattr(request, 'user', None)
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return False
+    user_id = getattr(user, 'id', None)
+    if user_id in (None, ''):
+        return False
+    from .runtime_fleet import _find_runtime_agent_row
+    agent = _find_runtime_agent_row(str(agent_id))
+    if agent is None or getattr(agent, 'owner_id', None) is None:
+        return False
+    try:
+        return int(agent.owner_id) == int(user_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _require_staff_daemon_or_owner(request, agent_id):
+    if _request_has_valid_daemon_credential(request):
+        return None
+    if _request_owns_runtime_agent(request, agent_id):
+        return None
+    return _require_staff(request)
+
+
 def _require_staff_or_daemon_credential(request):
     if _request_has_valid_daemon_credential(request):
         return None
@@ -6633,7 +6664,7 @@ class AgentEffectiveCapabilitiesView(APIView):
     permission_classes = []
 
     def get(self, request, agent_id):
-        denied = _require_staff_or_daemon_credential(request)
+        denied = _require_staff_daemon_or_owner(request, agent_id)
         if denied:
             return denied
         payload, error = _effective_capability_set(request, agent_id)
@@ -6723,7 +6754,7 @@ class AgentRuntimeLaneView(APIView):
     permission_classes = []
 
     def get(self, request, agent_id):
-        denied = _require_staff_or_daemon_credential(request)
+        denied = _require_staff_daemon_or_owner(request, agent_id)
         if denied:
             return denied
 
