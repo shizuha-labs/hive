@@ -239,3 +239,57 @@ class BrokerConsumerConvergenceTests(SimpleTestCase):
                 if defect != 'conflict':
                     self.assertTrue(provisioner.ensure_agent_image(self.agent))
                     self.assert_second_reconcile_is_noop()
+
+    def test_built_seat_spec_carries_reconnect_state_volume_and_mount(self):
+        # PLAT-12035: a full-replace build carries both halves of the writable
+        # reconnect-state contract at the runtime's default path
+        # (mcpReconnectStateDir() fallback), not just the container mount.
+        # _affinity resolves the workspace PV's node affinity from the live
+        # API; this fixture has no PV to bind, so stub it out.
+        with mock.patch.object(provisioner, '_affinity', return_value=None):
+            spec = provisioner._build_pod_spec(self.agent, forgejo_secret_name='fj')
+        self.assertIn(provisioner.MCP_RECONNECT_STATE_VOLUME, {v.name for v in spec.volumes})
+        volume = next(v for v in spec.volumes if v.name == provisioner.MCP_RECONNECT_STATE_VOLUME)
+        self.assertIsNotNone(volume.empty_dir)
+        agent = next(c for c in spec.containers if c.name == 'agent')
+        mount = next(m for m in agent.volume_mounts
+                     if m.name == provisioner.MCP_RECONNECT_STATE_VOLUME)
+        self.assertEqual(mount.mount_path, provisioner.MCP_RECONNECT_STATE_DIR)
+
+    def test_reconnect_state_volume_converges_on_patched_legacy_shape(self):
+        # PLAT-12035: the full-replace builder carries the writable
+        # mcp-reconnect-state volume; a patch-based repair of a legacy shape
+        # must too, or the drift predicate reports drift forever (perpetual
+        # reconcile churn instead of convergence).
+        self.legacy_deployment(has_broker=True, replicas=1)
+        self.assertTrue(provisioner.ensure_agent_image(self.agent))
+        spec = self.live.spec.template.spec
+        self.assertIn(provisioner.MCP_RECONNECT_STATE_VOLUME, {v.name for v in spec.volumes})
+        agent = next(c for c in spec.containers if c.name == 'agent')
+        mount = next(m for m in agent.volume_mounts
+                     if m.name == provisioner.MCP_RECONNECT_STATE_VOLUME)
+        self.assertEqual(mount.mount_path, provisioner.MCP_RECONNECT_STATE_DIR)
+        self.assert_second_reconcile_is_noop()
+
+    def test_reconnect_state_drift_requires_both_volume_and_mount(self):
+        # PLAT-12035: the predicate must fire when either half is missing —
+        # volume-only, mount-only, or both — and a single repair leg must
+        # converge both halves so the second reconcile is a noop.
+        self.legacy_deployment(has_broker=True)
+        self.assertTrue(provisioner.ensure_agent_image(self.agent))
+        healthy = deepcopy(self.live)
+        for defect in ('volume-only', 'mount-only', 'both'):
+            with self.subTest(defect=defect):
+                self.live = deepcopy(healthy)
+                spec = self.live.spec.template.spec
+                agent = next(c for c in spec.containers if c.name == 'agent')
+                if defect in ('volume-only', 'both'):
+                    spec.volumes = [v for v in spec.volumes
+                                    if v.name != provisioner.MCP_RECONNECT_STATE_VOLUME]
+                if defect in ('mount-only', 'both'):
+                    agent.volume_mounts = [m for m in agent.volume_mounts
+                                           if m.name != provisioner.MCP_RECONNECT_STATE_VOLUME]
+                self.assertTrue(provisioner.native_agent_runtime_contract_drift(
+                    self.agent, self.agent.image))
+                self.assertTrue(provisioner.ensure_agent_image(self.agent))
+                self.assert_second_reconcile_is_noop()

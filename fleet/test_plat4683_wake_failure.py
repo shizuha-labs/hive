@@ -219,6 +219,14 @@ class NativeWakeFailureTests(TestCase):
                     spec=SimpleNamespace(
                         containers=[container, broker],
                         volumes=[
+                            # PLAT-12035: the no-op snapshot must carry the
+                            # complete managed contract, including the writable
+                            # mcp-reconnect-state volume the drift predicate
+                            # now requires; omitting it manufactures drift.
+                            provisioner.client.V1Volume(
+                                name=provisioner.MCP_RECONNECT_STATE_VOLUME,
+                                empty_dir=provisioner.client.V1EmptyDirVolumeSource(),
+                            ),
                             provisioner.client.V1Volume(
                                 name='broker-sock',
                                 empty_dir=provisioner.client.V1EmptyDirVolumeSource(),

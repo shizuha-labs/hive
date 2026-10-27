@@ -255,6 +255,15 @@ MANAGED_BY = 'shizuha-hive'
 # <dir>/proxy.sock GET /token (SO_PEERCRED-gated to the agent uid).
 BROKER_SOCK_DIR = '/run/shizuha/mcp-auth-proxy'
 MCP_PROJECTION_TRUST_DIR = '/run/shizuha/mcp-projection'
+# PLAT-12035: mcp-proxy children persist reconnect snapshots to
+# mcpReconnectStateDir() = MCP_RECONNECT_STATE_DIR || '/run/shizuha/mcp-reconnect-state'
+# (src/mcp-proxy/reconnect-state.ts). The :9103 registry materializes the
+# PLAT-4112/PLAT-8689 reconnect series ONLY from those snapshot files — with no
+# writable path the writes fail silently (best-effort by design) and the
+# reconnect-wedge alert lane is dark fleet-wide. Mount a pod-local emptyDir at
+# the default path (fs_group=1000 owns it; agent runs uid/gid 1000).
+MCP_RECONNECT_STATE_DIR = '/run/shizuha/mcp-reconnect-state'
+MCP_RECONNECT_STATE_VOLUME = 'mcp-reconnect-state'
 MCP_PROJECTION_URL = (
     'http://hive-direct.shizuha-hive.svc.cluster.local:8030/'
     'hive/api/v1/fleet/agents/{agent_id}/mcp-projection'
@@ -2650,6 +2659,7 @@ def native_agent_runtime_contract_drift(agent: FleetAgent, target_image: str) ->
             # A sidecar alone is not a working broker. Keep incomplete legacy
             # consumers in the existing idle-fenced reconciliation path.
             or _broker_contract_drifted(deploy.spec.template.spec, container, agent)
+            or _reconnect_state_volume_drifted(deploy.spec.template.spec, container)
             or placement_drift
         )
     except Exception as exc:  # noqa: BLE001 - retry rather than assert false convergence
@@ -2817,6 +2827,23 @@ def _broker_contract_volumes() -> list[client.V1Volume]:
             ),
         ),
     ]
+
+
+def _reconnect_state_volume_drifted(spec, container) -> bool:
+    """PLAT-12035: seat must have the writable mcp-reconnect-state volume.
+
+    Without it the mcp-proxy children cannot persist reconnect snapshots, the
+    :9103 registry emits zero reconnect series, and the reconnect-wedge alert
+    lane is dark for the seat. Detect both halves: the pod-level volume and
+    the container-level mount."""
+    volumes = {v.name for v in (getattr(spec, 'volumes', None) or [])}
+    if MCP_RECONNECT_STATE_VOLUME not in volumes:
+        return True
+    mounts = {
+        getattr(m, 'name', None)
+        for m in (getattr(container, 'volume_mounts', None) or [])
+    }
+    return MCP_RECONNECT_STATE_VOLUME not in mounts
 
 
 def _broker_contract_drifted(spec, container, agent: FleetAgent) -> bool:
@@ -3104,6 +3131,21 @@ def ensure_agent_image(agent: FleetAgent, *, _preserve_native_intent: bool = Fal
                         vols.append(volume)
                         changed = True
                 spec.volumes = vols
+            # PLAT-12035: patched-as-well-as-replaced seats must converge on the
+            # writable reconnect-state volume. The full-replace builder carries
+            # it (see _build_pod_spec); a patch-based repair that leaves it out
+            # would make _reconnect_state_volume_drifted report drift forever —
+            # perpetual reconcile churn instead of convergence. Unconditional:
+            # the reconnect metrics lane is fleet-wide, not broker-gated.
+            spec = deploy.spec.template.spec
+            vols = list(getattr(spec, 'volumes', None) or [])
+            if MCP_RECONNECT_STATE_VOLUME not in {getattr(v, 'name', '') for v in vols}:
+                vols.append(client.V1Volume(
+                    name=MCP_RECONNECT_STATE_VOLUME,
+                    empty_dir=client.V1EmptyDirVolumeSource(),
+                ))
+                spec.volumes = vols
+                changed = True
             _SIDECAR_MODEL_ENV = {
                 'MODEL', 'SHIZUHA_K8S_PRIMARY_MODEL',
                 'MODEL_FALLBACKS', 'SHIZUHA_MODEL_FALLBACKS',
@@ -3164,6 +3206,20 @@ def ensure_agent_image(agent: FleetAgent, *, _preserve_native_intent: bool = Fal
                 # the moment those agents woke, their usage billed onto the
                 # shared agents-fleet-own-fleet principal (operator 2026-08-06).
                 if _converge_cortex_key_env(container, agent):
+                    changed = True
+                # PLAT-12035: converge the reconnect-state mount on repaired
+                # seats, matching _agent_container. The drift predicate checks
+                # both halves (pod volume + container mount); a repair that
+                # adds the volume but not the mount never clears.
+                mounts = list(getattr(container, 'volume_mounts', None) or [])
+                if MCP_RECONNECT_STATE_VOLUME not in {
+                    getattr(m, 'name', '') for m in mounts
+                }:
+                    mounts.append(client.V1VolumeMount(
+                        name=MCP_RECONNECT_STATE_VOLUME,
+                        mount_path=MCP_RECONNECT_STATE_DIR,
+                    ))
+                    container.volume_mounts = mounts
                     changed = True
                 # A model/runtime-lane edit is Hive desired state, just like the
                 # image and resource contract above. Re-render only the lane
@@ -5517,7 +5573,11 @@ def _agent_container(agent: FleetAgent, has_broker: bool = False, has_dind: bool
     # Deployments created before these refs existed.
     env.extend(_forgejo_credential_env(agent, secret_name=forgejo_secret_name))
 
-    volume_mounts = [client.V1VolumeMount(name='workspace', mount_path=agent.workspace_mount_path)]
+    volume_mounts = [
+        client.V1VolumeMount(name='workspace', mount_path=agent.workspace_mount_path),
+        # PLAT-12035: writable reconnect-state snapshots (see constant note).
+        client.V1VolumeMount(name=MCP_RECONNECT_STATE_VOLUME, mount_path=MCP_RECONNECT_STATE_DIR),
+    ]
     if agent.shared_workspace:
         # PLAT-1056: fleet-wide RWX PVC for cross-agent file handoff
         # (Scout→Nori news catalog). The PVC (`agent-shared-workspace`,
@@ -5844,6 +5904,13 @@ def _build_pod_spec(agent: FleetAgent, *, forgejo_secret_name: str | None = None
                 persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
                     claim_name=agent.workspace_pvc_name,
                 ),
+            ),
+            # PLAT-12035: pod-local writable state dir for mcp-proxy reconnect
+            # snapshots; fs_group=1000 (pod security context) owns the fresh
+            # emptyDir, so the non-root agent can persist state.
+            client.V1Volume(
+                name=MCP_RECONNECT_STATE_VOLUME,
+                empty_dir=client.V1EmptyDirVolumeSource(),
             ),
             # PLAT-1056: shared RWX PVC for cross-agent handoff (flag-gated).
             *([client.V1Volume(
