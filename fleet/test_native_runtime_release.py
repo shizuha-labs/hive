@@ -438,6 +438,21 @@ class NativeRuntimeReleaseCallerTests(TestCase):
         response = SimpleNamespace(data=json.dumps(fixture['container']))
         observed = client.ApiClient().deserialize(response, 'V1Container')
         observed.image = self.anchor
+        # PLAT-12035: the capture predates the writable mcp-reconnect-state
+        # volume; augment it to the current contract so the no-op assertions
+        # test runtime drift logic rather than a stale fixture shape.
+        if not any(getattr(m, 'name', None) == p.MCP_RECONNECT_STATE_VOLUME
+                   for m in (observed.volume_mounts or [])):
+            observed.volume_mounts = list(observed.volume_mounts or []) + [
+                client.V1VolumeMount(name=p.MCP_RECONNECT_STATE_VOLUME,
+                                     mount_path=p.MCP_RECONNECT_STATE_DIR),
+            ]
+        _vols = self.deployment.spec.template.spec.volumes
+        if not any(getattr(v, 'name', None) == p.MCP_RECONNECT_STATE_VOLUME for v in (_vols or [])):
+            self.deployment.spec.template.spec.volumes = list(_vols or []) + [
+                client.V1Volume(name=p.MCP_RECONNECT_STATE_VOLUME,
+                                empty_dir=client.V1EmptyDirVolumeSource()),
+            ]
         containers = self.deployment.spec.template.spec.containers
         containers[next(index for index, container in enumerate(containers)
                         if container.name == 'agent')] = observed
