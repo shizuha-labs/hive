@@ -924,16 +924,33 @@ jobs:
           .forgejo/scripts/migration-compat-gate.sh "$LAST_SHA" "$IMAGE" "$OLD_IMAGE"
 
           MIGRATE="hive-staging-migrate-${SHORT}"
-          kubectl -n staging delete pod "$MIGRATE" --ignore-not-found --wait=true
-          kubectl -n staging run "$MIGRATE" --restart=Never --image="$IMAGE" \
-            --env=DB_NAME=shizuha_hive_staging --env=DB_USER=postgres --env=DB_PASSWORD=staging-only \
-            --env=DB_HOST=hive-staging-postgres.staging.svc.cluster.local --env=DB_PORT=5432 \
-            --env=REDIS_URL=redis://hive-staging-redis.staging.svc.cluster.local:6379/5 \
-            --env=CACHE_REDIS_URL=redis://hive-staging-redis.staging.svc.cluster.local:6379/6 \
-            --env=JWT_SECRET_KEY=staging-only-jwt --env=SHIZUHA_JWT_SIGNING_KEY=staging-only-jwt \
-            --command -- python manage.py migrate --noinput
-          if ! kubectl -n staging wait --for=jsonpath='{.status.phase}'=Succeeded pod/"$MIGRATE" --timeout=300s; then
+          # Transient cluster-DNS blips (observed 2026-11-08 20:37Z and
+          # 21:08Z: "could not translate host name
+          # hive-staging-postgres.staging.svc.cluster.local" from the migrate
+          # pod, on two different runner replicas, with an identical passing
+          # run between them) must not fail the deploy. Retry the migration
+          # pod with backoff; migration itself stays idempotent so a re-run
+          # after a partial attempt is safe.
+          MIGRATE_OK=0
+          for MIGRATE_ATTEMPT in 1 2 3; do
+            kubectl -n staging delete pod "$MIGRATE" --ignore-not-found --wait=true
+            kubectl -n staging run "$MIGRATE" --restart=Never --image="$IMAGE" \
+              --env=DB_NAME=shizuha_hive_staging --env=DB_USER=postgres --env=DB_PASSWORD=staging-only \
+              --env=DB_HOST=hive-staging-postgres.staging.svc.cluster.local --env=DB_PORT=5432 \
+              --env=REDIS_URL=redis://hive-staging-redis.staging.svc.cluster.local:6379/5 \
+              --env=CACHE_REDIS_URL=redis://hive-staging-redis.staging.svc.cluster.local:6379/6 \
+              --env=JWT_SECRET_KEY=staging-only-jwt --env=SHIZUHA_JWT_SIGNING_KEY=staging-only-jwt \
+              --command -- python manage.py migrate --noinput
+            if kubectl -n staging wait --for=jsonpath='{.status.phase}'=Succeeded pod/"$MIGRATE" --timeout=300s; then
+              MIGRATE_OK=1
+              break
+            fi
             kubectl -n staging logs "$MIGRATE" --tail=200 || true
+            echo "migrate attempt ${MIGRATE_ATTEMPT} failed; retrying after 20s"
+            sleep 20
+          done
+          if [ "$MIGRATE_OK" != 1 ]; then
+            echo "::error::migrate pod failed after 3 attempts (last logs above)"
             exit 1
           fi
           kubectl -n staging delete pod "$MIGRATE" --wait=true
@@ -1327,4 +1344,3 @@ jobs:
           fi
           [ "$FLEET_RC" -eq 0 ] || exit "$FLEET_RC"
           [ "$CLEANUP_RC" -eq 0 ] || exit "$CLEANUP_RC"
-
