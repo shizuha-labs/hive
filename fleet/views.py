@@ -8206,6 +8206,48 @@ class FleetAgentArchiveView(APIView):
         return Response(body)
 
 
+def _deny_unarchive_without_grant(request, agent_id):
+    """Fail closed for non-staff callers before the archive row is deleted.
+
+    HIVE-2915: the scope embeds the canonical username, so the target is
+    resolved and then checked with the one exact-scope Admin read that
+    ``_active_jit_grant_for_scope`` already performs. A second pre-lookup
+    probe duplicated that read and broke the single-call contract.
+    """
+    username, _native = _agent_username_for_unarchive(agent_id)
+    if not username:
+        _audit_unarchive_jit(
+            request, target=str(agent_id), result='denied', reason='agent not found',
+        )
+        return (
+            Response({'error': 'Agent not found'}, status=status.HTTP_404_NOT_FOUND),
+            None, '', '',
+        )
+    canonical_username = str(username).strip().lower()
+    jit_scope = f'hive.fleet.agent.unarchive:{canonical_username}'
+    grant, decision, reason = _active_jit_grant_for_scope(request, jit_scope)
+    if grant is not None:
+        # Caller reuses this grant and the resolved username. A second
+        # identical Admin read after the deny returns would break the
+        # single-call contract (HIVE-779).
+        return None, grant, jit_scope, canonical_username
+    result = 'dependency-error' if decision == 'dependency' else 'denied'
+    _audit_unarchive_jit(
+        request, target=canonical_username, result=result, reason=reason, scope=jit_scope,
+    )
+    http_status = (
+        status.HTTP_503_SERVICE_UNAVAILABLE
+        if decision == 'dependency'
+        else status.HTTP_403_FORBIDDEN
+    )
+    error = (
+        'Admin JIT authorization unavailable'
+        if decision == 'dependency'
+        else 'Active scoped JIT grant required'
+    )
+    return Response({'error': error}, status=http_status), None, jit_scope, ''
+
+
 def _agent_username_for_unarchive(agent_id):
     """Resolve username for unarchive, including DELETED native rows.
 
@@ -8248,43 +8290,22 @@ class FleetAgentUnarchiveView(APIView):
     """
 
     def post(self, request, agent_id):
-        username, _native = _agent_username_for_unarchive(agent_id)
+        # HIVE-2915: a non-staff caller must not reach the delete path without
+        # one exact active grant. The grant scope names the agent, so the
+        # target is resolved first and then checked exactly once.
         is_staff = bool(getattr(request.user, 'is_staff', False))
-        if not username:
-            if not is_staff:
-                _audit_unarchive_jit(
-                    request,
-                    target=str(agent_id),
-                    result='denied',
-                    reason='agent not found',
-                )
-            return Response({'error': 'Agent not found'}, status=status.HTTP_404_NOT_FOUND)
-
-        canonical_username = str(username).strip().lower()
-        jit_scope = f'hive.fleet.agent.unarchive:{canonical_username}'
         grant = None
         if not is_staff:
-            grant, decision, reason = _active_jit_grant_for_scope(request, jit_scope)
-            if grant is None:
-                result = 'dependency-error' if decision == 'dependency' else 'denied'
-                _audit_unarchive_jit(
-                    request,
-                    target=canonical_username,
-                    result=result,
-                    reason=reason,
-                    scope=jit_scope,
-                )
-                http_status = (
-                    status.HTTP_503_SERVICE_UNAVAILABLE
-                    if decision == 'dependency'
-                    else status.HTTP_403_FORBIDDEN
-                )
-                error = (
-                    'Admin JIT authorization unavailable'
-                    if decision == 'dependency'
-                    else 'Active scoped JIT grant required'
-                )
-                return Response({'error': error}, status=http_status)
+            denied, grant, jit_scope, canonical_username = _deny_unarchive_without_grant(
+                request, agent_id,
+            )
+            if denied is not None:
+                return denied
+        else:
+            username, _native = _agent_username_for_unarchive(agent_id)
+            if not username:
+                return Response({'error': 'Agent not found'}, status=status.HTTP_404_NOT_FOUND)
+            canonical_username = str(username).strip().lower()
 
         deleted, _ = FleetAgentArchive.objects.filter(agent_username__iexact=canonical_username).delete()
         agent_index_cache.invalidate('agent unarchived')
