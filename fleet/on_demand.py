@@ -224,6 +224,29 @@ def lifecycle_agent_emails(agent: dict[str, Any]) -> set[str]:
     return {canon_email(item) for item in emails if item}
 
 
+def canonical_wake_key(agent: dict[str, Any]) -> str:
+    """One deterministic deferred-wake registry key per seat.
+
+    The connect-wake endpoint accepts BOTH wake spellings per seat
+    (``user@shizuha.com`` and ``user@agents.shizuha.io`` — see
+    `lifecycle_agent_emails`). Keying the deferred-wake registry on the
+    spelling the request happened to use split one seat's starvation into
+    TWO independent registry entries with independent clocks: a seat that
+    woke through one spelling left the other spelling's entry aging until
+    the 24h registry-rot bound, paging a principal that holds no runtime
+    records (observed 2026-11-08: banto paged 21h13m on the @shizuha.com
+    spelling while pod agent-banto-86877b9574-xnhtb was demonstrably
+    turning — PLAT-11902 / PLAT-12264 dual-spelling page class).
+
+    The canonical key is the seat's primary projected email — `agent_email`
+    already derives ``username@shizuha.com`` when the field is absent — so
+    any seat with a username gets a deterministic single key. Every registry
+    writer (record/clear) and the reconcile matcher converge on this key so
+    one seat has exactly one starvation clock regardless of request spelling.
+    """
+    return agent_email(agent)
+
+
 def agent_enabled(agent: dict[str, Any]) -> bool:
     return bool(agent.get('enabled'))
 

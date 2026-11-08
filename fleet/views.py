@@ -8325,6 +8325,7 @@ class ConnectWakeAgentView(APIView):
             agent_enabled as _agent_enabled,
             agent_eligible_to_start as _agent_eligible_to_start,
             canon_email as _canon,
+            canonical_wake_key as _wake_key,
             lifecycle_agent_emails as _lifecycle_emails,
         )
         email = _canon(request.data.get('email'))
@@ -8338,23 +8339,27 @@ class ConnectWakeAgentView(APIView):
         agent = next((a for a in agents if email in _lifecycle_emails(a)), None)
         if agent is None:
             return Response({'status': 'unknown_agent', 'email': email}, status=404)
+        # PLAT-11902/PLAT-12264: one registry key per seat, independent of the
+        # spelling this request used — dual-spelling wake requests previously
+        # split one seat's starvation into two independent registry entries.
+        wake_key = _wake_key(agent) or email
         username = agent.get('agent_username') or agent.get('username') or ''
         if _is_archived_username(username):
             # PLAT-9052: archived seats cannot be woken; drop any stale
             # deferral so the registry tracks starvation, not history.
             from fleet.wake_defers import clear_wake_defer
-            clear_wake_defer(email)
+            clear_wake_defer(wake_key)
             return Response({'status': 'archived', 'email': email}, status=409)
         if _agent_enabled(agent):
             # PLAT-9052: the seat is up -- an outstanding deferral is stale.
             from fleet.wake_defers import clear_wake_defer
-            clear_wake_defer(email)
+            clear_wake_defer(wake_key)
             return Response({'status': 'already_running', 'email': email})
         if not _agent_eligible_to_start(agent):
             # PLAT-9052: operator-stopped seats are not wakeable by design;
             # drop the deferral so it cannot age into a permanent page.
             from fleet.wake_defers import clear_wake_defer
-            clear_wake_defer(email)
+            clear_wake_defer(wake_key)
             return Response({
                 'status': 'operator_stopped',
                 'email': email,
@@ -8379,7 +8384,7 @@ class ConnectWakeAgentView(APIView):
             # registry is what the deferred-wake observability series and the
             # "reconcile grants when a slot frees" promise are accountable to.
             from fleet.wake_defers import record_wake_defer
-            record_wake_defer(email, reason=wake_reason)
+            record_wake_defer(wake_key, reason=wake_reason)
             # PLAT-9052 direction-2 (PLAT-7032 doctrine): before starving a
             # work-holding seat behind a full pool whose grants may never
             # release (the apply-time idle fence can defer revokes forever),
@@ -8428,7 +8433,7 @@ class ConnectWakeAgentView(APIView):
             # resolved. A FAILED start keeps the entry -- the seat is still
             # down and the starvation clock keeps running.
             from fleet.wake_defers import clear_wake_defer
-            clear_wake_defer(email)
+            clear_wake_defer(wake_key)
         return Response({'status': 'started' if ok else 'error',
                          'email': email, 'detail': str(detail)[:200]},
                         status=200 if ok else 502)

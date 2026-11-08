@@ -204,6 +204,7 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
         from fleet.on_demand import (
             agent_enabled as _agent_enabled,
             agent_eligible_to_start as _agent_eligible_to_start,
+            canonical_wake_key as _canonical_wake_key,
             lifecycle_agent_emails as _lifecycle_emails,
         )
         from fleet.model_lease import lease_wake_available
@@ -234,18 +235,29 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
             if agent is None:
                 skipped[email] = 'unknown_agent'
                 continue
+            # PLAT-11902/PLAT-12264: converge legacy spelling-keyed entries
+            # onto the seat's canonical registry key so a dual-spelling seat
+            # carries ONE starvation clock. Clearing both keys here retires
+            # pre-canonicalization entries on the seat's next reconcile.
+            ckey = _canonical_wake_key(agent) or email
             username = str(agent.get('agent_username') or agent.get('username') or '')
             from fleet.views import _is_archived_username
             if _is_archived_username(username):
                 clear_wake_defer(email)
+                if ckey != email:
+                    clear_wake_defer(ckey)
                 skipped[email] = 'archived'
                 continue
             if _agent_enabled(agent):
                 clear_wake_defer(email)
+                if ckey != email:
+                    clear_wake_defer(ckey)
                 skipped[email] = 'already_running'
                 continue
             if not _agent_eligible_to_start(agent):
                 clear_wake_defer(email)
+                if ckey != email:
+                    clear_wake_defer(ckey)
                 skipped[email] = 'operator_stopped'
                 continue
             wake_ok, wake_reason = lease_wake_available(agent=agent)
@@ -257,6 +269,8 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
             ok, detail = set_lifecycle_agent_enabled(str(agent.get('id') or ''), True)
             if ok:
                 clear_wake_defer(email)
+                if ckey != email:
+                    clear_wake_defer(ckey)
                 granted.append(email)
                 logger.info(
                     'connect-wake: RECONCILE-GRANT %s (deferred since epoch %s)',
