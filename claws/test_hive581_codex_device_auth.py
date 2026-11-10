@@ -224,6 +224,20 @@ class DeviceAuthAPITests(TestCase):
         from .authentication import FederatedUser
         from django.conf import settings
 
+        # PLAT-12168 (san's g6 live capture): pin the revocation-status
+        # transport for the cookie-auth bootstrap path — is_token_revoked
+        # fails closed without a reachable shizuha-id service, and the
+        # sandboxed presubmit backend has none, so the me-bootstrap request
+        # died 403-at-auth instead of reaching the CSRF flow under test
+        # (test_cookie_auth_me_bootstrap_enables_csrf_protected_start, gen 6).
+        # Mocking the lookup keeps the real revocation pipeline exercised.
+        revocation_patcher = patch(
+            'hive_platform.token_revocation._lookup_revocation',
+            return_value={'active': True},
+        )
+        revocation_patcher.start()
+        self.addCleanup(revocation_patcher.stop)
+
         self.client = APIClient()
         self.user = FederatedUser(user_id=100, email='user@example.com', username='user')
         self.staff = FederatedUser(

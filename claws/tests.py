@@ -35,6 +35,24 @@ from claws.models import Claw
 
 
 class FederatedJWTAuthenticationTests(SimpleTestCase):
+    def setUp(self):
+        # PLAT-12168 (san's g6 live capture): pin the revocation-status
+        # TRANSPORT, not the pipeline. The tests here exercise auth wiring
+        # (RS256-via-JWKS, HS256 path, user-id normalisation) — none test
+        # revocation. But is_token_revoked FAILS CLOSED when the shizuha-id
+        # lookup can't complete, and the sandboxed presubmit backend has no
+        # id service, so every signature-valid token deterministically died
+        # at claws/authentication.py:181 with 'token has been revoked' on
+        # ANY head (3 errors in the trusted gen-6 run). Mocking the lookup
+        # keeps the real revocation pipeline (cache, claims, version check)
+        # fully exercised while removing the network dependency.
+        patcher = patch(
+            'hive_platform.token_revocation._lookup_revocation',
+            return_value={'active': True},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_accepts_rs256_shizuha_id_token_via_jwks(self):
         from rest_framework.test import APIRequestFactory
 
