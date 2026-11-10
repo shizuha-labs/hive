@@ -160,6 +160,23 @@ class DispatchWiringTests(TestCase):
         self.token_patcher = mock.patch.dict('os.environ', {'HIVE_FORGEJO_TOKEN': 'tok'})
         self.token_patcher.start()
         self.addCleanup(self.token_patcher.stop)
+        # Hermetic version resolution: without these mocks the dispatch call
+        # resolves the non-overridden harnesses (antigravity via its live
+        # manifest URL, claude_code/openclaw via registry.npmjs.org), so the
+        # test's outcome depended on pod egress — in a sandboxed presubmit
+        # backend the lookups fail, `unresolved` goes non-empty, and
+        # dispatch_agent_runtime_build returns early with
+        # `could not resolve safe versions` before the guard/post mocks are
+        # ever consulted (caught live on trusted gen 4, PLAT-12168 cmt
+        # 1240787). The wiring under test is the guard->dispatch tail, not
+        # the resolvers; pin them deterministically.
+        self.resolver_patchers = [
+            mock.patch.object(hv, 'antigravity_latest', return_value='1.2.3'),
+            mock.patch.object(hv, 'npm_latest', return_value='4.5.6'),
+        ]
+        for patcher in self.resolver_patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _dispatch(self, guard_result):
         post = mock.Mock(status_code=204, text='')
