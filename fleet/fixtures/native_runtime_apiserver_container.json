@@ -15,7 +15,7 @@
     },
     "env": {
       "GITHUB_IDENTITY": "sara2574",
-      "PLAYWRIGHT_BROWSERS_PATH": "/workspace/.ms-playwright",
+      "PLAYWRIGHT_BROWSERS_PATH": "/opt/playwright-browsers",
       "SHIZUHA_IDLE_HEARTBEAT_MS": "1800000",
       "SHIZUHA_FIRST_HEARTBEAT_MS": "8000",
       "SHIZUHA_HEARTBEAT_DEBOUNCE_MS": "1800000",
@@ -94,7 +94,7 @@
       },
       {
         "name": "PLAYWRIGHT_BROWSERS_PATH",
-        "value": "/workspace/.ms-playwright"
+        "value": "/opt/playwright-browsers"
       },
       {
         "name": "SHIZUHA_EXPENSIVE_TURN_MIN_TURNS",

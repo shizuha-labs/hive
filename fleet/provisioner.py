@@ -80,6 +80,9 @@ _ENV_DENYLIST: frozenset[str] = frozenset({
     # Stale k3s leftovers: runtime may read these as MODEL / fallback pins.
     'SHIZUHA_K8S_PRIMARY_MODEL',
     'SHIZUHA_MODEL_FALLBACKS',
+    # Image-owned. A stale agent.env value of /workspace/.ms-playwright hides
+    # the Chromium baked at /opt/playwright-browsers (PLAT-7507).
+    'PLAYWRIGHT_BROWSERS_PATH',
 })
 
 
@@ -5560,6 +5563,14 @@ def _agent_container(agent: FleetAgent, has_broker: bool = False, has_dind: bool
     _apply_work_agent_runtime_env(agent, env)
     _apply_ctx5382_grok_breaker_config(agent, env)
     _apply_mcp_allow_list_env(agent, env)
+    # Last-key-wins: the runtime image copies Chromium to this path. A stored
+    # agent.env override of /workspace/.ms-playwright is not agent-writable and
+    # makes the browser tool report Chrome missing (PLAT-7507).
+    env[:] = [e for e in env if e.name != 'PLAYWRIGHT_BROWSERS_PATH']
+    env.append(client.V1EnvVar(
+        name='PLAYWRIGHT_BROWSERS_PATH',
+        value='/opt/playwright-browsers',
+    ))
 
     # Private browser MCP — one worker Service per agent (never shared). Bridges
     # attach when SHIZUHA_BROWSER_MCP_URL is set (cli/src/browser-mcp.ts).
