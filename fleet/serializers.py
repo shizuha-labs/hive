@@ -382,7 +382,29 @@ class FleetAgentSerializer(serializers.ModelSerializer):
         return profiles.get(obj.resource_profile, {})
 
     def get_context_budget(self, obj):
-        return context_budget_for_agent(obj)
+        # CTX-5382: the list path used to compute the budget from the bare
+        # model row — no telemetry overlay — so conversation_history rendered
+        # deferred/estimated-floor while the bridge HAD a live frame. Overlay
+        # the same telemetry the detail path uses before computing.
+        row = obj
+        try:
+            from .external_agents import agent_telemetry, telemetry_fields
+            snap = (agent_telemetry() or {}).get((getattr(obj, 'agent_username', '') or '').lower())
+            if snap:
+                configured = {
+                    'display_name': getattr(obj, 'display_name', None),
+                    'role': getattr(obj, 'role', None),
+                    'model': getattr(obj, 'model', None),
+                    'execution_method': getattr(obj, 'execution_method', None),
+                    'runtime_source': getattr(obj, 'runtime_source', None),
+                }
+                merged = dict(obj.__dict__) if hasattr(obj, '__dict__') else {}
+                merged.update({k: v for k, v in configured.items() if v is not None})
+                merged.update(telemetry_fields(snap, configured=merged))
+                return context_budget_for_agent(merged)
+        except Exception:
+            pass
+        return context_budget_for_agent(row)
 
     def get_display_title(self, obj):
         return obj.role or ''

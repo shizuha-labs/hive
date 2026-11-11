@@ -187,6 +187,52 @@ def _apply_lean_conversational_runtime_env(agent, env):
             present[key] = len(env) - 1
 
 
+# CTX-5382 Grok circuit-breaker companion config (operator 2026-11-09):
+# cached tokens count as real cost. Idle Pulse polls on grok_build lanes used
+# to start a NEW conversation per poll, re-shipping the ~200k system prefix
+# UNCACHED every beat (CTX-537 prefill arithmetic). Two levers, rendered for
+# gateway lanes whose harness supports them (inert keys where unsupported):
+#
+# 1. Compaction caps: SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS/_FRACTION —
+#    the harness precedence is absolute > fraction > default fraction (0.60).
+#    Hive renders the absolute cap so eternal sessions compact at a bounded
+#    steady-state regardless of announced-window drift.
+# 2. Session reuse contract: SHIZUHA_HEARTBEAT_SESSION_REUSE=within-budget —
+#    heartbeat turns resume the durable session while its resident estimate
+#    is within the PLAT-9203 soft budget (absolute 120k default), so the
+#    prefix prefill lands in the per-account cache (CTX-482) and the
+#    uncached share stays small; over-soft turns still start CLEAN per the
+#    PLAT-9185 lifecycle invariant. The harness-side consumption of this key
+#    is the required companion change (shizuha-beta); absent it, the key is
+#    inert and behavior is unchanged.
+CTX5382_COMPACTION_TRIGGER_TOKENS = '360000'
+CTX5382_SESSION_REUSE = 'within-budget'
+
+
+def _apply_ctx5382_grok_breaker_config(agent, env):
+    """Render compaction caps + heartbeat session-reuse for gateway lanes."""
+    # grok_build and shizuha share the gateway harness; keys are inert on
+    # any lane that does not consume them. Use _resolve_execution_method
+    # (there is no _primary_method helper).
+    if _resolve_execution_method(agent) not in ('grok_build', 'shizuha'):
+        return
+    existing_env = agent.env if isinstance(getattr(agent, 'env', None), dict) else {}
+    present = {item.name: idx for idx, item in enumerate(env)}
+    desired = {
+        'SHIZUHA_CORTEX_COMPACTION_TRIGGER_TOKENS': CTX5382_COMPACTION_TRIGGER_TOKENS,
+        'SHIZUHA_HEARTBEAT_SESSION_REUSE': CTX5382_SESSION_REUSE,
+    }
+    for key, value in desired.items():
+        if str((existing_env or {}).get(key) or ''):
+            continue  # seat-explicit value wins (Hive SoT heal not forced)
+        var = client.V1EnvVar(name=key, value=value)
+        if key in present:
+            env[present[key]] = var
+        else:
+            env.append(var)
+            present[key] = len(env) - 1
+
+
 # Work-agent idle cadence. Operator directive 2026-09-15: agents must
 # continuously seek and drain ready work — the 30m clamp (2026-09-14) left the
 # fleet silent (1/16 admitted) with ready tasks queued. Restore the 90s
@@ -5512,6 +5558,7 @@ def _agent_container(agent: FleetAgent, has_broker: bool = False, has_dind: bool
     # re-stamp SHIZUHA_FIRST_HEARTBEAT_MS=1800000 and cancel the prefix warm.
     _apply_lean_conversational_runtime_env(agent, env)
     _apply_work_agent_runtime_env(agent, env)
+    _apply_ctx5382_grok_breaker_config(agent, env)
     _apply_mcp_allow_list_env(agent, env)
 
     # Private browser MCP — one worker Service per agent (never shared). Bridges

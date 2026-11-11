@@ -48,6 +48,10 @@ class ContextBudgetTests(SimpleTestCase):
             'agent_username': 'bloated',
             'model': 'tiny-model',
             'skill_config': {'skills': ['a', 'b', 'c']},
+            # Unmeasured history now reports severity=unknown (estimated-floor).
+            # This test covers the warning/critical path, so feed telemetry.
+            'context_used_tokens': 120_000,
+            'context_max_tokens': 128_000,
         })
 
         self.assertTrue(budget['outlier'])
@@ -103,8 +107,10 @@ class ContextBudgetTests(SimpleTestCase):
         })
         self.assertEqual(budget['context_window_tokens'], 500_000)
         components = {c['component']: c for c in budget['components']}
-        self.assertEqual(components['conversation_history']['status'], 'deferred')
-        self.assertEqual(components['conversation_history']['tokens'], 0)
+        self.assertEqual(components['conversation_history']['status'], 'estimated-floor')
+        self.assertEqual(components['conversation_history']['tokens'], 40_000)
+        self.assertTrue(budget['history_unmeasured'])
+        self.assertEqual(budget['severity'], 'unknown')
 
     def test_telemetry_used_tokens_fill_conversation_history(self):
         budget = context_budget_for_agent({
@@ -132,8 +138,10 @@ class ContextBudgetTests(SimpleTestCase):
             'skill_config': {'skills': ['pulse-merge']},
         })
         history = {c['component']: c for c in agent['context_budget']['components']}
-        self.assertEqual(history['conversation_history']['status'], 'deferred')
-        self.assertLess(agent['context_budget']['total_tokens'], 20_000)
+        self.assertEqual(history['conversation_history']['status'], 'estimated-floor')
+        self.assertGreaterEqual(agent['context_budget']['total_tokens'], 40_000)
+        self.assertTrue(agent['context_budget']['history_unmeasured'])
+        self.assertEqual(agent['context_budget']['severity'], 'unknown')
 
         agent['context_used_tokens'] = 350230
         agent['context_max_tokens'] = 500000
