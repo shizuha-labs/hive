@@ -24,6 +24,10 @@ EAGER_MCP_SCHEMA_ESTIMATE = 2500
 SKILL_BODY_ESTIMATE = 1250
 SKILL_MENU_ITEM_ESTIMATE = 18
 DEFAULT_CONTEXT_WINDOW = 128_000
+# CTX-5382: conservative resident-history floor when the runtime has not
+# reported context.used_tokens. Never mistaken for a measurement (status
+# 'estimated-floor').
+CONTEXT_HISTORY_FLOOR_ESTIMATE = 40_000
 WARNING_UTILIZATION = 0.50
 CRITICAL_UTILIZATION = 0.80
 WARNING_ABSOLUTE_TOKENS = 100_000
@@ -209,9 +213,17 @@ def context_budget_for_agent(agent: Any) -> dict[str, Any]:
     static_total = sum(item['tokens'] for item in static_components)
     measured_used = _optional_nonneg_int(_agent_get(agent, 'context_used_tokens', None))
     if measured_used is None:
+        # CTX-5382 (operator 2026-11-09): a deferred measurement MUST NOT
+        # render as a 0-token history — that face showed 2-4% utilization on
+        # the Agents UI while live turns ran 160k-300k tokens and hid the
+        # spend. Report a conservative estimated floor instead, with a
+        # distinct status so it can never be mistaken for measurement, and
+        # flag the payload so severity reads honestly.
+        floor = int(getattr(settings, 'HIVE_CONTEXT_HISTORY_FLOOR_ESTIMATE', CONTEXT_HISTORY_FLOOR_ESTIMATE))
         history = _component(
-            'conversation_history', 0, 'runtime conversation state', 'deferred',
-            'Measured at turn-start by runtime when available',
+            'conversation_history', floor, 'runtime conversation state',
+            'estimated-floor',
+            'Telemetry unmeasured — conservative resident-history floor; real usage may be far higher',
         )
     else:
         history = _component(
@@ -229,11 +241,14 @@ def context_budget_for_agent(agent: Any) -> dict[str, Any]:
     total = sum(item['tokens'] for item in components)
     headroom = max(context_window - total, 0)
     utilization = (total / context_window * 100) if context_window else 0
+    history_unmeasured = history['status'] in ('deferred', 'estimated-floor')
 
     warning_threshold = float(getattr(settings, 'HIVE_CONTEXT_BUDGET_WARNING_UTILIZATION', WARNING_UTILIZATION))
     critical_threshold = float(getattr(settings, 'HIVE_CONTEXT_BUDGET_CRITICAL_UTILIZATION', CRITICAL_UTILIZATION))
     absolute_threshold = int(getattr(settings, 'HIVE_CONTEXT_BUDGET_WARNING_TOKENS', WARNING_ABSOLUTE_TOKENS))
-    if utilization >= critical_threshold * 100:
+    if history_unmeasured:
+        severity = 'unknown'
+    elif utilization >= critical_threshold * 100:
         severity = 'critical'
     elif utilization >= warning_threshold * 100 or total >= absolute_threshold:
         severity = 'warning'
@@ -249,6 +264,7 @@ def context_budget_for_agent(agent: Any) -> dict[str, Any]:
         'agent': _agent_name(agent),
         'agent_id': str(_agent_get(agent, 'id', '')),
         'model': model or 'runtime default',
+        'history_unmeasured': history_unmeasured,
         'context_window_tokens': context_window,
         'total_tokens': total,
         'headroom_tokens': headroom,
@@ -281,9 +297,15 @@ def budgets_to_prometheus(budgets: Iterable[dict[str, Any]]) -> str:
         '# HELP shizuha_agent_context_tokens Estimated context tokens loaded for each fleet agent component.',
         '# TYPE shizuha_agent_context_tokens gauge',
     ]
+    lines.append('# HELP shizuha_agent_context_history_unmeasured 1 when the runtime has not reported context.used_tokens for the agent.')
+    lines.append('# TYPE shizuha_agent_context_history_unmeasured gauge')
     for budget in budgets:
         agent = _prom_escape(budget.get('agent'))
         model = _prom_escape(budget.get('model'))
+        if budget.get('history_unmeasured'):
+            lines.append(
+                f'shizuha_agent_context_history_unmeasured{{agent="{agent}",model="{model}"}} 1'
+            )
         for comp in budget.get('components') or []:
             labels = {
                 'agent': agent,
