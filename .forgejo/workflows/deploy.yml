@@ -786,7 +786,7 @@ jobs:
   # ── R0: isolated staging smoke (PLAT-1223 / PLAT-4086) ──────────────
   deploy-staging:
     needs: build
-    if: github.event_name == 'push' || github.event.inputs.ring != 'fleet'
+    if: github.event_name == 'push' || (inputs.ring != 'fleet' && github.event.inputs.ring != 'fleet')
     runs-on: deploy-lane
     container:
       image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
@@ -1041,7 +1041,7 @@ jobs:
   # ── R1: additive addressable canary + full soak ──────────────────────────
   deploy-canary:
     needs: deploy-staging
-    if: github.event_name == 'push' || github.event.inputs.ring == 'canary'
+    if: github.event_name == 'push' || inputs.ring == 'canary' || github.event.inputs.ring == 'canary'
     runs-on: deploy-lane
     container:
       image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
@@ -1150,8 +1150,9 @@ jobs:
       always() && needs.build.result == 'success' &&
       ((github.event_name == 'push' && needs.deploy-staging.result == 'success' &&
         needs.deploy-canary.result == 'success' && github.event.inputs.hold != 'true') ||
-       (github.event_name == 'workflow_dispatch' && github.event.inputs.ring == 'fleet' &&
-        github.event.inputs.sha == github.sha))
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.ring == 'fleet' || github.event.inputs.ring == 'fleet') &&
+        (inputs.sha == github.sha || github.event.inputs.sha == github.sha)))
     runs-on: deploy-lane
     container:
       image: registry.registry.svc.cluster.local:5000/origin-ci-helm@sha256:90f02d48d68c0ed690f9ddd8bcef1167490610362c19d429943931433ed7b194
