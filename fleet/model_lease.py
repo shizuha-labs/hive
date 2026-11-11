@@ -2599,6 +2599,31 @@ def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, action
         returning=returning_floor_holders(),
     )
     reserved_usernames |= floor_state['reserved']
+    # CTX-1055: operator-only, time-boxed per-seat pin (default off: no pin →
+    # no effect). The pinned pool member is made worthy and processed as the
+    # FIRST one-seat floor target, so it takes the next free slot ahead of
+    # ordinary fairness and may only preempt a QUIET non-reserved holder
+    # (same work-never-evicts-work fence as HIVE-2841). Once seated it is
+    # keep-fenced until the pin expires.
+    from .lease_operator_pin import OPERATOR_PIN_SLUG, operator_pinned_usernames
+    member_usernames = {m.username for m in members}
+    for uname in sorted(operator_pinned_usernames(now=now) & member_usernames):
+        if not _agent_dict_auto_wakeable(by_username.get(uname)):
+            # Archived / operator-stopped seats stay down; a pin never
+            # overrides an explicit stop.
+            out['log'].append(f'{model}: operator pin for {uname} ignored (not auto-wakeable)')
+            continue
+        wants.add(uname)
+        want_reasons[uname] = 'operator_pin'
+        personal.add(uname)
+        if uname in current_holder_usernames:
+            reserved_usernames.add(uname)
+        else:
+            floor_state['targets'] = [(OPERATOR_PIN_SLUG, [uname])] + [
+                (slug, [c for c in picked if c != uname])
+                for slug, picked in floor_state['targets']
+            ]
+        out['log'].append(f'{model}: operator pin active for {uname}')
     for uname in reserved_usernames:
         wants.add(uname)
         want_reasons.setdefault(uname, 'keep_resident')
@@ -2984,7 +3009,10 @@ def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, action
                         f'REVOKE holder={victim} '
                         f'reason=preempt-for-critical-team-floor team={slug}'
                     )
-                floor_reason = f'critical-team-floor team={slug}'
+                floor_reason = (
+                    'operator-pin' if slug == 'operator-pin'
+                    else f'critical-team-floor team={slug}'
+                )
                 if apply and cortex_leases:
                     ok = client.grant(
                         model, principal,
