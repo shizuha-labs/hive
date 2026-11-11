@@ -244,36 +244,62 @@ def _method_capabilities(method: str) -> list[str]:
 
 
 def managed_model_fallbacks(model: str, method: str) -> list[dict[str, str]]:
-    """No agent has a fallback chain. An agent is pinned to one backend.
+    """Platform-managed fallback chains, derived at the model chokepoint.
 
-    Operator directive 2026-08-04: *"perhaps there should be zero concept of a
-    'fallback' .. the agent needs to be pinned to a backend and that's it .. to
-    make the life simpler"*.
+    Operator directive 2026-08-04 dropped every chain ("pinned to a backend
+    and that's it"). The 2026-08-01 Grok Build exception before it — a
+    ``grok primary -> cortex/DeepSeek-V4-Flash`` tail — cost more than it
+    bought. The four defects below are the review baseline for ANY
+    re-establishment (PLAT-13235 binding conditions):
 
-    This replaces the 2026-08-01 exception that gave Grok Build a
-    `grok primary -> cortex/DeepSeek-V4-Flash` tail. That chain cost more than
-    it bought:
+    * **Observability lie** — the Agents page showed `cortex/grok-4.5 pinned`
+      while the agent actually ran DeepSeek, so the operator could not tell
+      what an agent was using.
+    * **Drift false positives** — drift detection compared the running model
+      against the primary and reported every sanctioned failover as
+      `runtime_config_drift` / degraded.
+    * **Quota attribution ambiguity** — Cortex attributed two models to one
+      key, making per-agent error taxonomy and quota accounting ambiguous
+      (nagi: 2523 requests over two models in 24h).
+    * **Failure hiding** — a failing primary was hidden instead of surfaced;
+      nagi silently absorbed 191 failed grok attempts in a day rather than
+      making the quota problem visible.
 
-    * The Agents page showed `cortex/grok-4.5 pinned` while the agent actually
-      ran DeepSeek, so the operator could not tell what a agent was using.
-    * Drift detection compared the running model against the primary and
-      reported every sanctioned failover as `runtime_config_drift` / degraded.
-    * Cortex attributed two models to one key, making per-agent error taxonomy
-      and quota accounting ambiguous (nagi: 2523 requests over two models in
-      24h).
-    * A failing primary was hidden instead of surfaced — nagi silently absorbed
-      191 failed grok attempts in a day rather than making the quota problem
-      visible.
+    PLAT-13235 (operator policy decision 2026-11-09) re-establishes exactly
+    ONE bounded tail for grok-pinned lanes, config-gated for byte-for-byte
+    rollback: with ``settings.HIVE_MANAGED_GROK_GLM_FALLBACK`` set, a
+    ``cortex/grok*`` primary derives a single ``cortex/glm`` step with reason
+    ``grok_quota_exhaustion_fallback``. This re-arms the pod's inline failover
+    loop for the dominant primary-failure class (429 / quota exhaustion — the
+    Grok-token-off face surfaces as the same 429 at the proxy). Minimum-Grok
+    is honored: no blanket backfill, chains re-derive only on row touch per
+    the chokepoint design.
 
-    Returning an empty chain is an already-supported runtime state: the pod's
-    inline failover loop collapses to a single step, and `MODEL_FALLBACKS=[]`
-    means no failover by design.
+    The four 08-01 defects are answered where they were caused, not here:
 
-    Kept as a function (rather than deleted) because `FleetAgent.save` calls it
-    at the model chokepoint to normalise every write — admin, migrations,
-    reconcilers, daemon sync and REST all funnel through it, so this is the one
-    place that guarantees no hidden chain can be persisted.
+    * *Observability* — ``fleet.grok_provider_metrics`` exposes
+      ``hive_model_fallback_active{seat,from,to}`` and the Agents projection
+      (``fleet.external_agents.telemetry_fields``) carries the armed-fallback
+      note, so the page never again claims a bare pin while a tail is armed.
+    * *Drift* — the drift check in ``telemetry_fields`` sanctions the whole
+      configured chain (it already did; the chain is non-empty only under the
+      flag), so a seat obeying Hive's tail is never reported as drifting.
+    * *Attribution caveat* — while the flag is on, two models on one key are
+      possible again; the gauge labels carry seat/from/to for per-agent
+      attribution, and the acceptance-5 alert (fallback-active page) is the
+      compensating surfacing for quota accounting.
+    * *Failure surfacing* — the fallback-active series/page IS the fix: a
+      seat running on the tail is loud, and the grok quota problem behind it
+      pages instead of being absorbed.
+
+    Kept as a function (rather than deleted) because ``FleetAgent.save`` and
+    ``runtime_fleet`` normalization call it at the model chokepoint to
+    normalise every write — admin, migrations, reconcilers, daemon sync and
+    REST all funnel through it, so no hidden chain can be persisted. Flag off
+    returns [] for every lane: the 2026-08-04 pinned state, byte for byte.
     """
+    if getattr(settings, 'HIVE_MANAGED_GROK_GLM_FALLBACK', False) and model.startswith('cortex/grok'):
+        return [{'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'}]
     return []
 
 

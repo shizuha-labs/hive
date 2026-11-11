@@ -454,6 +454,27 @@ def telemetry_fields(snap: dict, *, configured: dict | None = None) -> dict:
             conf_norm and live_norm and live_norm not in sanctioned
         )
         fields['runtime_config_drift'] = runtime_config_drift
+        # PLAT-13235 condition 1 (observability), same slice as the sanctioned
+        # set: an armed platform-managed tail must be visible where the operator
+        # looks, so the page never claims a bare pin while a fallback is armed
+        # (the 08-01 observability lie). The note names from/to/reason so the
+        # projection is self-explanatory; the drift check above already
+        # sanctions the whole chain (condition 2 — a seat obeying Hive's tail
+        # is not drift).
+        fb_chain = [
+            s for s in (configured.get('model_fallbacks') or [])
+            if isinstance(s, dict) and s.get('model')
+        ]
+        if fb_chain:
+            fields['model_fallback_active'] = True
+            fields['model_fallback_note'] = (
+                'Platform-managed fallback armed: %s -> %s (%s)'
+                % (
+                    configured.get('model') or 'primary',
+                    fb_chain[0].get('model'),
+                    fb_chain[0].get('reason') or 'managed fallback',
+                )
+            )
         if runtime_config_drift:
             # Fresh output on a model Hive never authorised is proof the drift
             # is still active, not evidence that it cleared.
