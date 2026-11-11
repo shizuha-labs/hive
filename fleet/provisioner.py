@@ -3687,6 +3687,22 @@ def _base_labels(agent: FleetAgent) -> dict:
     # devops-ssh class was lost without anyone deciding to retire it.
     if agent.isolated or agent.hostplane_ssh:
         labels['shizuha.io/agent-role'] = 'devops-ssh'
+    # KURA-160: the kura-server-api-ingress netpol admits programmatic API
+    # clients ONLY via the pod label kura.shizuha.io/api-client="true" — the
+    # designed path was never wired to the seat template, so every seat's
+    # KURA-4 daily assurance probe was netpol-refused (~20d) while kura-server
+    # itself stayed healthy (pod Ready, endpoint populated, live 200s to
+    # kubelet/blackbox/heartbeats). Membership is a Hive data decision
+    # (settings allowlist), never a hand-applied kubectl label — same doctrine
+    # as devops-ssh above. Seat-side self-labeling is RBAC-blocked
+    # (PLAT-9018).
+    kura_clients = {
+        u.strip().lower()
+        for u in settings.FLEET_KURA_API_CLIENT_USERNAMES.split(',')
+        if u.strip()
+    }
+    if (agent.agent_username or '').strip().lower() in kura_clients:
+        labels['kura.shizuha.io/api-client'] = 'true'
     return labels
 
 

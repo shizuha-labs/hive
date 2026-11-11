@@ -195,6 +195,9 @@ spec:
             # so the fleet UI never invents a retired backend for a native row.
             - name: FLEET_AGENT_MODEL
               value: ""
+            # KURA-160: explicit assurance roster. Not a wildcard.
+            - name: FLEET_KURA_API_CLIENT_USERNAMES
+              value: "hana"
             - name: RUNTIME_FLEET_API_URL
               value: http://shizuha-runtime-fleet.rt-fleet.svc.cluster.local:8016
             # HIVE-146: sidecar broker that injects coordinator JWTs into agent pods

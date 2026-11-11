@@ -383,6 +383,10 @@ FLEET_AGENT_IMAGE = os.environ.get(
     'localhost:30500/shizuha-agent-runtime:src-20260618-mcp-authfix',
 )
 FLEET_AGENT_MODEL = os.environ.get('FLEET_AGENT_MODEL', 'GLM-5.1')
+# KURA-160: seats that receive kura.shizuha.io/api-client. Empty labels nobody.
+# No wildcard. Deploy sets the assurance roster; missing declaration must not
+# fall through getattr to a silent no-op.
+FLEET_KURA_API_CLIENT_USERNAMES = os.environ.get('FLEET_KURA_API_CLIENT_USERNAMES', '')
 FLEET_COORDINATOR_MODEL_TOKEN_URL = os.environ.get('FLEET_COORDINATOR_MODEL_TOKEN_URL', '')
 FLEET_COORDINATOR_TOKEN_SECRET_NAME = os.environ.get('FLEET_COORDINATOR_TOKEN_SECRET_NAME', '')
 FLEET_COORDINATOR_TOKEN_SECRET_KEY = os.environ.get('FLEET_COORDINATOR_TOKEN_SECRET_KEY', 'token')
