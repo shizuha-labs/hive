@@ -9,7 +9,11 @@ its next turn (live datum: agent-yuma, PLAT-13009 follow-up).
 Same contract as 0062: prefix-preserving rewrite at deploy so a leftover pin
 does not wait for a random save and does not fall through to an unintended
 model. Voice and imagine ids are untouched. Queryset.update skips save() so
-hibernated rows stay hibernated.
+hibernated rows stay hibernated. One exception to prefix preservation: the
+xai cohort (xai:* and cortex/xai/*) is rewritten wholesale to
+cortex/GLM-5.3-Flash, because the xai lane is no longer a catalog listing
+(provider unconfigured; HIVE-1937) and an explicit provider prefix would
+route to that dead provider and crash-loop at startup.
 """
 import re
 
@@ -28,6 +32,9 @@ def _canonicalize(model: str) -> str:
         return raw
     if _GROK_47.search(raw) is None:
         return raw
+    # xai lane gone: not a catalog listing, provider unconfigured (HIVE-1937) — rewrite wholesale.
+    if lowered.startswith('xai:') or '/xai/' in lowered:
+        return 'cortex/GLM-5.3-Flash'
     return _GROK_47.sub('GLM-5.3-Flash', raw)
 
 
