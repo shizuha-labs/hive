@@ -159,6 +159,9 @@ spec:
               value: localhost:30500/shizuha-agent-runtime:k3s-browserfix-202607040756
             - name: FLEET_AGENT_MODEL
               value: ""
+            # KURA-160: explicit assurance roster. Not a wildcard.
+            - name: FLEET_KURA_API_CLIENT_USERNAMES
+              value: "hana"
             - name: RUNTIME_FLEET_API_URL
               value: http://shizuha-runtime-fleet.rt-fleet.svc.cluster.local:8016
             - name: FLEET_BROKER_IMAGE
