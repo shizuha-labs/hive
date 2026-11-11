@@ -337,3 +337,192 @@ class GrokCapacityFallbackTests(TestCase):
             agent.refresh_from_db()
             self.assertEqual(agent.model_fallbacks, [])
             self.assertEqual(agent.pending_config['model_fallbacks'], [])
+
+
+@override_settings(
+    HIVE_TOKEN_COORDINATOR_KEK='grok-capacity-test-kek',
+    HIVE_TOKEN_COORDINATOR_KEK_ID='grok-capacity-v1',
+    HIVE_FLEET_OWNER_USER_ID='42',
+    HIVE_INTERNAL_AUTH_TOKEN='metrics-test-token',
+)
+class ManagedGrokGlmFallbackTests(GrokCapacityFallbackTests):
+    """PLAT-13235 — the re-established platform-managed Grok→GLM tail.
+
+    The 08-01 defect list in fleet/runtime_lane.managed_model_fallbacks'
+    docstring is the review baseline; the four binding conditions are asserted
+    here as tests (gauge+note observability, drift fallback-awareness,
+    attribution labels, failure surfacing). Flag off is the 2026-08-04 pinned
+    state, byte for byte — the parent class's tests re-run under exactly that
+    default and must stay green.
+    """
+
+    def test_flag_off_is_byte_for_byte_rollback(self):
+        from fleet.runtime_lane import managed_model_fallbacks
+        self.assertEqual(managed_model_fallbacks('cortex/grok-4.7', 'grok_build'), [])
+        lane = resolve_runtime_lane({}, {
+            'model': 'cortex/grok-4.7',
+            'execution_method': 'grok_build',
+        })
+        self.assertEqual(lane['model_fallbacks'], [])
+        agent = self._grok_agent('glm-rollback')
+        self.assertEqual(agent.model_fallbacks, [])
+
+    def test_flag_on_derives_single_glm_tail_for_grok_primary(self):
+        from fleet.runtime_lane import managed_model_fallbacks
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            self.assertEqual(
+                managed_model_fallbacks('cortex/grok-4.7', 'grok_build'),
+                [{'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'}],
+            )
+            lane = resolve_runtime_lane({}, {
+                'model': 'cortex/grok-4.7',
+                'execution_method': 'grok_build',
+            })
+            self.assertEqual(lane['model_fallbacks'], [
+                {'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'},
+            ])
+
+    def test_flag_on_is_policy_scoped_to_grok_primaries(self):
+        from fleet.runtime_lane import managed_model_fallbacks
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            self.assertEqual(managed_model_fallbacks('cortex/glm', 'shizuha'), [])
+            self.assertEqual(managed_model_fallbacks('cortex/DeepSeek-V4-Flash', 'shizuha'), [])
+
+    def test_caller_supplied_chains_stay_rejected_under_flag(self):
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            with self.assertRaises(RuntimeLaneError) as raised:
+                resolve_runtime_lane({}, {
+                    'model': 'cortex/grok-4.7',
+                    'execution_method': 'grok_build',
+                    'model_fallbacks': [{'method': 'shizuha', 'model': 'cortex/glm'}],
+                })
+        self.assertEqual(raised.exception.code, 'MODEL_FALLBACKS_DISABLED')
+
+    def test_fleet_agent_save_persists_tail_only_under_flag(self):
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            agent = self._grok_agent('glm-armed')
+            self.assertEqual(agent.model_fallbacks, [
+                {'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'},
+            ])
+            agent.save()
+            agent.refresh_from_db()
+            self.assertEqual(agent.model_fallbacks, [
+                {'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'},
+            ])
+        # flag back off -> the same row re-derives to the pinned state on touch
+        agent.save()
+        agent.refresh_from_db()
+        self.assertEqual(agent.model_fallbacks, [])
+
+    # ── condition 1: observability (gauge + projection note) ──
+
+    def test_metrics_expose_fallback_active_series_with_attribution_labels(self):
+        from fleet.grok_provider_metrics import to_prometheus
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            self._grok_agent('glm-gauge')
+            body = to_prometheus()
+        self.assertIn('# TYPE hive_model_fallback_active gauge', body)
+        self.assertIn(
+            'hive_model_fallback_active{seat="glm-gauge",from="cortex/grok-4.5",to="cortex/glm"} 1',
+            body,
+        )
+        # condition 3: attribution labels carry seat/from/to
+        self.assertIn('seat="glm-gauge"', body)
+        self.assertIn('from="cortex/grok-4.5"', body)
+
+    def test_metrics_flag_off_exports_zero_series_with_empty_tail(self):
+        from fleet.grok_provider_metrics import to_prometheus
+        self._grok_agent('glm-gauge-off')
+        body = to_prometheus()
+        self.assertIn('# TYPE hive_model_fallback_active gauge', body)
+        self.assertIn(
+            'hive_model_fallback_active{seat="glm-gauge-off",from="cortex/grok-4.5",to=""} 0',
+            body,
+        )
+
+    def test_projection_note_names_from_to_reason_when_tail_armed(self):
+        from fleet.external_agents import telemetry_fields
+        configured = {
+            'model': 'cortex/grok-4.7',
+            'execution_method': 'grok_build',
+            'model_fallbacks': [
+                {'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'},
+            ],
+        }
+        fields = telemetry_fields(
+            {'runtime': {'model': 'cortex/glm', 'provider': 'cortex'}},
+            configured=configured,
+        )
+        self.assertTrue(fields.get('model_fallback_active'))
+        self.assertIn('cortex/grok-4.7 -> cortex/glm', fields.get('model_fallback_note', ''))
+        self.assertIn('grok_quota_exhaustion_fallback', fields.get('model_fallback_note', ''))
+
+    def test_projection_note_absent_when_no_tail(self):
+        from fleet.external_agents import telemetry_fields
+        fields = telemetry_fields(
+            {'runtime': {'model': 'cortex/grok-4.7', 'provider': 'cortex'}},
+            configured={'model': 'cortex/grok-4.7', 'execution_method': 'grok_build'},
+        )
+        self.assertNotIn('model_fallback_active', fields)
+        self.assertNotIn('model_fallback_note', fields)
+
+    # ── condition 2: drift fallback-awareness ──
+
+    def test_running_the_sanctioned_glm_tail_is_not_drift(self):
+        from fleet.external_agents import telemetry_fields
+        configured = {
+            'model': 'cortex/grok-4.7',
+            'execution_method': 'grok_build',
+            'model_fallbacks': [
+                {'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'},
+            ],
+        }
+        fields = telemetry_fields(
+            {'runtime': {'model': 'cortex/glm', 'provider': 'cortex'}},
+            configured=configured,
+        )
+        self.assertFalse(fields.get('runtime_config_drift'))
+        # an UNSANCTIONED live model still drifts (fail-closed unchanged)
+        fields = telemetry_fields(
+            {'runtime': {'model': 'cortex/other-model', 'provider': 'cortex'}},
+            configured=configured,
+        )
+        self.assertTrue(fields.get('runtime_config_drift'))
+
+    # ── conditions 3+4: attribution labels under load + failure surfacing ──
+
+    def test_fallback_arming_leaves_protected_holder_capacity_priority_intact(self):
+        from fleet.grok_provider_metrics import to_prometheus
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            self._grok_agent('glm-holder')
+            entry = self._xai_entry(left=80.0, reset_at=timezone.now() + timedelta(hours=2))
+            body = to_prometheus()
+        # protected holder still admits on xai capacity: healthy 1,
+        # capacity_unavailable 0 — arming the tail changed nothing about
+        # admission priority.
+        self.assertIn(
+            'shizuha_agent_provider_healthy{agent="glm-holder",backend="grok_build"} 1',
+            body,
+        )
+        self.assertIn(
+            'shizuha_agent_capacity_unavailable{agent="glm-holder",backend="grok_build"} 0',
+            body,
+        )
+        self.assertIn(
+            'hive_model_fallback_active{seat="glm-holder",from="cortex/grok-4.5",to="cortex/glm"} 1',
+            body,
+        )
+        # capacity gone -> provider unhealthy, fallback still armed: the pod
+        # loop has a step to walk and the quota problem is loud (condition 4 —
+        # the fallback-active series IS the failure-surfacing fix).
+        entry.agent_leasing_enabled = False
+        entry.save(update_fields=['agent_leasing_enabled'])
+        body = to_prometheus()
+        self.assertIn(
+            'shizuha_agent_provider_healthy{agent="glm-holder",backend="grok_build"} 0',
+            body,
+        )
+        self.assertIn(
+            'hive_model_fallback_active{seat="glm-holder",from="cortex/grok-4.5",to="cortex/glm"} 1',
+            body,
+        )

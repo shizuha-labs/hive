@@ -248,6 +248,16 @@ LOGIN_URL = '/hive/login'
 # DevOps explicitly enables it after Security/QA sign-off.
 HIVE_FREE_CLAW_WAITLIST_ENABLED = _env_bool('HIVE_FREE_CLAW_WAITLIST_ENABLED', False)
 
+# PLAT-13235: platform-managed Grok→GLM fallback tail for grok-pinned lanes
+# (fleet/runtime_lane.managed_model_fallbacks). Flag off (default) is the
+# 2026-08-04 "pinned to one backend" state, byte for byte. Flag on derives a
+# single cortex/glm step for cortex/grok* primaries so the pod's inline
+# failover loop can walk it on 429/quota exhaustion. Observability (the
+# hive_model_fallback_active{seat,from,to} gauge + the Agents projection note)
+# ships in the same slice — see the four binding conditions in the function
+# docstring.
+HIVE_MANAGED_GROK_GLM_FALLBACK = _env_bool('HIVE_MANAGED_GROK_GLM_FALLBACK', False)
+
 # Platform URL (where Shizuha ID, Connect, etc. live)
 # Platform URL — use LAN IP for k8s pods (can't resolve Tailscale hostnames)
 SHIZUHA_PLATFORM_URL = os.environ.get('SHIZUHA_PLATFORM_URL', 'http://192.168.0.123')

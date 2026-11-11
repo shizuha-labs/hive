@@ -46,10 +46,24 @@ def to_prometheus(*, now=None) -> str:
         '# TYPE shizuha_agent_provider_healthy gauge',
         '# HELP shizuha_agent_capacity_unavailable Provider credential/quota capacity unavailable (1).',
         '# TYPE shizuha_agent_capacity_unavailable gauge',
+        '# HELP hive_model_fallback_active Platform-managed model fallback armed for this seat (1) or not (0).',
+        '# TYPE hive_model_fallback_active gauge',
     ]
     for agent in _enabled_grok_agents():
         healthy = 1 if _has_routable_xai_capacity(agent, now=now) else 0
         labels = f'agent="{agent.agent_username}",backend="grok_build"'
         lines.append(f'shizuha_agent_provider_healthy{{{labels}}} {healthy}')
         lines.append(f'shizuha_agent_capacity_unavailable{{{labels}}} {1 - healthy}')
+        # PLAT-13235 condition 1 (observability) + condition 3 (attribution):
+        # the platform-managed tail must be visible per seat, with from/to
+        # labels so quota accounting can attribute two-model traffic while the
+        # flag is on. Rows persist the chain only via the
+        # runtime_lane.managed_model_fallbacks chokepoint, so an armed series
+        # here always reflects the operator-gated flag — never a hidden chain.
+        chain = [s for s in (agent.model_fallbacks or []) if isinstance(s, dict)]
+        tail_model = str(chain[0].get('model') or '') if chain else ''
+        fb_labels = (
+            f'seat="{agent.agent_username}",from="{agent.model or ""}",to="{tail_model}"'
+        )
+        lines.append(f'hive_model_fallback_active{{{fb_labels}}} {1 if tail_model else 0}')
     return '\n'.join(lines) + '\n'
