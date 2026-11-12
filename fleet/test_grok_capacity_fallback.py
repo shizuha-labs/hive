@@ -382,6 +382,18 @@ class ManagedGrokGlmFallbackTests(GrokCapacityFallbackTests):
                 {'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'},
             ])
 
+    def test_flag_on_derives_same_tail_for_hive_direct_xai_primary(self):
+        """CTX-5382: the Hive direct lane (xai:grok-*, TokenPool lease) gets the
+        same single bounded tail; its runtime breaker trips as a 429."""
+        from fleet.runtime_lane import managed_model_fallbacks
+        self.assertEqual(managed_model_fallbacks('xai:grok-4.7', 'shizuha'), [])
+        with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):
+            for method in ('grok_build', 'shizuha'):
+                self.assertEqual(
+                    managed_model_fallbacks('xai:grok-4.7', method),
+                    [{'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'}],
+                )
+
     def test_flag_on_is_policy_scoped_to_grok_primaries(self):
         from fleet.runtime_lane import managed_model_fallbacks
         with override_settings(HIVE_MANAGED_GROK_GLM_FALLBACK=True):

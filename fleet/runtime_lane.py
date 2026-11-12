@@ -55,8 +55,13 @@ MANAGED_GROK_FALLBACK_MODEL = "cortex/DeepSeek-V4-Flash"
 # that lane. A model with an explicit provider prefix outside the method's set is
 # rejected before it can reach a pod env that exits at startup.
 _METHOD_SERVABLE_PROVIDERS: dict[str, frozenset[str]] = {
-    # shizuha gateway: openai/google/cortex/ollama are the configured providers.
-    'shizuha': frozenset({'openai', 'google', 'cortex', 'ollama', 'vllm', 'llamacpp'}),
+    # shizuha gateway: openai/google/cortex/ollama are the configured providers,
+    # plus `xai` via the Hive TokenPool access-only lease. CTX-5382: since SCLI
+    # 2026-09-26 the gateway leases `xai:grok-*` from the pod broker for ANY
+    # method (grok_build is the same gateway binary), and since shizuha#621 it
+    # sends those OAuth leases to the Grok CLI chat proxy with a per-seat
+    # rolling-hour breaker. The 2026-08-14 Aya crash predates the lease path.
+    'shizuha': frozenset({'openai', 'google', 'cortex', 'ollama', 'vllm', 'llamacpp', 'xai'}),
     # grok_build bridge: xAI TokenPool + cortex-routed offers.
     'grok_build': frozenset({'xai', 'cortex', 'ollama', 'vllm', 'llamacpp'}),
     'codex_app_server': frozenset({'openai', 'cortex', 'ollama', 'vllm', 'llamacpp'}),
@@ -298,7 +303,9 @@ def managed_model_fallbacks(model: str, method: str) -> list[dict[str, str]]:
     REST all funnel through it, so no hidden chain can be persisted. Flag off
     returns [] for every lane: the 2026-08-04 pinned state, byte for byte.
     """
-    if getattr(settings, 'HIVE_MANAGED_GROK_GLM_FALLBACK', False) and model.startswith('cortex/grok'):
+    # CTX-5382: the Hive direct xAI lane (`xai:grok*`, TokenPool lease) gets
+    # the same single bounded tail — its runtime breaker trips as a 429.
+    if getattr(settings, 'HIVE_MANAGED_GROK_GLM_FALLBACK', False) and model.startswith(('cortex/grok', 'xai:grok')):
         return [{'model': 'cortex/glm', 'reason': 'grok_quota_exhaustion_fallback'}]
     return []
 
