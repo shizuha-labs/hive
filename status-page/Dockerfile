@@ -1,4 +1,5 @@
 FROM nginx:alpine
+RUN apk add --no-cache 'expat>=2.8.5-r0'
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY index.html /usr/share/nginx/html/index.html
 COPY status.json /usr/share/nginx/html/status.json

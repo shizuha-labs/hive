@@ -36,6 +36,7 @@ RUN npm run build
 
 # Stage 2: serve
 FROM nginx:alpine
+RUN apk add --no-cache 'expat>=2.8.5-r0'
 COPY --from=builder /build/nginx.prod.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /build/dist /usr/share/nginx/html
 EXPOSE 80
