@@ -17,26 +17,37 @@ from .runtime_lane import RuntimeLaneError, resolve_runtime_lane
 
 
 class ProviderServableValidationTests(TestCase):
-    def test_xai_colon_model_rejected_on_shizuha_gateway(self):
-        """The exact incident tuple: xai:grok-4.5 on the shizuha gateway must be
-        rejected at persist (FleetAgent.save chokepoint)."""
+    def test_xai_colon_model_allowed_on_shizuha_gateway(self):
+        """CTX-5382: the shizuha gateway now serves `xai:grok-*` through the Hive
+        TokenPool broker lease (same gateway binary as grok_build; lease path
+        added 2026-09-26, after the 2026-08-14 Aya incident)."""
+        agent = FleetAgent.objects.create(
+            agent_username='scli-xai-direct-valid',
+            model='xai:grok-4.7',
+            mcp_config={'execution_method': 'shizuha'},
+        )
+        self.assertEqual(agent.model, 'xai:grok-4.7')
+
+    def test_unserved_provider_still_rejected_on_shizuha_gateway(self):
+        """The HIVE-1937 gate still rejects providers the gateway cannot serve
+        (the shizuha gateway has no anthropic provider)."""
         agent = FleetAgent(
-            agent_username='aya-incident-repro',
-            model='xai:grok-4.5',
+            agent_username='scli-anthropic-repro',
+            model='anthropic:claude-opus-4',
             mcp_config={'execution_method': 'shizuha'},
         )
         with self.assertRaisesMessage(ValidationError, 'cannot serve'):
             agent.save()
 
-    def test_xai_colon_model_rejected_on_shizuha_update(self):
-        """Changing an existing shizuha-gateway agent's model to xai:grok-4.5 is
+    def test_unserved_provider_rejected_on_shizuha_update(self):
+        """Changing an existing shizuha-gateway agent to an unserved provider is
         rejected; the last-known healthy model is not overwritten."""
         agent = FleetAgent.objects.create(
-            agent_username='aya-update-repro',
+            agent_username='scli-update-repro',
             model='cortex/grok-4.5',
             mcp_config={'execution_method': 'shizuha'},
         )
-        agent.model = 'xai:grok-4.5'
+        agent.model = 'anthropic:claude-opus-4'
         with self.assertRaisesMessage(ValidationError, 'cannot serve'):
             agent.save(update_fields=['model', 'updated_at'])
         agent.refresh_from_db()
@@ -85,14 +96,24 @@ class ProviderServableValidationTests(TestCase):
         self.assertEqual(agent.model, 'openai/gpt-5.5')
 
     def test_admission_path_rejects_unsupported_provider(self):
-        """The runtime-lane admission path (daemon) also rejects the incident
-        tuple."""
+        """The runtime-lane admission path (daemon) also rejects a registered
+        model whose explicit provider the method cannot serve (xai on the
+        codex app server)."""
         with self.assertRaises(RuntimeLaneError) as raised:
             resolve_runtime_lane(
-                {'model': 'cortex/grok-4.5', 'execution_method': 'shizuha'},
-                {'model': 'xai:grok-4.5', 'execution_method': 'shizuha'},
+                {'model': 'gpt-5.5', 'execution_method': 'codex_app_server'},
+                {'model': 'xai:grok-4.7', 'execution_method': 'codex_app_server'},
             )
         self.assertEqual(raised.exception.code, 'PROVIDER_NOT_SERVABLE')
+
+    def test_admission_path_accepts_xai_direct_on_shizuha(self):
+        """CTX-5382: xai:grok-4.7 on the shizuha gateway resolves."""
+        lane = resolve_runtime_lane(
+            {'model': 'cortex/GLM-5.3-Flash', 'execution_method': 'shizuha'},
+            {'model': 'xai:grok-4.7', 'execution_method': 'shizuha'},
+        )
+        self.assertEqual(lane['model'], 'xai:grok-4.7')
+        self.assertEqual(lane['execution_method'], 'shizuha')
 
     def test_admission_path_accepts_valid_tuples(self):
         """Valid Cortex Grok + xAI Grok Build tuples still resolve."""
