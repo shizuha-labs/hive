@@ -3575,6 +3575,16 @@ def check_entry_health(entry, *, clear_expired_cooldown: bool = True, force_refr
     return result
 
 
+def _open_alert_conditions(entry) -> list[str]:
+    """Enum-only open conditions for this entry. Never crosses pools."""
+    from hive_platform.models import ProviderQuotaAlert
+    return list(
+        ProviderQuotaAlert.objects.filter(
+            entry=entry, state=ProviderQuotaAlert.State.OPEN,
+        ).order_by('condition').values_list('condition', flat=True)
+    )
+
+
 def build_credential_health_overview(*, owner_scope=None) -> dict:
     """Aggregate Claude / Codex / Grok pool health for the multi-provider dashboard.
 
@@ -3720,6 +3730,7 @@ def build_credential_health_overview(*, owner_scope=None) -> dict:
                 'priority': entry.priority,
                 'quota': snap,
                 'quota_status': quota_status,
+                'open_alert_conditions': _open_alert_conditions(entry),
             }
             by_provider[provider].append(row)
             accounts.append(row)

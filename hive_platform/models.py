@@ -730,3 +730,48 @@ class UsageInvoiceDraft(models.Model):
         return f'{self.tenant_org_slug or self.tenant_org_id} {self.period_start}..{self.period_end} {self.total} {self.currency}'
 
 
+class ProviderQuotaAlert(models.Model):
+    """HIVE-2804: one active Pulse item per (org_id, entry_id, condition).
+
+    Edge-triggered from the existing quota refresh path. No polling sweep.
+    Payload is enum-only; never stores tokens or raw provider bodies.
+    """
+
+    class Condition(models.TextChoices):
+        LOW_QUOTA = 'low_quota', 'Low quota'
+        STALE_SNAPSHOT = 'stale_snapshot', 'Stale snapshot'
+        FETCH_ERROR = 'fetch_error', 'Fetch error'
+        REVOKED_TOKEN = 'revoked_token', 'Revoked token'
+        UNEXPECTED_COOLDOWN = 'unexpected_cooldown', 'Unexpected cooldown'
+        TOKEN_EXPIRY = 'token_expiry', 'Token expiry'
+
+    class State(models.TextChoices):
+        OPEN = 'open', 'Open'
+        RESOLVED = 'resolved', 'Resolved'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    org_id = models.CharField(max_length=128, db_index=True)
+    entry = models.ForeignKey('TokenEntry', on_delete=models.CASCADE, related_name='quota_alerts')
+    condition = models.CharField(max_length=32, choices=Condition.choices)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.OPEN)
+    pulse_item_key = models.CharField(max_length=64, blank=True, default='')
+    snapshot_version = models.CharField(max_length=64, blank=True, default='')
+    diagnostic = models.CharField(max_length=64, blank=True, default='')
+    actor = models.CharField(max_length=64, blank=True, default='')
+    service = models.CharField(max_length=32, blank=True, default='')
+    last_transition = models.CharField(max_length=16, blank=True, default='')
+    opened_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'claws_providerquotaalert'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['org_id', 'entry', 'condition'],
+                condition=models.Q(state='open'),
+                name='uniq_open_quota_alert_org_entry_condition',
+            ),
+        ]
+
+
