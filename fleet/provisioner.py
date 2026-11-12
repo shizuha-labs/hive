@@ -825,6 +825,9 @@ def ensure_fleet_identity(agent: 'FleetAgent', password: str = '') -> bool:
     return bool(getattr(agent, 'identity_user_id', None))
 
 
+EXPLICIT_ENABLE_WAITING = 'explicit enable awaiting model lease grant'
+
+
 def enable_or_provision_agent(agent: 'FleetAgent') -> bool:
     """Enable a fleet agent. Never-provisioned rows get a first-time provision.
 
@@ -850,7 +853,9 @@ def enable_or_provision_agent(agent: 'FleetAgent') -> bool:
         except Exception:
             pass
     ok = provision_agent(agent) if agent.provisioned_at is None else start_agent(agent)
-    if not ok and lease_start_pending_reason(agent) and agent.status == FleetAgent.Status.STOPPED:
+    if not ok and lease_start_pending_reason(agent) and agent.status in {
+        FleetAgent.Status.STOPPED, FleetAgent.Status.HIBERNATED,
+    }:
         # This entrypoint is explicit Enable intent (API/UI), unlike automatic
         # start_agent callers. Arm a sleeping waiter for the ordinary planner;
         # do not start it or clear the operator stop on unknown/positive state.
@@ -862,11 +867,16 @@ def enable_or_provision_agent(agent: 'FleetAgent') -> bool:
                 if agent_needs_browser_mcp(agent) else None
             )
         except Exception:
+            if agent.status == FleetAgent.Status.HIBERNATED:
+                agent.hibernation_reason = EXPLICIT_ENABLE_WAITING
+                agent.save(update_fields=['hibernation_reason'])
             _record_lease_start_refusal(agent, LeaseStartDecision(False, 'deployment_state_unreadable'))
             return False
-        if cold.can_stage and (cold_browser is None or cold_browser.can_stage):
+        if agent.status == FleetAgent.Status.HIBERNATED or (
+            cold.can_stage and (cold_browser is None or cold_browser.can_stage)
+        ):
             agent.status = FleetAgent.Status.HIBERNATED
-            agent.hibernation_reason = 'explicit enable awaiting model lease grant'
+            agent.hibernation_reason = EXPLICIT_ENABLE_WAITING
             agent.hibernated_at = timezone.now()
             agent.runtime_lifecycle_state = 'hibernated'
             agent.save(update_fields=[
@@ -1934,7 +1944,15 @@ def _scale_agent_to_zero(
     agent.status = status
     update_fields = ['status', 'hibernation_reason', 'hibernated_at']
     if status == FleetAgent.Status.HIBERNATED:
-        agent.hibernation_reason = str(lifecycle_reason or 'automatic idle policy')[:255]
+        new_reason = str(lifecycle_reason or 'automatic idle policy')[:255]
+        # A staff enable that could not start must survive the rate-limit
+        # hibernate that caused the refusal. Otherwise the 202 is forgotten.
+        if (
+            (agent.hibernation_reason or '') == EXPLICIT_ENABLE_WAITING
+            and 'rate/usage' in new_reason
+        ):
+            new_reason = EXPLICIT_ENABLE_WAITING
+        agent.hibernation_reason = new_reason
         agent.hibernated_at = naive_utc_now()
         # Native hibernate must clear operator_stopped or the agent is
         # never auto-wakeable (mika 2026-08-31: QA 390 ready, no GLM seat).

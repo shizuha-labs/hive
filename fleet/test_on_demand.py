@@ -90,6 +90,26 @@ class OnDemandPolicyTests(SimpleTestCase):
         self.assertTrue(agent_eligible_to_start(scout))
         self.assertEqual([action.action for action in actions], ['start'])
 
+    def test_explicit_enable_waits_through_rate_limit_then_starts(self):
+        waiting = _agent('codex', enabled=False, status='hibernated')
+        waiting['hibernation_reason'] = 'explicit enable awaiting model lease grant'
+        waiting['provider_unavailable_reason'] = 'provider rate/usage limited'
+        blocked = decide_on_demand_actions(
+            agents=[waiting],
+            rosters=[_roster('engineering', ['codex'])],
+            workload_by_email={},
+            workload_by_team={},
+        )
+        self.assertEqual(blocked, [])
+        waiting.pop('provider_unavailable_reason', None)
+        ready = decide_on_demand_actions(
+            agents=[waiting],
+            rosters=[_roster('engineering', ['codex'])],
+            workload_by_email={},
+            workload_by_team={},
+        )
+        self.assertEqual([action.action for action in ready], ['start'])
+
     def test_default_until_first_use_is_not_sweep_started(self):
         parked = _agent('shizuha-115', enabled=False, status='hibernated')
         parked['hibernation_reason'] = 'default_until_first_use'

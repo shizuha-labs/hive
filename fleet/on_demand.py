@@ -775,6 +775,20 @@ def decide_on_demand_actions(
             continue
         member_teams = email_to_teams.get(email, set())
         status = str(agent.get('status') or '').strip().lower()
+        # A staff enable that returned 202 must start once the rate limit
+        # clears, even if the seat has no new team demand.
+        if str(agent.get('hibernation_reason') or '') == 'explicit enable awaiting model lease grant':
+            if agent_eligible_to_start(agent):
+                actions.append(OnDemandAction(
+                    action='start',
+                    agent_id=aid,
+                    username=agent_username(agent),
+                    reason='explicit enable waiting for capacity',
+                    teams=tuple(sorted(member_teams)),
+                ))
+                acted_agents.add(aid)
+                planned_start_emails.add(email)
+            continue
         # Parked signup seats stay down until a real owner DM or explicit
         # Hive enable. Team demand / keep-resident must not treat them as
         # ordinary workers (ADR-0080 / HIVE-2007).

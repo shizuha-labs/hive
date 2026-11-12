@@ -5963,6 +5963,10 @@ class FleetAgentEnableView(APIView):
                 )
         ok = provisioner.enable_or_provision_agent(agent)
         if not ok:
+            if agent.status == FleetAgent.Status.HIBERNATED:
+                from .provisioner import EXPLICIT_ENABLE_WAITING
+                agent.hibernation_reason = EXPLICIT_ENABLE_WAITING
+                agent.save(update_fields=['hibernation_reason'])
             waiting = _lease_wait_response(agent)
             if waiting is not None:
                 return waiting
