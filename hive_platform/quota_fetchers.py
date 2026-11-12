@@ -1251,6 +1251,17 @@ def persist_quota_snapshot(
     entry.quota_snapshot = project_quota_snapshot(snapshot)
     entry.last_checked_at = timezone.now()
     entry.save(update_fields=['quota_snapshot', 'last_checked_at', 'updated_at'])
+    try:
+        from hive_platform.quota_alerts import sync_quota_alerts
+        sync_quota_alerts(entry, entry.quota_snapshot)
+    except Exception:
+        # Alert bookkeeping must not fail the quota persist itself.
+        import logging
+        logging.getLogger(__name__).warning(
+            'quota alert sync failed entry_id=%s',
+            getattr(entry, 'pk', None),
+            exc_info=True,
+        )
     exhausted_until = confirmed_xai_quota_exhausted_until(entry)
     if exhausted_until is not None:
         _preserve_quota_cooldown(entry, exhausted_until)
