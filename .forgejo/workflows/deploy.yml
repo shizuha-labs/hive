@@ -1263,6 +1263,26 @@ jobs:
           set -euo pipefail
           kubectl apply -f k8s/fleet-agent-liveness-reconciler.yaml
           kubectl diff -f k8s/fleet-agent-liveness-reconciler.yaml
+      # PLAT-9903: k8s/hive-golden-path-validation.yaml triggers this lane via
+      # the k8s/** path filter but had NO applier — the HIVE-2697/2715 env fix
+      # (SHIZUHA_ID_INTERNAL_URL) merged on main never reached the live
+      # CronJob, so every per-deploy golden-path validation teardown targeted
+      # the public ingress (404 by the /api/internal network gate), failed
+      # stage 6, and left KubeJobFailed red on every hive deploy. Reconcile
+      # the CronJob (and its alert rules) the same way as the liveness
+      # reconciler, then verify the exact env landed on the live object.
+      - name: Reconciling hive golden-path validation CronJob (PLAT-9903)
+        run: |
+          set -euo pipefail
+          kubectl apply -f k8s/hive-golden-path-validation.yaml
+          kubectl diff -f k8s/hive-golden-path-validation.yaml
+          kubectl apply -f k8s/hive-golden-path-alerts.yaml
+          kubectl diff -f k8s/hive-golden-path-alerts.yaml
+          # The teardown must target the in-cluster internal ID service; a
+          # missing env regresses to the public-ingress 404 silently.
+          kubectl -n shizuha-hive get cronjob hive-golden-path-validation \
+            -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env[*].name}' \
+            | tr ' ' '\n' | grep -Fx SHIZUHA_ID_INTERNAL_URL
       - name: Verify administrator-bootstrapped ring executor identities
         run: |
           set -euo pipefail
