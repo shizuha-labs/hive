@@ -272,3 +272,66 @@ class AgentIndexCacheTests(TestCase):
         self.assertEqual(s['invalidations'], 1)
         self.assertAlmostEqual(s['hit_rate'], round(2 / 3, 3))
         self.assertEqual(s['fresh_ttl_s'], aic.FRESH_TTL)
+
+    def test_empty_rebuild_against_nonempty_lastgood_is_refused(self):
+        # PLAT-11959 fail-loud silent-empty guard: a rebuild producing 0 agents
+        # must NEVER commit over a non-empty last-good registry — that is the
+        # silent-empty class that blanked the registry twice (PLAT-11046,
+        # PLAT-11959). The refusal preserves last-good serving and is counted.
+        good = [{'agent_username': 'zen@shizuha.com'}, {'agent_username': 'a'}]
+        build_good, _ = self._counting_builder(good)
+        aic.get_or_build('ext1', build_good)
+        self._join_revalidators()
+        self.assertEqual(aic.get_or_build('ext1', build_good)[1], 'hit')
+
+        aic.invalidate('transient upstream loss')
+        build_empty, calls_empty = self._counting_builder([])
+        out, st = aic.get_or_build('ext1', build_empty)
+        self.assertEqual(st, 'stale-revalidating')
+        self.assertEqual(out, good, 'refusal must keep serving the non-empty last-good payload')
+        self.assertTrue(self._wait_for(lambda: calls_empty[0] == 1),
+                        'the empty rebuild must still have run')
+        self._join_revalidators()
+
+        # The committed state must still be the NON-empty payload: the refusal
+        # declines to store the empty rebuild, so every subsequent read keeps
+        # serving last-good (never a fresh hit until a real rebuild succeeds).
+        out2, st2 = aic.get_or_build('ext1', build_empty)
+        self.assertEqual(st2, 'stale-revalidating')
+        self.assertEqual(out2, good)
+        self._join_revalidators()
+        with aic._metrics_lock:
+            self.assertGreaterEqual(aic._metrics['empty_rebuild_refused'], 1)
+
+    def test_authorized_empty_rebuild_commits_single_shot(self):
+        # Explicit purge intent (delete/deprovision of the last agent) must be
+        # able to empty the registry — exactly once per authorization.
+        good = [{'agent_username': 'zen@shizuha.com'}]
+        build_good, _ = self._counting_builder(good)
+        aic.get_or_build('ext1', build_good)
+        self._join_revalidators()
+        self.assertEqual(aic.get_or_build('ext1', build_good)[1], 'hit')
+
+        aic.authorize_empty_rebuild(reason='test purge')
+        aic.invalidate('deprovision/delete')
+        build_empty, _ = self._counting_builder([])
+        out, st = aic.get_or_build('ext1', build_empty)
+        self.assertEqual(st, 'stale-revalidating')
+        self._join_revalidators()
+        self.assertTrue(self._wait_for(
+            lambda: aic.get_or_build('ext1', build_empty)[1] == 'hit'))
+        out3, _ = aic.get_or_build('ext1', build_empty)
+        self.assertEqual(out3, [], 'authorized purge must commit the empty registry')
+        # Single-shot: the authorization is consumed by the commit above.
+        self.assertIsNone(cache.get(aic._EMPTY_REBUILD_AUTH_KEY))
+
+    def test_cold_start_empty_registry_is_allowed(self):
+        # A genuinely empty fleet with no prior payload must still serve — the
+        # guard only protects an EXISTING non-empty registry.
+        build_empty, _ = self._counting_builder([])
+        out, st = aic.get_or_build('ext1', build_empty)
+        self.assertIn(st, ('miss', 'building'))
+        self._join_revalidators()
+        out2, st2 = aic.get_or_build('ext1', build_empty)
+        self.assertEqual(st2, 'hit')
+        self.assertEqual(out2, [])

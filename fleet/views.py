@@ -5868,6 +5868,11 @@ class FleetAgentDetailView(APIView):
             FleetAgentArchive.objects.filter(agent_username=agent.agent_username).delete()
         except Exception:
             logger.exception('archive-marker cleanup failed for %s (non-fatal)', agent.agent_username)
+        # PLAT-11959: this is the one path that may legitimately empty the
+        # fleet-agent registry (deleting the last agent). Arm explicit purge
+        # intent so the fail-loud empty-rebuild guard lets the rebuilt index
+        # commit zero rows; every other rebuild shape is refused.
+        agent_index_cache.authorize_empty_rebuild(reason='deprovision/delete')
         agent_index_cache.invalidate('deprovision/delete')
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -8576,4 +8581,3 @@ class FleetSeatLifecycleMetricsView(APIView):
             seat_lifecycle_metrics.to_prometheus(),
             content_type='text/plain; version=0.0.4; charset=utf-8',
         )
-
