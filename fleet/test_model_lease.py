@@ -1601,15 +1601,20 @@ class ReservedMustHoldLeaseTests(SimpleTestCase):
         tick = _reconcile_one_pool(
             cfg=self.cfg,
             agents=agents,
-            email_to_teams={'yuna@shizuha.com': {'ceo-office'}},
-            workload_by_team={},
-            workload_by_email={'saki@shizuha.com': {'ready': 1}},
+            email_to_teams={'yuna@shizuha.com': {'ceo-office'}, 'saki@shizuha.com': {'engineering'}},
+            workload_by_team={'engineering': {'ready': 1}},
+            workload_by_email={},
             unread_by_email={},
             alerts_by_email={},
             actionable_buckets=('ready',),
             client=self.client,
             now=1000.0,
             apply=True,
+            # Review fe6edecb: the runtime-idle observation is INJECTED, not
+            # fence-weakened. Without a stub the live telemetry check fails
+            # closed and the eviction never fires; the stub asserts the fence
+            # face for the quiet-holder branch.
+            idle_confirmation=lambda u: (True, 'test-idle'),
         )
         self.assertEqual(self.client.revokes, ['agent-saki'])
         self.assertEqual(self.client.grants, ['agent-yuna'])
@@ -1623,6 +1628,58 @@ class ReservedMustHoldLeaseTests(SimpleTestCase):
         )
         self.assertIn('GRANT holder=agent-yuna reason=keep-resident', ' '.join(tick['log']))
         self.assertEqual(cache.get(PREEMPT_RETRY_CACHE_KEY), {'saki': 1000.0})
+
+    def test_idle_holder_with_ready_work_is_not_preempted(self):
+        """HIVE-3016: a runtime-idle stub does not preempt a holder who still
+        has ready work. Delivery keep wins over the reserved pass."""
+        agents = [
+            {'username': 'saki', 'email': 'saki@shizuha.com', 'status': 'running', 'enabled': True},
+            {'username': 'yuna', 'email': 'yuna@shizuha.com', 'status': 'running', 'enabled': True,
+             'warm_pool_size': 1},
+        ]
+        tick = _reconcile_one_pool(
+            cfg=self.cfg,
+            agents=agents,
+            email_to_teams={'yuna@shizuha.com': {'ceo-office'}, 'saki@shizuha.com': {'engineering'}},
+            workload_by_team={'engineering': {'ready': 1}},
+            workload_by_email={'saki@shizuha.com': {'ready': 1}},
+            unread_by_email={},
+            alerts_by_email={},
+            actionable_buckets=('ready',),
+            client=self.client,
+            now=1000.0,
+            apply=True,
+            idle_confirmation=lambda u: (True, 'test-idle'),
+        )
+        self.assertEqual(self.client.revokes, [])
+        self.assertIn('RESERVED GRANT blocked', ' '.join(tick['log']))
+
+    def test_not_fresh_idle_holder_blocks_the_preempt(self):
+        """Review fe6edecb: a stub reporting the holder NOT fresh-idle means
+        no victim and the blocked receipt — the inverse of the stubbed-idle
+        case, proving the fence direction (no-blind-eye, no fence-weak)."""
+        agents = [
+            {'username': 'saki', 'email': 'saki@shizuha.com', 'status': 'running', 'enabled': True},
+            {'username': 'yuna', 'email': 'yuna@shizuha.com', 'status': 'running', 'enabled': True,
+             'warm_pool_size': 1},
+        ]
+        tick = _reconcile_one_pool(
+            cfg=self.cfg,
+            agents=agents,
+            email_to_teams={'yuna@shizuha.com': {'ceo-office'}},
+            workload_by_team={},
+            workload_by_email={'saki@shizuha.com': {'ready': 1}},
+            unread_by_email={},
+            alerts_by_email={},
+            actionable_buckets=('ready',),
+            client=self.client,
+            now=1000.0,
+            apply=True,
+            idle_confirmation=lambda u: (False, 'working'),
+        )
+        self.assertEqual(self.client.revokes, [])
+        self.assertEqual(self.client.grants, [])
+        self.assertIn('RESERVED GRANT blocked', ' '.join(tick['log']))
 
     def test_preempt_retry_wins_the_next_free_slot(self):
         """After Yuna steals the seat, Saki is the next personal fill — not Nori."""
