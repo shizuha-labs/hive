@@ -186,6 +186,12 @@ class RuntimeFamily:
     prefixes: tuple[str, ...]
     allowed_methods: tuple[str, ...]
     canonical_method: str
+    # HIVE-3017: optional per-family narrowing of the method's broker
+    # capabilities. A multi-provider method (antigravity_server serves Claude
+    # AND Gemini) otherwise demands every provider credential for every model,
+    # so a Gemini seat was refused for lacking provider.api:anthropic. None
+    # (key absent) keeps the method's full list, byte for byte.
+    credential_capabilities: tuple[str, ...] | None = None
 
     def matches(self, model: str) -> bool:
         lowered = model.lower()
@@ -200,6 +206,10 @@ def _families() -> tuple[RuntimeFamily, ...]:
         prefixes=tuple(str(prefix).lower() for prefix in item.get("model_prefixes") or []),
         allowed_methods=tuple(str(method) for method in item.get("allowed_methods") or []),
         canonical_method=str(item.get("canonical_method") or ""),
+        credential_capabilities=(
+            tuple(str(cap) for cap in item["credential_capabilities"])
+            if "credential_capabilities" in item else None
+        ),
     ) for item in RUNTIME_CAPABILITY_MANIFEST["families"])
 
 
@@ -351,6 +361,9 @@ def resolve_runtime_lane(current: dict[str, Any], patch: dict[str, Any]) -> dict
             )
 
     capabilities = _method_capabilities(method)
+    if family.credential_capabilities is not None:
+        # Narrow only: a family can never require more than the method declares.
+        capabilities = [cap for cap in capabilities if cap in family.credential_capabilities]
     model_fallbacks = managed_model_fallbacks(model, method)
     return {
         "lane_id": family.lane_id,
