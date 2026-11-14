@@ -48,6 +48,7 @@ COLD_WAIT_S = 1.5
 
 _VER_KEY = 'fleet:agents_index:ver'
 _OBSERVATION_INVALIDATE_LOCK_KEY = 'fleet:agents_index:observation-invalidate-lock'
+_EMPTY_REBUILD_AUTH_KEY = 'fleet:agents_index:empty-rebuild-authorized'
 _FRESH_PREFIX = 'fleet:agents_index:fresh'
 _LASTGOOD_PREFIX = 'fleet:agents_index:lastgood'
 
@@ -63,6 +64,9 @@ _metrics = {
     'building': 0,
     'invalidations': 0,
     'coalesced_invalidations': 0,
+    # PLAT-11959: rebuilds that produced 0 agents against a non-empty
+    # last-good payload and were refused (fail-loud silent-empty guard).
+    'empty_rebuild_refused': 0,
     'build_ms_last': 0.0,
 }
 
@@ -131,6 +135,25 @@ def invalidate_observation(reason=''):
     invalidate(reason)
 
 
+def authorize_empty_rebuild(reason='', ttl=900):
+    """Arm explicit purge intent for ONE empty rebuild commit (PLAT-11959).
+
+    The silent-empty failure class (PLAT-11046, PLAT-11959) committed a rebuilt
+    index with zero rows over a non-empty registry. The fail-loud guard in
+    :func:`_store_payload` refuses exactly that shape; a genuine emptying of the
+    fleet (delete/deprovision of the last agent) must arm this authorization
+    first so the refusal never turns "deleted the last agent" into an
+    undeletable ghost row. Single-shot: the guard consumes the authorization
+    when it allows an empty commit.
+    """
+    try:
+        cache.set(_EMPTY_REBUILD_AUTH_KEY, {'reason': reason, 'at': time.time()}, ttl)
+        logger.info('agents-index empty-rebuild authorized (%s, ttl=%ss)',
+                    reason or 'unspecified', ttl)
+    except Exception:
+        logger.exception('agents-index empty-rebuild authorization failed (non-fatal)')
+
+
 # Single-flight registry for background revalidations: cache_suffix → started
 # monotonic time. Guarded by _metrics_lock's sibling below; entries older than
 # _REVALIDATE_STUCK_S are considered dead (thread crashed) and may be replaced.
@@ -140,6 +163,39 @@ _REVALIDATE_STUCK_S = 120
 
 
 def _store_payload(fresh_key, lastgood_key, payload):
+    # PLAT-11959 fail-loud guard: a rebuild that yields an EMPTY payload must
+    # never silently overwrite a non-empty last-good registry (the second
+    # occurrence of the silent-empty class — PLAT-11046 was the first). Serve
+    # semantics stay stale-while-revalidate; the last-good payload keeps
+    # serving and the refusal is alerted on. Explicit purge intent (armed by
+    # the delete/deprovision path via authorize_empty_rebuild) is consumed
+    # single-shot when it allows an empty commit.
+    if not payload:
+        try:
+            previous = cache.get(lastgood_key)
+        except Exception:
+            previous = None
+        if previous:
+            try:
+                authorized = cache.get(_EMPTY_REBUILD_AUTH_KEY)
+            except Exception:
+                authorized = None
+            if authorized:
+                try:
+                    cache.delete(_EMPTY_REBUILD_AUTH_KEY)
+                except Exception:
+                    logger.exception('agents-index empty-rebuild auth consume failed (non-fatal)')
+            else:
+                _bump('empty_rebuild_refused')
+                logger.error(
+                    'AGENTS-INDEX EMPTY-REBUILD REFUSED (PLAT-11959): rebuild produced 0 '
+                    'agents while a non-empty last-good registry (%d agents) exists and no '
+                    'purge intent is armed. Last-good payload is preserved and keeps serving; '
+                    'if an empty registry is genuinely intended, arm it via '
+                    'agent_index_cache.authorize_empty_rebuild() on the delete/deprovision path.',
+                    len(previous) if isinstance(previous, list) else -1,
+                )
+                return
     try:
         cache.set(fresh_key, payload, FRESH_TTL)
         cache.set(lastgood_key, payload, LAST_GOOD_TTL)
