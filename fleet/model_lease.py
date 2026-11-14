@@ -892,6 +892,70 @@ def _actionable_buckets_for_personal_keep(teams, actionable_buckets) -> tuple:
     )
 
 
+def _holder_working_fences(
+    *,
+    holder_rows,
+    reserved_usernames,
+    agent_by_username,
+    workload_by_email,
+    unread_by_email,
+    alerts_by_email,
+    actionable_buckets,
+    idle_confirmation,
+) -> tuple[list[dict], set[str]]:
+    """Split live holders into (preempt candidates, fenced-out usernames).
+
+    THE work-never-evicts-work fence (HIVE-2841 docstring doctrine), shared
+    by ``wake_preempt_lease_slot`` and the reconcile's reserved-grant loop —
+    one predicate, never duplicated. A holder is a candidate only when ALL
+    fences affirmatively pass; every failure is fail-closed and blocks the
+    preempt:
+
+      1. fresh-idle: the runtime is affirmatively fresh-idle right now —
+         unknown/stale/working all fail closed (the wake path's inverted
+         apply-time fence);
+      2. no personal signal: no unread Connect DM, no assigned Pulse alert,
+         and no row in any actionable bucket — work never evicts work.
+
+    Delivery-keep gating (spec-v2 leg 2) is follow-up PR work: it brings its
+    own per-evidence-item book and threads a separate gate at the fence's
+    call sites.
+
+    Reserved holders are never candidates. Returns ``(candidates, fenced)``
+    where ``fenced`` is the set of usernames blocked (for decision logging).
+    """
+    fenced: set[str] = set()
+    candidates: list[dict] = []
+    for row in holder_rows or ():
+        if not isinstance(row, dict):
+            continue
+        uname = _username_from_principal(str(row.get('principal') or '').strip())
+        if not uname or uname in reserved_usernames:
+            continue
+        # Fence 1: fresh-idle (fail-closed to "fenced").
+        try:
+            idle_ok, _why = idle_confirmation(uname)
+        except Exception:  # noqa: BLE001 — fence failure must not evict
+            idle_ok = False
+        if not idle_ok:
+            fenced.add(uname)
+            continue
+        # Fence 2: no personal signal (DM / alert / actionable work).
+        agent_row = agent_by_username.get(uname) or {}
+        holder_email = str(agent_row.get('email') or '').strip().lower()
+        if agent_has_unread_dm(holder_email, unread_by_email):
+            fenced.add(uname)
+            continue
+        if agent_has_assigned_alert(holder_email, alerts_by_email):
+            fenced.add(uname)
+            continue
+        if _bucket_count(workload_by_email.get(holder_email), actionable_buckets) > 0:
+            fenced.add(uname)
+            continue
+        candidates.append(row)
+    return candidates, fenced
+
+
 def agent_has_assigned_work(email: str, workload_by_email, actionable_buckets) -> bool:
     """True when this agent email has actionable Pulse assignments of their own."""
     email = str(email or '').strip().lower()
@@ -1349,34 +1413,20 @@ def wake_preempt_lease_slot(
         )
         idle_confirmation = _live_idle_confirmation
 
-    def _has_personal_signal(uname: str) -> bool:
-        agent_row = agent_by_username.get(uname) or {}
-        holder_email = str(agent_row.get('email') or '').strip().lower()
-        if agent_has_unread_dm(holder_email, unread_by_email):
-            return True
-        if agent_has_assigned_alert(holder_email, alerts_by_email):
-            return True
-        return _bucket_count(workload_by_email.get(holder_email), ACTIONABLE_BUCKETS) > 0
-
-    active: set[str] = set()
-    candidates: list[dict] = []
-    for row in holders:
-        uname = _username_from_principal(str(row.get('principal') or '').strip())
-        if not uname or uname in reserved_usernames:
-            continue
-        # Fresh-idle fence (the reconcile's apply-time fence, inverted): a
-        # holder that is not affirmatively fresh-idle is treated as active
-        # and is never evicted — unknown/stale/working all fail closed.
-        try:
-            idle_ok, _why = idle_confirmation(uname)
-        except Exception:  # noqa: BLE001 — fence failure must not evict
-            idle_ok = False
-        if not idle_ok:
-            active.add(uname)
-            continue
-        if _has_personal_signal(uname):
-            continue
-        candidates.append(row)
+    # Work-never-evicts-work fences via the SHARED helper (HIVE-3016): the
+    # same fresh-idle + personal-signal (+ live delivery-KEEP) predicate the
+    # reconcile's reserved-grant loop uses — one predicate, never duplicated.
+    candidates, fenced_out = _holder_working_fences(
+        holder_rows=holders,
+        reserved_usernames=reserved_usernames,
+        agent_by_username=agent_by_username,
+        workload_by_email=workload_by_email,
+        unread_by_email=unread_by_email,
+        alerts_by_email=alerts_by_email,
+        actionable_buckets=ACTIONABLE_BUCKETS,
+        idle_confirmation=idle_confirmation,
+    )
+    active: set[str] = set(fenced_out)
 
     # HIVE-2862: over-floor waste-holders yield first. A team holding MORE
     # leases than its floor contributes an idle lease only to the pool's loss;
@@ -2391,7 +2441,8 @@ def _yield_unpinned_residents(*, model: str, agents, client, out: dict) -> None:
 def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, actionable_buckets,
                         client: CortexLeaseClient, now: float, apply: bool,
                         workload_by_email=None, unread_by_email=None,
-                        alerts_by_email=None, can_handoff=None) -> dict:
+                        alerts_by_email=None, can_handoff=None,
+                        idle_confirmation=None) -> dict:
     """One model pool tick — see ``reconcile_model_lease``."""
     out = {
         'decision': None,
@@ -2421,6 +2472,17 @@ def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, action
     workload_by_email = workload_by_email or {}
     unread_by_email = unread_by_email or {}
     alerts_by_email = alerts_by_email or {}
+
+    # The board is read ONCE per tick, before worthiness: the holder set is
+    # needed by the worthiness pass (is-current-holder scoping) and reused
+    # downstream — every later lane reads these bindings, never re-fetches.
+    board = client.board(model)
+    if board is None:
+        out['log'].append(f'{model}: cortex lease board unreadable; leaving fleet unchanged')
+        return out
+    current_holder_usernames = {
+        _username_from_principal(principal) for principal in _board_holder_principals(board)
+    }
 
     by_username = {}
     for agent in agents or ():
@@ -2497,13 +2559,8 @@ def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, action
     # its current work within the grace window; past it, the fence drops and
     # scale_plan hibernates it (its queued work re-wakes it when a slot
     # frees). Holders reset their grace on every tick.
-    board = client.board(model)
-    if board is None:
-        out['log'].append(f'{model}: cortex lease board unreadable; leaving fleet unchanged')
-        return out
-    current_holder_usernames = {
-        _username_from_principal(principal) for principal in _board_holder_principals(board)
-    }
+    # The board and holder set were read ONCE above (before worthiness) and
+    # are reused here — no second read this tick.
     active_continuity = active & running
     try:
         admission_now = int((board or {}).get('admission_capacity') or 0)
@@ -3151,13 +3208,41 @@ def _reconcile_one_pool(*, cfg, agents, email_to_teams, workload_by_team, action
             )
             continue
         if len(holder_principals) >= max_holders:
+            # HIVE-3016 leg 1: the reserved/floor preempt runs the SAME
+            # work-never-evicts-work fences as wake_preempt_lease_slot via
+            # the shared helper — candidates must be fresh-idle and carry no
+            # personal signal. Unknown/stale/working holders all fail closed;
+            # no victim means the floor waits for the next free slot.
+            # The runtime-idle fence is INJECTED (review fe6edecb): callers
+            # pass an explicit observation source (tests stub it; production
+            # leaves None to defer to the live runtime check). Resolving into
+            # a new local keeps the a93664c0 UnboundLocalError out.
+            from .management.commands.reconcile_on_demand_agents import (
+                runtime_idle_confirmation as _live_idle_fn,
+            )
+            _idle_fn = idle_confirmation or _live_idle_fn
+            preempt_candidates, preempt_fenced = _holder_working_fences(
+                holder_rows=live_holder_rows,
+                reserved_usernames=reserved_usernames,
+                agent_by_username=by_username,
+                workload_by_email=workload_by_email,
+                unread_by_email=unread_by_email,
+                alerts_by_email=alerts_by_email,
+                actionable_buckets=actionable_buckets,
+                idle_confirmation=_idle_fn,
+            )
+            if preempt_fenced:
+                decisions_log.append(
+                    f'RESERVED GRANT fenced candidates={",".join(sorted(preempt_fenced))} '
+                    f'principal={principal} (fresh-idle/personal-signal/delivery-keep fence)'
+                )
             victim = reserved_preempt_victim(
-                live_holder_rows, reserved_usernames, active=active_continuity,
+                preempt_candidates, reserved_usernames, active=active_continuity,
             )
             if victim is None:
                 decisions_log.append(
                     f'RESERVED GRANT blocked principal={principal} '
-                    f'(no preemptable non-reserved holder)'
+                    f'(no preemptable non-working holder)'
                 )
                 continue
             if apply and callable(revoke_fn):
@@ -3404,7 +3489,8 @@ def reconcile_model_lease(*, agents, email_to_teams, workload_by_team, actionabl
                           client: CortexLeaseClient | None = None, now: float | None = None,
                           apply: bool = False,
                           workload_by_email=None, unread_by_email=None,
-                          alerts_by_email=None, can_handoff=None) -> dict:
+                          alerts_by_email=None, can_handoff=None,
+                          idle_confirmation=None) -> dict:
     """Run one lease tick across ALL configured model pools.
 
     Returns ``{'decision', 'holder', 'scale', 'log', 'pools': [...]}``.
@@ -3456,6 +3542,7 @@ def reconcile_model_lease(*, agents, email_to_teams, workload_by_team, actionabl
             unread_by_email=unread_by_email,
             alerts_by_email=alerts_by_email,
             can_handoff=can_handoff,
+            idle_confirmation=idle_confirmation,
         )
         out['pools'].append(one)
         out['log'].extend(one.get('log') or [])
