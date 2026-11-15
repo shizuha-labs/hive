@@ -3854,10 +3854,17 @@ def _fleet_ssh_init_container(agent: FleetAgent) -> client.V1Container:
 # PLAT-7463: materialize ~/.kube/config referencing the kubelet-managed SA
 # tokenFile. The kubeconfig NEVER embeds bearer bytes — client.authentication
 # style tokenFile reference keeps the credential live-rotating. The workspace
-# PVC is fsGroup-1000; the init runs as root to write into /home/agent/.kube
+# PVC is fsGroup-1000; the init runs as root to write into <workspace>/.kube
 # and chowns it to the agent uid (mirrors the fleet-ssh materialize pattern).
-FLEET_KUBECONFIG_INIT_SCRIPT = r'''set -euo pipefail
-KUBE_DIR=/home/agent/.kube
+# PLAT-10308 path parity: the init container MUST mount the workspace PVC at
+# the SAME path the agent container mounts it (agent.workspace_mount_path,
+# default /home/agent/.shizuha) — mounting the bare /home/agent root while
+# the agent container mounts the .shizuha subpath left the materialized
+# config at /home/agent/.shizuha/.kube/config while KUBECONFIG pointed at
+# /home/agent/.kube/config, which never existed in the agent container.
+def _fleet_kubeconfig_init_script(kube_dir: str) -> str:
+    return r'''set -euo pipefail
+KUBE_DIR=''' + repr(kube_dir) + '''
 mkdir -p "$KUBE_DIR"
 cat > "$KUBE_DIR/config" <<'KCFG'
 apiVersion: v1
@@ -3882,22 +3889,37 @@ chown -R 1000:1000 "$KUBE_DIR"
 chmod 600 "$KUBE_DIR/config"
 '''
 
+
 # Single source of truth for the env var / init name in the cluster-plane
 # kubeconfig contract (PLAT-7463 render, PLAT-10308 converge).
 FLEET_KUBECONFIG_INIT_NAME = 'fleet-kubeconfig-materialize'
 FLEET_KUBECONFIG_ENV_NAME = 'KUBECONFIG'
-FLEET_KUBECONFIG_PATH = '/home/agent/.kube/config'
+# PLAT-10308: the KUBECONFIG target is per-agent — it derives from the
+# agent's workspace mount path so the init write path and the agent-side
+# KUBECONFIG target always resolve to the same PVC volume path.
+FLEET_KUBECONFIG_DEFAULT_WORKSPACE = AGENT_WORKSPACE_CWD
+
+
+def fleet_kubeconfig_dir_for(agent: FleetAgent) -> str:
+    workspace = (getattr(agent, 'workspace_mount_path', None) or FLEET_KUBECONFIG_DEFAULT_WORKSPACE).rstrip('/')
+    return f'{workspace}/.kube'
+
+
+def fleet_kubeconfig_path_for(agent: FleetAgent) -> str:
+    return f'{fleet_kubeconfig_dir_for(agent)}/config'
 
 
 def _fleet_kubeconfig_init_container(agent: FleetAgent) -> client.V1Container:
+    workspace_mount = (getattr(agent, 'workspace_mount_path', None)
+                       or FLEET_KUBECONFIG_DEFAULT_WORKSPACE).rstrip('/')
     return client.V1Container(
         name=FLEET_KUBECONFIG_INIT_NAME,
         image=_resolve_image(agent),
         image_pull_policy=agent.image_pull_policy,
         command=['bash', '-lc'],
-        args=[FLEET_KUBECONFIG_INIT_SCRIPT],
+        args=[_fleet_kubeconfig_init_script(fleet_kubeconfig_dir_for(agent))],
         volume_mounts=[
-            client.V1VolumeMount(name='workspace', mount_path='/home/agent'),
+            client.V1VolumeMount(name='workspace', mount_path=workspace_mount),
         ],
         security_context=client.V1SecurityContext(
             run_as_non_root=False,
@@ -3957,13 +3979,13 @@ def _converge_kubeconfig_env(container, agent: FleetAgent) -> bool:
     if agent.clusterplane_kubeconfig:
         if (
             len(existing) == 1
-            and existing[0].value == FLEET_KUBECONFIG_PATH
+            and existing[0].value == fleet_kubeconfig_path_for(agent)
             and getattr(existing[0], 'value_from', None) is None
         ):
             return False
         container.env = [
             e for e in current_env if e.name != FLEET_KUBECONFIG_ENV_NAME
-        ] + [client.V1EnvVar(name=FLEET_KUBECONFIG_ENV_NAME, value=FLEET_KUBECONFIG_PATH)]
+        ] + [client.V1EnvVar(name=FLEET_KUBECONFIG_ENV_NAME, value=fleet_kubeconfig_path_for(agent))]
         return True
     if not existing:
         return False
@@ -5635,7 +5657,7 @@ def _agent_container(agent: FleetAgent, has_broker: bool = False, has_dind: bool
     # bearer bytes). The init container writes it before the agent starts.
     if agent.clusterplane_kubeconfig:
         env.append(client.V1EnvVar(
-            name=FLEET_KUBECONFIG_ENV_NAME, value=FLEET_KUBECONFIG_PATH,
+            name=FLEET_KUBECONFIG_ENV_NAME, value=fleet_kubeconfig_path_for(agent),
         ))
     model = _resolve_model(agent)
     if model:
