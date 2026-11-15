@@ -869,7 +869,13 @@ export default function Fleet({ embedded = false }) {
             hint={snapshotHint}
             tone={stats.attention ? 'red' : 'gray'}
             active={filters.health === 'needs_help'}
-            onClick={() => setFilter('health', filters.health === 'needs_help' ? 'all' : 'needs_help')}
+            onClick={() => {
+              // HIVE-2910: the strip counts health verdicts (needs_help flag,
+              // degraded runtime, unproven running), not lifecycle Failed/Blocked.
+              // Selecting it must clear the status lane so those agents stay visible.
+              setStatus('all')
+              setFilter('health', filters.health === 'needs_help' ? 'all' : 'needs_help')
+            }}
           />
           <Stat
             icon={Briefcase}
