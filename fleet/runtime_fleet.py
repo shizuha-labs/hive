@@ -85,23 +85,50 @@ def _runtime_timeout() -> float:
     return float(getattr(settings, 'RUNTIME_FLEET_API_TIMEOUT', 3))
 
 
+def _fallback_dict(agent: dict[str, Any]) -> dict[str, Any]:
+    """First modelFallbacks entry, or {}.
+
+    PLAT-13547: a direct DB write stored a list of model-name strings
+    (``['cortex/GLM-5.3-Flash']``). ``.get`` on that string aborted the whole
+    on-demand reconciler. Skip non-dicts and log; do not raise.
+    """
+    raw = agent.get('modelFallbacks') or agent.get('model_fallbacks') or []
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return {}
+    first = raw[0]
+    if isinstance(first, dict):
+        return first
+    logger.warning(
+        'runtime_fleet: skipping non-dict model fallback for %s (%s)',
+        agent.get('username') or agent.get('agent_username') or '?',
+        type(first).__name__,
+    )
+    return {}
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _primary_method(agent: dict[str, Any]) -> str:
     return (
         agent.get('executionMethod')
-        or (agent.get('modelFallbacks') or [{}])[0].get('method')
+        or _fallback_dict(agent).get('method')
         or 'shizuha'
     )
 
 
 def _primary_model(agent: dict[str, Any], method: str) -> str:
-    overrides = agent.get('modelOverrides') or {}
-    fallback = (agent.get('modelFallbacks') or [{}])[0]
+    overrides = _mapping(agent.get('modelOverrides') or agent.get('model_overrides'))
+    fallback = _fallback_dict(agent)
     return overrides.get(method) or fallback.get('model') or agent.get('model') or ''
 
 
 def _primary_reasoning_effort(agent: dict[str, Any], method: str) -> str:
-    overrides = agent.get('modelOverrides') or {}
-    fallback = (agent.get('modelFallbacks') or [{}])[0]
+    overrides = _mapping(agent.get('modelOverrides') or agent.get('model_overrides'))
+    fallback = _fallback_dict(agent)
     return (
         overrides.get(f'{method}_reasoning_effort')
         or fallback.get('reasoningEffort')
@@ -837,7 +864,12 @@ def _apply_cached_runtime_config(agent, updates: dict, save: bool = True) -> Non
     if 'model_fallbacks' in updates:
         agent.model_fallbacks = updates['model_fallbacks'] or []
         if updates['model_fallbacks']:
-            agent.model = (updates['model_fallbacks'][0] or {}).get('model') or agent.model
+            first = updates['model_fallbacks'][0]
+            if isinstance(first, dict):
+                agent.model = first.get('model') or agent.model
+            elif isinstance(first, str) and first:
+                # PLAT-13547: a bare model-name string must not crash the sweep.
+                agent.model = first
     if 'model_overrides' in updates:
         agent.model_overrides = updates['model_overrides'] or {}
     if 'context_prompt' in updates:
