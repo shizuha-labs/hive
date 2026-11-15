@@ -8,12 +8,20 @@ embedded bearer bytes). Unflagged seats render neither — the default stays
 fail-closed. Authorization is NOT granted by the flag (the scoped RBAC is a
 separate declarative grant in the deploy repo).
 """
-from django.test import TestCase, override_settings
+from types import SimpleNamespace
+
+from django.test import SimpleTestCase, TestCase, override_settings
+
+from kubernetes import client as k8s_client
 
 from fleet.models import FleetAgent
 from fleet.provisioner import (
+    FLEET_KUBECONFIG_INIT_NAME,
     FLEET_KUBECONFIG_INIT_SCRIPT,
+    FLEET_KUBECONFIG_PATH,
     _build_pod_spec,
+    _converge_clusterplane_pod_contract,
+    _converge_kubeconfig_env,
     _fleet_kubeconfig_init_container,
 )
 
@@ -71,3 +79,120 @@ class ClusterPlaneKubeconfigRenderTests(TestCase):
     def test_flag_flip_is_model_level_and_defaults_off(self):
         # the migration default is False — existing seats are unaffected.
         self.assertFalse(FleetAgent._meta.get_field('clusterplane_kubeconfig').default)
+
+
+class ClusterPlaneExistingDeploymentConvergeTests(SimpleTestCase):
+    """PLAT-10308: the plane flag landing on a seat whose Deployment already
+    exists — and the hand kubectl-patch ownership problem.
+
+    agent-kai rendered automountServiceAccountToken: false with
+    clusterplane_kubeconfig=True because a 2026-09-20 hand kubectl-patch owned
+    the field in managedFields and the read-modify-replace update path only
+    converged image/resources/lane env. The update path must reconcile the
+    provisioner-owned pod contract (automount + initContainers) and the
+    KUBECONFIG env from the same render the create path uses — in BOTH flag
+    directions.
+    """
+
+    def _spec(self, *, automount=False, init_containers=None):
+        return SimpleNamespace(
+            automount_service_account_token=automount,
+            init_containers=init_containers,
+        )
+
+    def _agent(self, **kw):
+        defaults = dict(
+            agent_username='kai',
+            clusterplane_kubeconfig=True,
+            hostplane_ssh=False,
+            image='localhost:30500/shizuha-agent-runtime:test',
+            image_pull_policy='IfNotPresent',
+        )
+        defaults.update(kw)
+        return SimpleNamespace(**defaults)
+
+    def test_stale_hand_patch_automount_is_reconciled(self):
+        # the exact agent-kai live shape: flag on, automount forced false by a
+        # hand patch, no init container.
+        spec = self._spec(automount=False, init_containers=None)
+        self.assertTrue(_converge_clusterplane_pod_contract(spec, self._agent()))
+        self.assertTrue(spec.automount_service_account_token)
+        self.assertEqual(
+            [c.name for c in spec.init_containers],
+            [FLEET_KUBECONFIG_INIT_NAME],
+        )
+
+    def test_converge_is_idempotent(self):
+        # a converged template must not churn on every reconcile pass.
+        spec = self._spec(automount=False, init_containers=None)
+        agent = self._agent()
+        self.assertTrue(_converge_clusterplane_pod_contract(spec, agent))
+        self.assertFalse(_converge_clusterplane_pod_contract(spec, agent))
+
+    def test_unflag_removes_the_contract(self):
+        # the flag was cleared on a seat provisioned while flagged: the stale
+        # kubeconfig init and the token projection must go (fail-closed Q1a).
+        spec = self._spec(
+            automount=True,
+            init_containers=[k8s_client.V1Container(name=FLEET_KUBECONFIG_INIT_NAME)],
+        )
+        self.assertTrue(_converge_clusterplane_pod_contract(
+            spec, self._agent(clusterplane_kubeconfig=False),
+        ))
+        self.assertFalse(spec.automount_service_account_token)
+        self.assertIsNone(spec.init_containers)
+
+    def test_foreign_inits_are_never_touched(self):
+        # native-runtime release seats carry their own runtime init (and dind/
+        # ssh have their own flows) — the kubeconfig converge must not delete
+        # or reorder them.
+        foreign = [k8s_client.V1Container(name='runtime-init'),
+                   k8s_client.V1Container(name='docker-cli-init')]
+        spec = self._spec(automount=False, init_containers=list(foreign))
+        self.assertTrue(_converge_clusterplane_pod_contract(spec, self._agent()))
+        names = [c.name for c in spec.init_containers]
+        self.assertEqual(names, ['runtime-init', 'docker-cli-init', FLEET_KUBECONFIG_INIT_NAME])
+        # unflag removes only the kubeconfig init, not the foreign ones.
+        spec2 = self._spec(automount=True, init_containers=list(foreign) + [
+            k8s_client.V1Container(name=FLEET_KUBECONFIG_INIT_NAME)])
+        self.assertTrue(_converge_clusterplane_pod_contract(
+            spec2, self._agent(clusterplane_kubeconfig=False)))
+        self.assertEqual([c.name for c in spec2.init_containers],
+                         ['runtime-init', 'docker-cli-init'])
+
+    def _container(self, env):
+        return SimpleNamespace(env=list(env))
+
+    def test_kubeconfig_env_added_on_flagged_seat(self):
+        container = self._container([SimpleNamespace(name='MODEL', value='cortex/grok-4.5')])
+        self.assertTrue(_converge_kubeconfig_env(container, self._agent()))
+        names = [e.name for e in container.env]
+        self.assertIn('MODEL', names)
+        kc = next(e for e in container.env if e.name == 'KUBECONFIG')
+        self.assertEqual(kc.value, FLEET_KUBECONFIG_PATH)
+
+    def test_kubeconfig_env_converge_is_idempotent(self):
+        container = self._container([
+            SimpleNamespace(name='KUBECONFIG', value=FLEET_KUBECONFIG_PATH),
+        ])
+        self.assertFalse(_converge_kubeconfig_env(container, self._agent()))
+
+    def test_stale_kubeconfig_value_is_rewritten(self):
+        container = self._container([
+            SimpleNamespace(name='KUBECONFIG', value='/legacy/kube/config'),
+        ])
+        self.assertTrue(_converge_kubeconfig_env(container, self._agent()))
+        kc = next(e for e in container.env if e.name == 'KUBECONFIG')
+        self.assertEqual(kc.value, FLEET_KUBECONFIG_PATH)
+
+    def test_kubeconfig_env_dropped_on_unflag(self):
+        # absence must be obeyed — a stale KUBECONFIG on an unflagged seat
+        # points kubectl at a config the init container no longer writes.
+        container = self._container([
+            SimpleNamespace(name='KUBECONFIG', value=FLEET_KUBECONFIG_PATH),
+            SimpleNamespace(name='MODEL', value='cortex/grok-4.5'),
+        ])
+        self.assertTrue(_converge_kubeconfig_env(
+            container, self._agent(clusterplane_kubeconfig=False),
+        ))
+        self.assertFalse(any(e.name == 'KUBECONFIG' for e in container.env))

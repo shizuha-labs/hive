@@ -3213,6 +3213,17 @@ def ensure_agent_image(agent: FleetAgent, *, _preserve_native_intent: bool = Fal
                 ))
                 spec.volumes = vols
                 changed = True
+            # PLAT-10308: the SA-token projection and the init containers are
+            # provisioner-owned pod-spec state. A hand kubectl-patch owns them
+            # in managedFields on legacy seats (agent-kai 2026-09-20:
+            # automountServiceAccountToken: false survived every later
+            # provisioner write), and a plane flag flipped after the
+            # Deployment existed never re-rendered them — the read-modify-
+            # replace path only converged image/resources/lane env. Reconcile
+            # them here from the same render the create path uses.
+            spec = deploy.spec.template.spec
+            if _converge_clusterplane_pod_contract(spec, agent):
+                changed = True
             _SIDECAR_MODEL_ENV = {
                 'MODEL', 'SHIZUHA_K8S_PRIMARY_MODEL',
                 'MODEL_FALLBACKS', 'SHIZUHA_MODEL_FALLBACKS',
@@ -3378,6 +3389,13 @@ def ensure_agent_image(agent: FleetAgent, *, _preserve_native_intent: bool = Fal
                     current_env.append(desired_env)
                     changed = True
                 container.env = current_env
+                # PLAT-10308: cluster-plane seats point kubectl at the
+                # init-materialized config. The env must follow the flag in
+                # both directions on seats whose Deployment predates it —
+                # added when flagged, deleted when unflagged — exactly like
+                # the retired MODEL_FALLBACKS lane keys above.
+                if _converge_kubeconfig_env(container, agent):
+                    changed = True
             # A Secret patch is invisible to a running Pod: env vars are resolved
             # once, at container start. Stamping the key's fingerprint on the pod
             # template turns a freshly minted key into a rollout, so the agent
@@ -3864,10 +3882,16 @@ chown -R 1000:1000 "$KUBE_DIR"
 chmod 600 "$KUBE_DIR/config"
 '''
 
+# Single source of truth for the env var / init name in the cluster-plane
+# kubeconfig contract (PLAT-7463 render, PLAT-10308 converge).
+FLEET_KUBECONFIG_INIT_NAME = 'fleet-kubeconfig-materialize'
+FLEET_KUBECONFIG_ENV_NAME = 'KUBECONFIG'
+FLEET_KUBECONFIG_PATH = '/home/agent/.kube/config'
+
 
 def _fleet_kubeconfig_init_container(agent: FleetAgent) -> client.V1Container:
     return client.V1Container(
-        name='fleet-kubeconfig-materialize',
+        name=FLEET_KUBECONFIG_INIT_NAME,
         image=_resolve_image(agent),
         image_pull_policy=agent.image_pull_policy,
         command=['bash', '-lc'],
@@ -3887,6 +3911,64 @@ def _fleet_kubeconfig_init_container(agent: FleetAgent) -> client.V1Container:
             limits={'cpu': '100m', 'memory': '64Mi'},
         ),
     )
+
+
+def _converge_clusterplane_pod_contract(spec, agent: FleetAgent) -> bool:
+    """PLAT-10308: reconcile the cluster-plane pod contract on EXISTING
+    Deployments. The provision/create path renders via _build_pod_spec, but
+    the read-modify-replace update path historically converged only image/
+    resources/lane env — so managedFields ownership from a hand kubectl-patch
+    (or a flag flipped after the Deployment existed) survived every later
+    provisioner write. Returns True when the in-memory spec was corrected.
+
+    Scope note: this converge owns ONLY the kubeconfig materialize init and
+    the SA-token projection. dind/ssh inits and the native-runtime init are
+    owned by their own flows — a wholesale initContainers rewrite here would
+    delete the native runtime init the release path manages.
+    """
+    changed = False
+    desired_automount = bool(agent.clusterplane_kubeconfig)
+    if bool(getattr(spec, 'automount_service_account_token', None) or False) != desired_automount:
+        spec.automount_service_account_token = desired_automount
+        changed = True
+    current_init = list(getattr(spec, 'init_containers', None) or [])
+    kube_inits = [c for c in current_init if c.name == FLEET_KUBECONFIG_INIT_NAME]
+    if agent.clusterplane_kubeconfig:
+        desired_kube_init = _fleet_kubeconfig_init_container(agent)
+        if len(kube_inits) != 1 or kube_inits[0].to_dict() != desired_kube_init.to_dict():
+            spec.init_containers = (
+                [c for c in current_init if c.name != FLEET_KUBECONFIG_INIT_NAME]
+                + [desired_kube_init]
+            )
+            changed = True
+    elif kube_inits:
+        spec.init_containers = (
+            [c for c in current_init if c.name != FLEET_KUBECONFIG_INIT_NAME] or None
+        )
+        changed = True
+    return changed
+
+
+def _converge_kubeconfig_env(container, agent: FleetAgent) -> bool:
+    """PLAT-10308: reconcile the KUBECONFIG env var on the agent container —
+    added when clusterplane_kubeconfig is set, deleted when it is cleared."""
+    current_env = list(getattr(container, 'env', None) or [])
+    existing = [e for e in current_env if e.name == FLEET_KUBECONFIG_ENV_NAME]
+    if agent.clusterplane_kubeconfig:
+        if (
+            len(existing) == 1
+            and existing[0].value == FLEET_KUBECONFIG_PATH
+            and getattr(existing[0], 'value_from', None) is None
+        ):
+            return False
+        container.env = [
+            e for e in current_env if e.name != FLEET_KUBECONFIG_ENV_NAME
+        ] + [client.V1EnvVar(name=FLEET_KUBECONFIG_ENV_NAME, value=FLEET_KUBECONFIG_PATH)]
+        return True
+    if not existing:
+        return False
+    container.env = [e for e in current_env if e.name != FLEET_KUBECONFIG_ENV_NAME]
+    return True
 
 
 def apply_hostplane_ssh(agent: FleetAgent) -> None:
@@ -5553,7 +5635,7 @@ def _agent_container(agent: FleetAgent, has_broker: bool = False, has_dind: bool
     # bearer bytes). The init container writes it before the agent starts.
     if agent.clusterplane_kubeconfig:
         env.append(client.V1EnvVar(
-            name='KUBECONFIG', value='/home/agent/.kube/config',
+            name=FLEET_KUBECONFIG_ENV_NAME, value=FLEET_KUBECONFIG_PATH,
         ))
     model = _resolve_model(agent)
     if model:
