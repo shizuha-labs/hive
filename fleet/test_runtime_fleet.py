@@ -6,7 +6,12 @@ from django.conf import settings
 from django.test import SimpleTestCase, override_settings
 
 from .consumers import _lifecycle_status_from_observation
-from .runtime_fleet import delete_runtime_agent, normalize_runtime_agent, normalize_runtime_config_updates
+from .runtime_fleet import (
+    _primary_model,
+    delete_runtime_agent,
+    normalize_runtime_agent,
+    normalize_runtime_config_updates,
+)
 from .runtime_lane import RuntimeLaneError, resolve_runtime_lane
 
 
@@ -201,6 +206,25 @@ class RuntimeFleetNormalizerTests(SimpleTestCase):
         })
         self.assertEqual(normalized['status'], 'running')
         self.assertEqual(normalized['status_message'], '')
+
+    def test_string_model_fallback_does_not_abort_normalization(self):
+        """PLAT-13547: a list of model-name strings must not raise."""
+        normalized = normalize_runtime_agent({
+            'id': 'agent-nagi',
+            'username': 'nagi',
+            'enabled': True,
+            'status': 'running',
+            'model': 'cortex/GLM-5.3-Flash',
+            'modelFallbacks': ['cortex/GLM-5.3-Flash'],
+        })
+        self.assertEqual(normalized['model'], 'cortex/GLM-5.3-Flash')
+        self.assertEqual(
+            _primary_model(
+                {'modelFallbacks': ['cortex/GLM-5.3-Flash'], 'model': 'kept'},
+                'shizuha',
+            ),
+            'kept',
+        )
 
     def test_stale_fallback_only_update_cannot_derive_primary_model(self):
         """Disabled legacy maps cannot overwrite Hive's explicit primary."""
