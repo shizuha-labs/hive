@@ -22,6 +22,11 @@ REQUIRED_PATTERNS = {
     "bounded bandit deadline": r"timeout -k 30 300 bandit -r",
     "bounded osv deadline": r"timeout -k 30 300 osv-scanner",
     "bounded trivy deadline": r"timeout -k 30 300 trivy fs",
+    "literal trivy cache assignment": r"(?m)^\s*TRIVY_CACHE_DIR=/opt/hostedtoolcache/trivy\s*$",
+    "literal trivy cache mkdir": r'''mkdir -p "\$\{TRIVY_CACHE_DIR\}"''',
+    "literal trivy cache argument": r'''--cache-dir "\$\{TRIVY_CACHE_DIR\}"''',
+    "trivy nonzero hard failure": r'''if \[ "\$\{rc\}" -ne 0 \]; then''',
+    "trivy empty-result hard failure": r'''if \[ ! -s trivy\.json \]; then''',
     "uv lock project guard": r"if \[ -f pyproject\.toml \] && \[ -f uv\.lock \]; then",
     "uv lock non-project skip": r"Skipping uv lock drift check: pyproject\.toml and uv\.lock are not both present\.",
 }
@@ -35,6 +40,10 @@ def validate(workflow: Path, expected_sha256: str | None = None) -> list[str]:
     data = workflow.read_bytes()
     text = data.decode("utf-8")
     errors = [name for name, pattern in REQUIRED_PATTERNS.items() if not re.search(pattern, text)]
+    if re.search(r'''(?:mkdir -p|--cache-dir)\s+["']?["']?\s*(?:\\|$)''', text, re.M):
+        errors.append("blank trivy cache path")
+    if re.search(r'''test\s+-s\s+trivy\.json\s+\|\|\s+echo\s+\{Results:\[\]\}''', text):
+        errors.append("synthetic empty trivy result")
     if text.count('python3 -m pip install "${pip_cache_args[@]}"') < 2:
         errors.append("all in-cluster pip installs use the bounded argument array")
     job_match = re.search(r"(?m)^\s*timeout-minutes:\s*(\d+)\s*$", text)

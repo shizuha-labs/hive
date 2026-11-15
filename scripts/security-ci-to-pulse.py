@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import textwrap
 import time
@@ -19,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -31,6 +33,10 @@ PRIORITY = {"info": "low", "low": "low", "medium": "normal", "moderate": "normal
 # which broke ALL finding filing (the security-ci gate failure). Map the internal
 # rank name to the Pulse enum on the wire; the granular value survives in labels.
 PULSE_SEVERITY = {"info": "info", "low": "info", "medium": "warning", "moderate": "warning", "high": "error", "critical": "critical"}
+SECURITY_WIKI_SPACE_KEY = "SEC"
+SECURITY_WIKI_INDEX_PAGE_ID = "9f584f5b-46a6-4274-bbe3-1e3684e8beb6"
+WIKI_PROJECTION_START = "<!-- security-ci:projection:start -->"
+WIKI_PROJECTION_END = "<!-- security-ci:projection:end -->"
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,15 @@ class Finding:
     def source_id(self) -> str:
         raw = "|".join([self.tool, self.rule, self.path, str(self.line or 0), self.title])
         return "security-ci:" + hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+@dataclass(frozen=True)
+class WikiLedgerResult:
+    ok: bool
+    page_url: str = ""
+    page_id: str = ""
+    error: str = ""
+    action: str = ""
 
 
 def load_json(path: str | None) -> Any:
@@ -201,21 +216,178 @@ def load_allowlist(path: str | None) -> list[dict[str, Any]]:
     return list(data) if isinstance(data, list) else []
 
 
-def allowlisted(f: Finding, entries: list[dict[str, Any]]) -> str | None:
-    for e in entries:
+# PLAT-4772 / Hiro contract: suppressions are fail-closed. A row may suppress a
+# finding only when it carries an exact identity, a *suppressing* disposition,
+# a rationale, typed Security approval provenance, and a non-expired expiry.
+# Unknown/malformed/expired/unauthorized rows never match and are reported
+# loudly. PLAT-4772: bare tool+rule is class-wide and rejected; deferred/open
+# are ledger states, not suppressions; Security identity is exact-match only.
+#
+# Suppressing dispositions (machine allowlist). Ledger may still track
+# deferred/open findings, but those must NOT hide active scan results.
+VALID_SUPPRESSION_DISPOSITIONS = frozenset({
+    "accepted-false-positive",
+    "false-positive",
+    "remediated",
+    "risk-accepted",
+    "wont-fix",
+})
+# Canonical typed Security identities (exact token or email local-part).
+# Substring / regex matching is forbidden — "not-security" must never pass.
+_CANONICAL_SECURITY_IDENTITIES = frozenset({
+    "security",
+    "sec",
+    "security-lead",
+    "sec-lead",
+    "security-team",
+})
+
+
+def _norm_disposition(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-")
+
+
+def _is_security_approver(value: Any) -> bool:
+    """True only for canonical typed Security identities.
+
+    Accepts exact tokens (``security``, ``security-lead``, …) or emails whose
+    local-part (plus-tag stripped) is exactly one of those tokens. Rejects
+    substring spoofs such as ``not-security`` / ``unsecurity@…``.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    if text in _CANONICAL_SECURITY_IDENTITIES:
+        return True
+    if "@" not in text:
+        return False
+    local, _, domain = text.partition("@")
+    local = local.strip()
+    domain = domain.strip()
+    if not local or not domain:
+        return False
+    if "+" in local:
+        local = local.split("+", 1)[0]
+    return local in _CANONICAL_SECURITY_IDENTITIES
+
+
+def _parse_expiry(value: Any) -> datetime | None:
+    """Parse an allowlist expiry. Returns None when missing/unparseable."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    # Date-only → end of that UTC day (inclusive).
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        day = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return day.replace(hour=23, minute=59, second=59)
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def validate_allowlist_entry(entry: Any, *, now: datetime | None = None) -> str | None:
+    """Return a rejection reason, or None when the entry is structurally valid.
+
+    Valid entries still have to *match* a finding before they suppress anything.
+    This gate only decides whether the row is eligible to suppress at all.
+
+    Exact identity (PLAT-4772 / Hiro Architecture): require a stable
+    ``source_id`` **or** a demonstrably path-scoped fingerprint
+    (``tool`` + ``rule`` + non-empty ``path_contains``). Bare ``tool``+``rule``
+    is class-wide and must never suppress.
+    """
+    if not isinstance(entry, dict):
+        return "entry is not an object"
+    source_id = str(entry.get("source_id") or "").strip()
+    tool = str(entry.get("tool") or "").strip()
+    rule = str(entry.get("rule") or "").strip()
+    path_contains = str(entry.get("path_contains") or "").strip()
+    # Exact fingerprint: source_id alone, OR tool+rule+path_contains together.
+    # path_contains alone / bare tool+rule / empty {} never suppress.
+    if source_id:
+        pass  # stable source_id is the preferred exact key
+    elif tool and rule and path_contains:
+        pass  # path-scoped fingerprint (not class-wide)
+    elif tool and rule:
+        return (
+            "missing exact identity (bare tool+rule is class-wide; "
+            "require source_id or tool+rule+path_contains)"
+        )
+    else:
+        return (
+            "missing exact identity "
+            "(require source_id or tool+rule+path_contains)"
+        )
+    reason = str(entry.get("reason") or entry.get("rationale") or "").strip()
+    if not reason:
+        return "missing reason/rationale"
+    owner = str(entry.get("owner") or "").strip()
+    if not owner:
+        return "missing owner"
+    disposition = _norm_disposition(entry.get("disposition"))
+    if not disposition:
+        return "missing disposition"
+    if disposition not in VALID_SUPPRESSION_DISPOSITIONS:
+        # deferred/open are ledger states — they must not hide active findings.
+        return f"invalid disposition {disposition!r} (not a suppressing disposition)"
+    approved_by = entry.get("approved_by") or entry.get("security_approver") or entry.get("approver")
+    if not (_is_security_approver(approved_by) or _is_security_approver(owner)):
+        return "missing Security approval provenance (owner/approved_by must be Security)"
+    expiry_raw = entry.get("expires") or entry.get("expires_at") or entry.get("expiry")
+    if expiry_raw is None or str(expiry_raw).strip() == "":
+        return "missing expiry"
+    expiry = _parse_expiry(expiry_raw)
+    if expiry is None:
+        return f"unparseable expiry {expiry_raw!r}"
+    current = now or datetime.now(timezone.utc)
+    if current > expiry:
+        return f"expired at {expiry.isoformat()}"
+    return None
+
+
+def allowlisted(
+    f: Finding,
+    entries: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    reject_sink: list[str] | None = None,
+) -> str | None:
+    """Return a suppression reason when a *valid* entry matches ``f``.
+
+    Malformed / expired / non-Security-approved rows never suppress. Each
+    rejection is printed to stderr and optionally appended to ``reject_sink``.
+    """
+    for idx, e in enumerate(entries):
+        rejection = validate_allowlist_entry(e, now=now)
+        if rejection is not None:
+            msg = f"allowlist entry[{idx}] rejected (fail-closed, no suppression): {rejection}"
+            print(f"ERROR: {msg}", file=sys.stderr)
+            if reject_sink is not None:
+                reject_sink.append(msg)
+            continue
+        # Fail-closed fence (PLAT-6754 B101 disposition): a non-dict entry is
+        # malformed input, not a fence violation — skip it the same way the
+        # rejected-allowlist neighbors do. (A bare assert vanishes under -O and
+        # crashes the relay otherwise.)
         if not isinstance(e, dict):
             continue
-        if e.get("source_id") and e.get("source_id") != f.source_id:
+        if e.get("source_id") and str(e.get("source_id")) != f.source_id:
             continue
-        if e.get("tool") and e.get("tool") != f.tool:
+        if e.get("tool") and str(e.get("tool")) != f.tool:
             continue
-        if e.get("rule") and e.get("rule") != f.rule:
+        if e.get("rule") and str(e.get("rule")) != f.rule:
             continue
         if e.get("path_contains") and str(e.get("path_contains")) not in f.path:
             continue
-        reason = str(e.get("reason") or "allowlisted")
-        owner = str(e.get("owner") or "unknown")
-        return f"{reason} (owner: {owner})"
+        reason = str(e.get("reason") or e.get("rationale") or "").strip()
+        owner = str(e.get("owner") or "").strip()
+        disposition = _norm_disposition(e.get("disposition"))
+        return f"{reason} (owner: {owner}; disposition: {disposition})"
     return None
 
 
@@ -274,47 +446,275 @@ def pulse_request(method: str, url: str, token: str, body: dict[str, Any] | None
             raise RuntimeError(f"{method} {url} -> {exc.reason}") from exc
 
 
-def pulse_find_existing(api_base: str, token: str, source_id: str) -> dict[str, Any] | None:
-    """Return the existing Pulse item for this finding's stable ``source_id``, if any.
+def normalize_wiki_api_base(raw: str) -> str:
+    base = (raw or "").rstrip("/")
+    if not base:
+        return ""
+    return base if base.endswith("/api") else f"{base}/api"
 
-    PLAT-2688: the previous implementation searched by ``source_id`` and then
-    re-confirmed the match from each returned row's ``source_id``/``description``.
-    But the list endpoint serializes with ``ItemListSerializer``, which exposes
-    NEITHER field — so the per-row check was always False, ``None`` was returned
-    for every finding, and each repeated CI run refiled a duplicate even when an
-    identical-``source_id`` task (including already-accepted ones) existed.
 
-    We instead constrain the query server-side so every returned row is a genuine
-    match and no per-row field inspection is needed:
-      - ``source_id=`` — exact, index-backed filter on ``(source, source_id)``
-        (migration 0005) on Pulse builds that carry the PLAT-2688 filter;
-      - ``search=`` — the ``source_id`` is a unique, namespaced (``security-ci:``)
-        token that appears in the finding's description/comments, so on any build
-        this still limits results to items that actually contain it.
-    Both are AND-combined, so a returned row is authoritative regardless of which
-    filters the backend honors. No ``status`` filter is sent, so matches span ALL
-    statuses (open/accepted/awaiting-merge/rejected/terminal) — repeated runs
-    dedupe against accepted findings and terminal false-positive dispositions
-    rather than refiling.
+def wiki_request(
+    method: str,
+    url: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+    *,
+    organization_id: int = 1,
+) -> Any:
+    """Call Wiki with the same fail-readable transport contract as Pulse."""
+    data = json.dumps(body).encode() if body is not None else None
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise RuntimeError(f"refusing non-HTTP(S) Wiki API URL scheme {scheme!r}")
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Organization-ID": str(organization_id),
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 - scheme validated above
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+        except Exception:
+            pass
+        raise RuntimeError(f"{method} {url} -> HTTP {exc.code}: {detail or exc.reason}") from exc
+
+
+def _wiki_content_json(content: str) -> dict[str, Any]:
+    """Build a readable TipTap document without adding non-stdlib dependencies."""
+    nodes: list[dict[str, Any]] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            nodes.append({"type": "heading", "attrs": {"level": 1},
+                          "content": [{"type": "text", "text": stripped[2:]}]})
+        elif stripped.startswith("## "):
+            nodes.append({"type": "heading", "attrs": {"level": 2},
+                          "content": [{"type": "text", "text": stripped[3:]}]})
+        else:
+            node: dict[str, Any] = {"type": "paragraph"}
+            if line:
+                node["content"] = [{"type": "text", "text": line}]
+            nodes.append(node)
+    return {"type": "doc", "content": nodes}
+
+
+def _wiki_projection(findings: list[Finding], args: argparse.Namespace) -> str:
+    def cell(value: Any, limit: int = 160) -> str:
+        return str(value or "").replace("|", "/").replace("\n", " ")[:limit]
+
+    lines = [
+        WIKI_PROJECTION_START,
+        "## Current scan projection (managed by security-ci)",
+        "",
+        f"Repository: `{args.repo}`  ",
+        f"Scan: `{args.ref}` / `{args.sha or 'N/A'}`  ",
+        f"Run: {args.run_url or 'N/A'}  ",
+        f"Active findings: **{len(findings)}**",
+        "",
+        "This section is derived from the scanner. The checked-in ",
+        "`.security-ci-allowlist.json` is the machine-consumed suppression authority.",
+        "",
+        "| Severity | Tool | Rule | Location | Source ID |",
+        "|---|---|---|---|---|",
+    ]
+    # The Wiki projection is the durable disposition surface, so it must remain
+    # lossless even during a large scanner flood. Let the Wiki write fail loud
+    # (and surface durable-write-failed in Pulse) if its API cannot accept the
+    # complete page rather than silently publishing only a prefix.
+    for finding in sorted(findings, key=lambda f: -SEV_RANK.get(f.severity, 0)):
+        location = cell((finding.path or "") + (f":{finding.line}" if finding.line else ""), 240)
+        lines.append(
+            f"| {cell(finding.severity)} | `{cell(finding.tool)}` | `{cell(finding.rule)}` | "
+            f"`{location}` | `{cell(finding.source_id)}` |"
+        )
+    if not findings:
+        lines.append("| — | — | — | No active findings at filing threshold | — |")
+    lines.append(WIKI_PROJECTION_END)
+    return "\n".join(lines)
+
+
+def _replace_wiki_projection(existing: str, projection: str, repo: str) -> str:
+    if (WIKI_PROJECTION_START in existing) != (WIKI_PROJECTION_END in existing):
+        raise RuntimeError("Wiki projection markers are incomplete; refusing a destructive rewrite")
+    if WIKI_PROJECTION_START in existing and WIKI_PROJECTION_END in existing:
+        before, tail = existing.split(WIKI_PROJECTION_START, 1)
+        _, after = tail.split(WIKI_PROJECTION_END, 1)
+        return before.rstrip() + "\n\n" + projection + after
+    if existing.strip():
+        return existing.rstrip() + "\n\n" + projection
+    return f"# Findings Ledger — `{repo}`\n\n" + projection
+
+
+def wiki_upsert_ledger(
+    api_base: str,
+    token: str,
+    findings: list[Finding],
+    args: argparse.Namespace,
+) -> WikiLedgerResult:
+    """Upsert the derived per-repo projection before Pulse may point at it."""
+    if not api_base or not token:
+        return WikiLedgerResult(ok=False, error="Wiki API URL/token not configured", action="config-missing")
+
+    organization_id = int(getattr(args, "wiki_organization_id", 1) or 1)
+    index_page_id = str(getattr(args, "wiki_index_page_id", "") or SECURITY_WIKI_INDEX_PAGE_ID)
+    try:
+        space = wiki_request(
+            "GET", f"{api_base}/spaces/{SECURITY_WIKI_SPACE_KEY}/", token,
+            organization_id=organization_id,
+        )
+        space_id = str(space.get("id") or "")
+        if not space_id:
+            raise RuntimeError("Security space response did not contain an id")
+
+        repo_slug = args.repo.split("/")[-1]
+        title = f"Findings Ledger — {repo_slug}"
+        query = urllib.parse.urlencode({
+            "space": space_id,
+            "search": title,
+            "page_size": 100,
+        })
+        listed = wiki_request(
+            "GET", f"{api_base}/pages/?{query}", token,
+            organization_id=organization_id,
+        )
+        rows = listed.get("results", []) if isinstance(listed, dict) else listed
+        exact_matches = [row for row in rows or [] if row.get("title") == title]
+        if len(exact_matches) > 1:
+            raise RuntimeError(f"Wiki contains multiple exact pages titled {title!r}")
+        match = exact_matches[0] if exact_matches else None
+        projection = _wiki_projection(findings, args)
+
+        if match:
+            page_id = str(match.get("id") or "")
+            if not page_id:
+                raise RuntimeError("Wiki page search match did not contain an id")
+            detail = wiki_request(
+                "GET", f"{api_base}/pages/{page_id}/", token,
+                organization_id=organization_id,
+            )
+            content = _replace_wiki_projection(str(detail.get("content_text") or ""), projection, args.repo)
+            if content != str(detail.get("content_text") or ""):
+                wiki_request(
+                    "PATCH", f"{api_base}/pages/{page_id}/", token,
+                    {
+                        "content_text": content,
+                        "content_json": _wiki_content_json(content),
+                        "expected_version": int(detail.get("version") or 1),
+                        "status": "published",
+                    },
+                    organization_id=organization_id,
+                )
+                action = "updated"
+            else:
+                action = "unchanged"
+        else:
+            content = _replace_wiki_projection("", projection, args.repo)
+            created = wiki_request(
+                "POST", f"{api_base}/pages/", token,
+                {
+                    "space": space_id,
+                    "parent": index_page_id,
+                    "title": title,
+                    "content_text": content,
+                    "content_json": _wiki_content_json(content),
+                    "status": "published",
+                },
+                organization_id=organization_id,
+            )
+            page_id = str(created.get("id") or "")
+            if not page_id:
+                raise RuntimeError("Wiki page create response did not contain an id")
+            action = "created"
+        return WikiLedgerResult(
+            ok=True,
+            page_url=f"https://wiki.shizuha.com/{page_id}",
+            page_id=page_id,
+            action=action,
+        )
+    except Exception as exc:
+        return WikiLedgerResult(ok=False, error=str(exc)[:500], action="write-failed")
+
+
+def pulse_find_existing_all(api_base: str, token: str, source_id: str) -> list[dict[str, Any]]:
+    """Return EVERY live Pulse item sharing this stable ``source_id`` (PLAT-8903).
+
+    Same server-side constraint as :func:`pulse_find_existing` (index-backed
+    exact match on ``(source, source_id)``, ``include_archived=true`` so a
+    repeated run does not refile a duplicate of an archived row), but returns
+    the full match list instead of silently electing one row. The ledger
+    upsert needs the full set to detect the two-live-rollups ambiguity instead
+    of silently writing one generation (PLAT-8903: the oldest-first election
+    upserted PLAT-4699 — created 2026-07-16 — over the wiki-documented current
+    rollup PLAT-6986 and wrote a fix-branch's stale 12-row posture into it).
     """
     q = urllib.parse.urlencode({
         "source": SECURITY_CI_SOURCE,
         "source_id": source_id,
-        "search": source_id,
         # Also match auto-archived done-category copies — otherwise a repeated
         # run would refile a duplicate of an archived finding.
         "include_archived": "true",
     })
     data = pulse_request("GET", f"{api_base}/items/?{q}", token)
     rows = data.get("results") if isinstance(data, dict) else data
+    matched = []
     for row in rows or []:
         # When the payload exposes source_id, require an exact match; when it does
-        # not (the list serializer), the server-side source_id/search constraint
-        # already guarantees the row contains this unique token — trust it.
+        # not (the list serializer), the server-side source_id constraint already
+        # guarantees the row is this identity — trust it.
         rid = row.get("source_id")
         if rid in (None, source_id) and (row.get("item_key") or row.get("id")):
-            return row
-    return None
+            matched.append(row)
+    if matched:
+        matched.sort(key=lambda row: str(row.get("created_at") or row.get("id") or ""))
+        return matched
+    # Fallback for Pulse builds that ignore the source_id query param.
+    q2 = urllib.parse.urlencode({
+        "source": SECURITY_CI_SOURCE,
+        "search": source_id,
+        "include_archived": "true",
+    })
+    data = pulse_request("GET", f"{api_base}/items/?{q2}", token)
+    rows = data.get("results") if isinstance(data, dict) else data
+    fallback = []
+    for row in rows or []:
+        rid = row.get("source_id")
+        if rid in (None, source_id) and (row.get("item_key") or row.get("id")):
+            fallback.append(row)
+    fallback.sort(key=lambda row: str(row.get("created_at") or row.get("id") or ""))
+    return fallback
+
+
+def pulse_find_existing(api_base: str, token: str, source_id: str) -> dict[str, Any] | None:
+    """Return the existing Pulse item for this finding's stable ``source_id``, if any.
+
+    PLAT-2688: constrain the query server-side with ``source_id=`` (index-backed
+    exact match on ``(source, source_id)``). ItemListSerializer does not expose
+    ``source_id``/``description``, so the match must not depend on per-row fields.
+
+    Do NOT AND ``search=`` with ``source_id=``. Ledger titles are
+    ``[security-ci] Findings ledger — <repo>`` and the description does not
+    contain the token ``security-ci:<repo>:ledger``. AND-combining those filters
+    returned zero rows on every weekly scan and minted a new ledger (live
+    2026-08-29: six open cortex ledgers sharing one source_id). Look up by
+    source_id first; fall back to search only when that filter returns nothing
+    (old Pulse builds without the PLAT-2688 query param).
+
+    PLAT-8903 root cause (documented): this single-row election sorted matches
+    by ``created_at`` ASCENDING and returned the OLDEST row — for the drive
+    ledger that elected the stale generation PLAT-4699 (2026-07-16) over the
+    wiki-documented current rollup PLAT-6986, and a fix-branch scan then wrote
+    its stale posture into it. The ledger path no longer uses this election:
+    :func:`pulse_upsert_ledger` consumes :func:`pulse_find_existing_all` and
+    fails loud on multi-generation ambiguity. The per-finding path keeps the
+    historical first-row behavior (unchanged scope).
+    """
+    return (pulse_find_existing_all(api_base, token, source_id) or [None])[0]
 
 
 def pulse_comment(api_base: str, token: str, item_ref: str, content: str) -> None:
@@ -444,7 +844,13 @@ def pulse_create_or_update_finding(api_base: str, token: str, finding: Finding, 
     return f"created:{ref}"
 
 
-def pulse_upsert_ledger(api_base: str, token: str, findings: list[Finding], args: argparse.Namespace) -> str:
+def pulse_upsert_ledger(
+    api_base: str,
+    token: str,
+    findings: list[Finding],
+    args: argparse.Namespace,
+    wiki_ledger: WikiLedgerResult | None = None,
+) -> str:
     """HIVE-694 (operator 2026-07-12): ONE rolling ledger item per repo instead
     of a Pulse task per finding.
 
@@ -458,9 +864,43 @@ def pulse_upsert_ledger(api_base: str, token: str, findings: list[Finding], args
     Set SECURITY_CI_PER_FINDING=1 to restore the legacy per-finding filing.
     """
     import hashlib
+    # PLAT-8903 (branch posture): a fix-branch scan is BEHIND main — its
+    # finding set is not the repo's stable posture. Writing it into the stable
+    # per-repo rollup advertised stale posture (live: run 5830 on
+    # `fix/security-ci-origin-checkout` wrote a 12-row stale set into the
+    # drive rollup). Branch telemetry stays branch-scoped: the CI run summary
+    # (write_summary) carries it; the stable rollup is only ever written by
+    # scans of the repo's default branch.
+    # PLAT-8903 follow-up: GITHUB_REF arrives fully qualified on scheduled and
+    # push events ("refs/heads/master") and the workflow does not pass --ref,
+    # so args.ref falls back to that env default. Compare the SHORT branch
+    # name: the unqualified comparison classified every scheduled run as a
+    # branch scan and silently skipped the stable rollup forever (the ledger
+    # went stale with no error). Unknown/empty refs still fail closed to the
+    # branch-skip path.
+    normalized_ref = (
+        str(getattr(args, "ref", "") or "")
+        .strip()
+        .lower()
+        .rstrip("/")
+        .removeprefix("refs/heads/")
+        .removeprefix("refs/")
+    )
+    if normalized_ref not in ("main", "master"):
+        print(
+            f"ledger: ref {args.ref!r} is not the default branch — stable rollup "
+            f"for {args.repo} NOT updated (branch posture stays branch-scoped, PLAT-8903)",
+            file=sys.stderr,
+        )
+        return f"ledger-skipped-branch:{args.ref}"
     source_id = f"security-ci:{args.repo}:ledger"
+    wiki_ledger = wiki_ledger or WikiLedgerResult(
+        ok=False, error="Wiki ledger upsert was not attempted", action="not-attempted"
+    )
+    durable_state = "ok" if wiki_ledger.ok else "failed"
     digest = hashlib.sha256(
-        "\n".join(sorted(f"{f.source_id}|{f.severity}" for f in findings)).encode()
+        ("\n".join(sorted(f"{f.source_id}|{f.severity}" for f in findings))
+         + f"\nwiki:{durable_state}:{wiki_ledger.page_id}").encode()
     ).hexdigest()[:12]
     hash_label = f"ledger-hash:{digest}"
     sev_counts: dict[str, int] = {}
@@ -478,31 +918,80 @@ def pulse_upsert_ledger(api_base: str, token: str, findings: list[Finding], args
         ) for f in top
     )
     wiki_slug = args.repo.split("/")[-1]
+    if wiki_ledger.ok:
+        durable_line = (
+            f"- Full ledger, history and remediation notes: "
+            f"[Findings Ledger — {wiki_slug}]({wiki_ledger.page_url})"
+        )
+    else:
+        failure_detail = " ".join(str(wiki_ledger.error or "unknown error").split())
+        failure_detail = failure_detail.replace("`", "'")[:240]
+        durable_line = (
+            "- Durable ledger projection: **FAILED** (`durable-write-failed`). "
+            f"No wiki pointer was emitted; Security owns recovery. "
+            f"Action: `{wiki_ledger.action or 'unknown'}`; error: `{failure_detail}`."
+        )
     description = "\n".join([
         f"Rolling security-findings ledger for `{args.repo}` (weekly scheduled scan; HIVE-694 rollup mode).",
         "",
         f"- Open findings: **{len(findings)}** ({counts_md})",
         f"- Last scan: `{args.ref}` / `{args.sha or 'N/A'}` — {args.run_url or 'N/A'}",
-        f"- Full ledger, history and remediation notes: **wiki → Security → Findings Ledger — {wiki_slug}**",
+        durable_line,
         f"- Ledger hash: `{digest}`",
         "",
         "This item is UPDATED IN PLACE by security-ci; do not file per-finding tasks from it wholesale.",
         "Pick up a finding → create a scoped remediation task (or batch-PR task per repo for dep advisories),",
-        "record the disposition on the wiki ledger page, and suppress accepted false-positives via",
-        "`.security-ci-allowlist.json`.",
+        "record the disposition in the checked-in `.security-ci-allowlist.json` via Security-reviewed PR;",
+        "the wiki page is a derived human-readable projection, never the suppression authority.",
         "",
         "| Severity | Tool | Rule | Location | Source ID |",
         "|---|---|---|---|---|",
         rows or "| — | — | — | (no findings at/above filing threshold) | — |",
     ])
     max_sev = max((f.severity for f in findings), key=lambda s: SEV_RANK.get(s, 0), default="low")
-    existing = pulse_find_existing(api_base, token, source_id)
+    matches = pulse_find_existing_all(api_base, token, source_id)
+    # PLAT-8903 (one stable rollup per repo): with multiple items sharing the
+    # ledger source_id, NO silent election is contract-safe — created_at
+    # ordering elected the stale generation (PLAT-4699 over PLAT-6986), and
+    # open-status ordering would have done the same here (the stale generation
+    # is the OPEN one; the wiki-current rollup is completed). The signals
+    # conflict, so ambiguity fails LOUD: no write, non-zero exit via
+    # RuntimeError — the workflow retry/notifier owns recovery and Security
+    # reconciles the pair (cancel the stale generation). Only an all-done-
+    # category match set (pure archived history) is unambiguous: keep updating
+    # the most recently created generation.
+    if len(matches) > 1:
+        done_rows = [m for m in matches if (m.get("status_category") or "") == "done"]
+        if len(done_rows) != len(matches):
+            detail = "; ".join(
+                f"{m.get('item_key') or m.get('id')} (status={m.get('status')}, "
+                f"category={m.get('status_category')}, created={m.get('created_at')})"
+                for m in matches
+            )
+            raise RuntimeError(
+                f"security-ci ledger ambiguity for {args.repo}: {len(matches)} live items "
+                f"share source_id `{source_id}` — the one-stable-per-repo-rollup contract "
+                f"(HIVE-694 / PLAT-4772) is violated and no silent election is safe "
+                f"(PLAT-8903). NO posture was written. Reconcile: cancel/park the "
+                f"stale-generation item(s) so exactly one rollup remains, then re-run. "
+                f"Matches: {detail}"
+            )
+        # All-done match set = pure archived history: unambiguous. Keep updating
+        # the MOST RECENTLY created generation (matches is created_at-ascending).
+        existing = matches[-1]
+    else:
+        existing = matches[0] if matches else None
     if existing:
         ref = str(existing.get("item_key") or existing.get("id"))
         labels = [l for l in (existing.get("labels") or []) if isinstance(l, str)]
         if hash_label in labels:
             return f"ledger-unchanged:{ref}"
-        new_labels = [l for l in labels if not l.startswith("ledger-hash:")] + [hash_label]
+        new_labels = [
+            l for l in labels
+            if not l.startswith("ledger-hash:") and l != "durable-write-failed"
+        ] + [hash_label]
+        if not wiki_ledger.ok:
+            new_labels.append("durable-write-failed")
         try:
             pulse_request("PATCH", f"{api_base}/items/{existing.get('id') or ref}/", token,
                           {"description": description, "labels": new_labels,
@@ -510,8 +999,37 @@ def pulse_upsert_ledger(api_base: str, token: str, findings: list[Finding], args
                            "append_origin_observations": [origin_observation(args)]})
             return f"ledger-updated:{ref}"
         except Exception as exc:
-            # PATCH rejected → one compact refresh comment (still no per-finding spam).
+            # PATCH rejected. When Wiki delivery already failed, a bare refresh
+            # comment would drop the durable-write-failed signal and leave the
+            # prior dead pointer/description in place while main() exits 0 —
+            # unbounded, uninformative telemetry (PLAT-4772 P1). Persist an
+            # explicit failure comment when possible, then always propagate so
+            # main() returns 2 and the workflow retry/notifier owns recovery.
             print(f"WARN: ledger PATCH failed for {ref}: {exc}", file=sys.stderr)
+            if not wiki_ledger.ok:
+                failure_detail = " ".join(str(wiki_ledger.error or "unknown error").split())
+                failure_detail = failure_detail.replace("`", "'")[:240]
+                comment = (
+                    f"durable-write-failed: Wiki ledger delivery failed "
+                    f"(action=`{wiki_ledger.action or 'unknown'}`; error=`{failure_detail}`); "
+                    f"Pulse PATCH also failed (`{exc}`); "
+                    f"{len(findings)} open finding(s) ({counts_md}); hash `{digest}`. "
+                    f"run: {args.run_url or 'N/A'}"
+                )
+                try:
+                    pulse_comment(api_base, token, ref, comment)
+                except Exception as comment_exc:
+                    print(
+                        f"ERROR: could not post durable-write-failed comment for {ref}: "
+                        f"{comment_exc}",
+                        file=sys.stderr,
+                    )
+                raise RuntimeError(
+                    f"Wiki ledger failed ({wiki_ledger.action or 'unknown'}: "
+                    f"{wiki_ledger.error or 'unknown'}); "
+                    f"Pulse PATCH failed for {ref}: {exc}"
+                ) from exc
+            # Wiki ok — keep the compact non-spammy refresh comment fallback.
             pulse_comment(api_base, token, ref,
                           f"Ledger refresh — {len(findings)} open finding(s) ({counts_md}); hash `{digest}`. "
                           f"See item description staleness note; run: {args.run_url or 'N/A'}")
@@ -528,7 +1046,8 @@ def pulse_upsert_ledger(api_base: str, token: str, findings: list[Finding], args
         "source_id": source_id,
         "source_url": args.run_url or "",
         "metadata": {"origin_observations": [origin_observation(args)]},
-        "labels": ["security-ci", "security-ci:ledger", f"repo:{args.repo}", hash_label],
+        "labels": (["security-ci", "security-ci:ledger", f"repo:{args.repo}", hash_label]
+                   + ([] if wiki_ledger.ok else ["durable-write-failed"])),
         "assignee_id": None,
     }
     if args.project_id:
@@ -643,6 +1162,13 @@ def main() -> int:
     ap.add_argument("--pulse-api-url", default=os.environ.get("PULSE_API_URL", ""))
     ap.add_argument("--pulse-token", default=os.environ.get("PULSE_TOKEN", ""))
     ap.add_argument("--project-id", default=os.environ.get("PULSE_PROJECT_ID", ""))
+    ap.add_argument("--wiki-api-url", default=os.environ.get("WIKI_API_URL", ""))
+    ap.add_argument("--wiki-token", default=os.environ.get("WIKI_TOKEN", ""))
+    ap.add_argument("--wiki-organization-id", type=int, default=int(os.environ.get("WIKI_ORGANIZATION_ID", "1")))
+    ap.add_argument(
+        "--wiki-index-page-id",
+        default=os.environ.get("SECURITY_CI_WIKI_INDEX_PAGE_ID", SECURITY_WIKI_INDEX_PAGE_ID),
+    )
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--fail-on", default=os.environ.get("SECURITY_CI_FAIL_ON", "high"), choices=sorted(SEV_RANK))
     args = ap.parse_args()
@@ -665,7 +1191,28 @@ def main() -> int:
         old = by_id.get(f.source_id)
         if not old or SEV_RANK[f.severity] > SEV_RANK[old.severity]:
             by_id[f.source_id] = f
-    all_findings = sorted(by_id.values(), key=lambda f: (-SEV_RANK[f.severity], f.tool, f.path, f.line or 0))
+    raw_identities = sorted(
+        by_id.values(),
+        key=lambda f: (-SEV_RANK[f.severity], f.tool, f.path, f.line or 0),
+    )
+
+    # PLAT-5289: suppressions must be evaluated against the same stable
+    # identities that are filed/upserted. Dependency scanners mint per-advisory
+    # identities, while consolidate_dependency_findings() mints the final
+    # package identity consumed by Pulse and the findings ledger. Normalize all
+    # severities before the allowlist pass so low/medium dependency suppressions
+    # receive the same coverage as high/critical ones. Code SAST findings are
+    # passthrough identities, preserving their existing allowlist behaviour.
+    all_findings = sorted(
+        consolidate_dependency_findings(raw_identities, args.repo),
+        key=lambda f: (-SEV_RANK[f.severity], f.tool, f.path, f.line or 0),
+    )
+    if len(all_findings) != len(raw_identities):
+        print(
+            f"security-ci: normalized {len(raw_identities)} raw finding(s) → "
+            f"{len(all_findings)} stable finding identity/identities after "
+            "per-package dedup (PLAT-2893)"
+        )
 
     entries = load_allowlist(args.allowlist)
     findings: list[Finding] = []
@@ -705,6 +1252,7 @@ def main() -> int:
             return 2
     can_post = posting_requested
     post_errors = 0
+    ledger_delivery_failed = False
     # 2026-07-03 flood post-mortem: filing EVERY finding created 646 Pulse tasks
     # in one day (105x bandit try/except-pass, 82x assert — style nits as tasks).
     # Only findings at/above SECURITY_CI_MIN_FILE_SEVERITY (default: high) become
@@ -712,13 +1260,10 @@ def main() -> int:
     file_min = SEV_RANK[os.environ.get("SECURITY_CI_MIN_FILE_SEVERITY", "high")]
     below = [f for f in findings if SEV_RANK[f.severity] < file_min]
     at_or_above = [f for f in findings if SEV_RANK[f.severity] >= file_min]
-    # PLAT-2893: collapse N-advisories-for-one-package into ONE task per package
-    # (osv/trivy dep CVEs) before filing; code SAST findings pass through.
-    pre_consolidation = len(at_or_above)
-    to_file = consolidate_dependency_findings(at_or_above, args.repo)
-    if len(to_file) != pre_consolidation:
-        print(f"security-ci: consolidated {pre_consolidation} finding(s) → {len(to_file)} "
-              f"task(s) after per-package dedup (PLAT-2893)")
+    # Findings already carry their final filing identities. Do not consolidate
+    # again after severity filtering: doing so would make allowlist coverage
+    # depend on SECURITY_CI_MIN_FILE_SEVERITY.
+    to_file = at_or_above
     if below:
         print(f"security-ci: {len(below)} finding(s) below the filing threshold — tracked in summary only, not filed to Pulse")
 
@@ -741,11 +1286,33 @@ def main() -> int:
         else:
             # HIVE-694 default: ONE rolling ledger item per repo, updated in place.
             try:
-                print(f"pulse ledger: {pulse_upsert_ledger(api_base, args.pulse_token, to_file, args)}")
+                wiki_base = normalize_wiki_api_base(args.wiki_api_url)
+                wiki_ledger = wiki_upsert_ledger(wiki_base, args.wiki_token, to_file, args)
+                if wiki_ledger.ok:
+                    print(f"wiki ledger: {wiki_ledger.action}:{wiki_ledger.page_id}")
+                else:
+                    print(
+                        f"ERROR: Wiki ledger upsert failed ({wiki_ledger.action}): "
+                        f"{wiki_ledger.error}",
+                        file=sys.stderr,
+                    )
+                print(
+                    f"pulse ledger: "
+                    f"{pulse_upsert_ledger(api_base, args.pulse_token, to_file, args, wiki_ledger)}"
+                )
             except Exception as exc:
                 print(f"ERROR: Pulse ledger upsert failed: {exc}", file=sys.stderr)
+                # The Wiki failure signal itself is delivered through Pulse. If
+                # that durable sink is unavailable, fail the process so the
+                # workflow's bounded retry and Origin run notifier become the
+                # independent fail-loud path instead of losing the incident in
+                # an otherwise-green CI log.
+                ledger_delivery_failed = True
     elif findings:
         print("security-ci: Pulse posting skipped (dry-run or PULSE_URL/PULSE_API_URL/PULSE_TOKEN missing)")
+
+    if ledger_delivery_failed:
+        return 2
 
     threshold = SEV_RANK[args.fail_on]
     blocking = [f for f in findings if SEV_RANK[f.severity] >= threshold]
