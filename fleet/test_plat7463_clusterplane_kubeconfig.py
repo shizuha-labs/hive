@@ -17,12 +17,12 @@ from kubernetes import client as k8s_client
 from fleet.models import FleetAgent
 from fleet.provisioner import (
     FLEET_KUBECONFIG_INIT_NAME,
-    FLEET_KUBECONFIG_INIT_SCRIPT,
-    FLEET_KUBECONFIG_PATH,
     _build_pod_spec,
     _converge_clusterplane_pod_contract,
     _converge_kubeconfig_env,
     _fleet_kubeconfig_init_container,
+    _fleet_kubeconfig_init_script,
+    fleet_kubeconfig_path_for,
 )
 
 
@@ -54,15 +54,16 @@ class ClusterPlaneKubeconfigRenderTests(TestCase):
         init_names = [c.name for c in (spec.init_containers or [])]
         self.assertIn('fleet-kubeconfig-materialize', init_names)
         init = next(c for c in spec.init_containers if c.name == 'fleet-kubeconfig-materialize')
-        self.assertIn('tokenFile', FLEET_KUBECONFIG_INIT_SCRIPT)
-        self.assertNotIn('token: ey', FLEET_KUBECONFIG_INIT_SCRIPT)  # no embedded bearer
+        script = init.args[0]
+        self.assertIn('tokenFile', script)
+        self.assertNotIn('token: ey', script)  # no embedded bearer
         # the materialized config lands on the workspace PVC (durable)
         mounts = [m.name for m in init.volume_mounts]
         self.assertIn('workspace', mounts)
         # the agent container points kubectl at the materialized config
         agent_container = next(c for c in spec.containers if c.name == 'agent')
         kubeconfig_env = next(e for e in agent_container.env if e.name == 'KUBECONFIG')
-        self.assertEqual(kubeconfig_env.value, '/home/agent/.kube/config')
+        self.assertEqual(kubeconfig_env.value, fleet_kubeconfig_path_for(agent))
 
     def test_init_container_runs_as_root_only_to_chown_workspace_write(self):
         # the materialize init needs root solely to write/chown the fsGroup-1000
@@ -169,11 +170,11 @@ class ClusterPlaneExistingDeploymentConvergeTests(SimpleTestCase):
         names = [e.name for e in container.env]
         self.assertIn('MODEL', names)
         kc = next(e for e in container.env if e.name == 'KUBECONFIG')
-        self.assertEqual(kc.value, FLEET_KUBECONFIG_PATH)
+        self.assertEqual(kc.value, fleet_kubeconfig_path_for(self._agent()))
 
     def test_kubeconfig_env_converge_is_idempotent(self):
         container = self._container([
-            SimpleNamespace(name='KUBECONFIG', value=FLEET_KUBECONFIG_PATH),
+            SimpleNamespace(name='KUBECONFIG', value=fleet_kubeconfig_path_for(self._agent())),
         ])
         self.assertFalse(_converge_kubeconfig_env(container, self._agent()))
 
@@ -183,13 +184,13 @@ class ClusterPlaneExistingDeploymentConvergeTests(SimpleTestCase):
         ])
         self.assertTrue(_converge_kubeconfig_env(container, self._agent()))
         kc = next(e for e in container.env if e.name == 'KUBECONFIG')
-        self.assertEqual(kc.value, FLEET_KUBECONFIG_PATH)
+        self.assertEqual(kc.value, fleet_kubeconfig_path_for(self._agent()))
 
     def test_kubeconfig_env_dropped_on_unflag(self):
         # absence must be obeyed — a stale KUBECONFIG on an unflagged seat
         # points kubectl at a config the init container no longer writes.
         container = self._container([
-            SimpleNamespace(name='KUBECONFIG', value=FLEET_KUBECONFIG_PATH),
+            SimpleNamespace(name='KUBECONFIG', value='/home/agent/.kube/config'),
             SimpleNamespace(name='MODEL', value='cortex/grok-4.5'),
         ])
         self.assertTrue(_converge_kubeconfig_env(
