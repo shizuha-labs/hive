@@ -206,5 +206,60 @@ class TestMainBaselineGuard(unittest.TestCase):
         self.assertEqual(rc, 4)
 
 
+
+class TestCommittedBaselineArtifact(unittest.TestCase):
+    """Pins the committed k8s/rbac-drift-baseline.json to the intended posture.
+
+    Context: 2026-11-14 origin-outage remediation — the operator intentionally
+    REMOVED the `origin-ci-plat6638-netpol-create` RoleBinding in the `origin`
+    namespace (origin-ci-deployer is now limited to get/list netpols there).
+    The daily audit paged on the stale baseline (run 4175, 2026-11-16); this
+    artifact was renewed surgically because the fail-loud payload named the
+    full delta (removed=that entry, narrowed=[]). These assertions are
+    fail-loud against accidental re-introduction or wider deletions.
+    """
+
+    ARTIFACT = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "k8s", "rbac-drift-baseline.json",
+    )
+
+    def load(self):
+        return audit.load_baseline(self.ARTIFACT)
+
+    def test_artifact_parses(self):
+        d = self.load()
+        self.assertEqual(d["schema"], "shizuha.rbac-drift-baseline.v1")
+        self.assertEqual(set(d["identities"]), {"build:hive-ci-deployer", "build:origin-ci-deployer"})
+
+    def test_origin_netpol_create_not_reintroduced(self):
+        d = self.load()
+        entries = d["identities"]["build:hive-ci-deployer"]
+        self.assertEqual(
+            [e for e in entries
+             if e["bindingName"] == "origin-ci-plat6638-netpol-create"
+             and e["bindingNamespace"] == "origin"],
+            [],
+            "origin-ns origin-ci-plat6638-netpol-create was intentionally removed "
+            "by the operator (2026-11-14 origin outage remediation) — do not "
+            "blind-restore it",
+        )
+
+    def test_remaining_netpol_create_grants_intact(self):
+        d = self.load()
+        entries = d["identities"]["build:hive-ci-deployer"]
+        namespaced = sorted(
+            e["bindingNamespace"] for e in entries
+            if e["bindingName"] == "origin-ci-plat6638-netpol-create"
+            and e["bindingNamespace"] != ""
+        )
+        self.assertEqual(
+            namespaced,
+            ["ai-models", "kura", "mail-edge", "monitoring", "staging"],
+            "exactly the five still-intended netpol-create lane grants must "
+            "remain in the baseline",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

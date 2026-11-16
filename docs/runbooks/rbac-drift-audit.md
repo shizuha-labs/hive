@@ -46,6 +46,23 @@ python -m security.rbac_drift_audit --capture k8s/rbac-drift-baseline.json
 Run on a seat with cluster access, commit the updated baseline. Growth
 (more bindings/verbs) does not fire the alert; only removal or narrowing does.
 
+### Surgical renewal (no live re-capture available)
+
+When the fail-loud payload names the complete delta (removed list + empty
+narrowed list) and the removal is an attributed intentional operator action,
+the artifact may be renewed surgically on a branch: remove exactly the named
+entries, keep everything else. Requires (all in the same PR):
+
+1. the attributed action log/attribution for the removal (who/why), and
+2. a `TestCommittedBaselineArtifact`-style regression test pinning the
+   renewed posture, fail-loud against re-introduction or wider deletions.
+
+The next audit run verifies from the live surface; if the surgical edit was
+wrong, the job pages again (fail-loud). Precedent: run 4175 (2026-11-16)
+paged on the `origin`-namespace `origin-ci-plat6638-netpol-create` removal
+from the 2026-11-14 origin-outage remediation; the five remaining lane
+grants (ai-models, kura, mail-edge, monitoring, staging) stayed intact.
+
 ## Acceptance provenance
 
 - Unit leg (`security.tests.test_rbac_drift_audit`) proves: a deliberately
