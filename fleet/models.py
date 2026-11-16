@@ -3083,3 +3083,14 @@ class LeaseCriticalTeamPolicy(models.Model):
     def __str__(self):
         state = 'enabled' if self.enabled else 'disabled'
         return f'LeaseCriticalTeamPolicy({self.team_slug}, min={self.min_leases}, {state})'
+
+
+# PLAT-9124: register the runtime-metering outbox models with the fleet app
+# registry. They live in fleet/runtime_metering/models.py to keep the metering
+# slice self-contained; Django only autodiscovers this module, so import them
+# here — without this, makemigrations sees migration 0066's tables as
+# orphaned and generates a spurious "delete model" migration.
+from fleet.runtime_metering.models import (  # noqa: E402,F401
+    RuntimeMeterCheckpoint,
+    RuntimeUsageOutbox,
+)
