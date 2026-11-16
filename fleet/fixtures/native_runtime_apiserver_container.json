@@ -313,6 +313,11 @@
         "mountPath": "/run/shizuha/mcp-projection",
         "name": "mcp-projection-keyring",
         "readOnly": true
+      },
+      {
+        "name": "workspace",
+        "mountPath": "/home/agent/.config/shizuha/logs",
+        "subPath": "agent-logs"
       }
     ]
   },

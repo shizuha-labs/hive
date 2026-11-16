@@ -2670,6 +2670,84 @@ def _replace_native_runtime(agent, core, apps, proposed, original, authority, *,
     return True
 
 
+NATIVE_LOG_MOUNT_PATH = '/home/agent/.config/shizuha/logs'
+NATIVE_LOG_SUB_PATH = 'agent-logs'
+NATIVE_LOG_INIT_NAME = 'agent-logs-materialize'
+
+
+def _native_log_contract_drifted(spec, agent: FleetAgent) -> bool:
+    """PLAT-9847 (rei P1): whether an EXISTING native template carries the
+    persistent-log contract. Fresh rendering always emits the agent-logs
+    subPath mount and the materialize init (PLAT-9847 ad0ddf64); legacy or
+    pre-contract Deployments lack both, so their seats stay ephemeral even
+    after image/runtime reconciliation. Missing agent container is drift
+    (fail closed into the retry path)."""
+    containers = list(getattr(spec, 'containers', None) or [])
+    container = next(
+        (item for item in containers if item.name in {'agent', agent.agent_username}),
+        None,
+    )
+    if container is None:
+        return True
+    mounts = list(getattr(container, 'volume_mounts', None) or [])
+    has_mount = any(
+        getattr(mount, 'name', '') == 'workspace'
+        and getattr(mount, 'mount_path', '') == NATIVE_LOG_MOUNT_PATH
+        and getattr(mount, 'sub_path', '') == NATIVE_LOG_SUB_PATH
+        for mount in mounts
+    )
+    inits = list(getattr(spec, 'init_containers', None) or [])
+    has_init = any(
+        getattr(init, 'name', '') == NATIVE_LOG_INIT_NAME for init in inits
+    )
+    return not (has_mount and has_init)
+
+
+def _converge_native_log_contract(spec, container, agent: FleetAgent) -> bool:
+    """PLAT-9847 (rei P1): apply the persistent-log contract to an EXISTING
+    native template in place — the workspace PVC volume, the agent-logs
+    subPath mount, and the materialize init — returning whether anything
+    changed. Runs inside the established idle/lease-fenced replace path
+    (``_replace_native_runtime`` with ``require_start_lease``), and the init
+    script itself is the reviewed prior-log-preserving one (mkdir semantics,
+    never rm), so existing log history survives convergence. Idempotent: a
+    converged template triggers no further change."""
+    changed = False
+    vols = list(getattr(spec, 'volumes', None) or [])
+    vol_names = {getattr(volume, 'name', '') for volume in vols}
+    if 'workspace' not in vol_names:
+        vols.append(client.V1Volume(
+            name='workspace',
+            persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                claim_name=agent.workspace_pvc_name,
+            ),
+        ))
+        spec.volumes = vols
+        changed = True
+    mounts = list(getattr(container, 'volume_mounts', None) or [])
+    if not any(
+        getattr(mount, 'name', '') == 'workspace'
+        and getattr(mount, 'mount_path', '') == NATIVE_LOG_MOUNT_PATH
+        and getattr(mount, 'sub_path', '') == NATIVE_LOG_SUB_PATH
+        for mount in mounts
+    ):
+        mounts.append(client.V1VolumeMount(
+            name='workspace', mount_path=NATIVE_LOG_MOUNT_PATH,
+            sub_path=NATIVE_LOG_SUB_PATH,
+        ))
+        container.volume_mounts = mounts
+        changed = True
+    inits = list(getattr(spec, 'init_containers', None) or [])
+    if not any(
+        getattr(init, 'name', '') == NATIVE_LOG_INIT_NAME for init in inits
+    ):
+        # Fresh render places the logs init first; keep that ordering so a
+        # converged template matches a freshly rendered one exactly.
+        spec.init_containers = [_agent_logs_init_container(agent)] + inits
+        changed = True
+    return changed
+
+
 def native_agent_runtime_contract_drift(agent: FleetAgent, target_image: str) -> bool:
     """Return whether a Hive-native Deployment misses its managed contract.
 
@@ -2726,6 +2804,10 @@ def native_agent_runtime_contract_drift(agent: FleetAgent, target_image: str) ->
             # A sidecar alone is not a working broker. Keep incomplete legacy
             # consumers in the existing idle-fenced reconciliation path.
             or _broker_contract_drifted(deploy.spec.template.spec, container, agent)
+            # PLAT-9847 (rei P1): a native template without the persistent-log
+            # contract is drift — existing seats must converge, not just fresh ones.
+            or _native_log_contract_drifted(deploy.spec.template.spec, agent)
+            # PLAT-12035: reconnect-state volume drift joins the same probe.
             or _reconnect_state_volume_drifted(deploy.spec.template.spec, container)
             or placement_drift
         )
@@ -3307,6 +3389,14 @@ def ensure_agent_image(agent: FleetAgent, *, _preserve_native_intent: bool = Fal
                     agent, has_broker=has_broker, has_dind=has_dind,
                     forgejo_secret_name=forgejo_secret_name,
                 )
+                # PLAT-9847 (rei P1): EXISTING templates converge to the
+                # persistent-log contract alongside the other managed fields —
+                # the drift probe above flags missing mount/init, and this
+                # applies them inside the same idle/lease-fenced replace path.
+                if _converge_native_log_contract(
+                    deploy.spec.template.spec, container, agent,
+                ):
+                    changed = True
                 if has_broker:
                     try:
                         if _converge_broker_consumer_contract(container, desired_container):
@@ -3888,6 +3978,41 @@ KCFG
 chown -R 1000:1000 "$KUBE_DIR"
 chmod 600 "$KUBE_DIR/config"
 '''
+
+
+# PLAT-9847: the agent-logs subPath directory must exist and be owned by the
+# agent (uid 1000) before any container mounts it — kubelet-created subPath
+# dirs are root-owned and fsGroup does not chown subPaths, which would leave
+# the logger unable to create its file (EACCES) on a fresh PVC. Mirrors the
+# legacy lane's workspace-permissions init, scoped to just the log dir.
+FLEET_AGENT_LOGS_INIT_SCRIPT = """set -euo pipefail
+mkdir -p /home/agent/.shizuha/agent-logs
+chown 1000:1000 /home/agent/.shizuha/agent-logs
+"""
+
+
+def _agent_logs_init_container(agent: FleetAgent) -> client.V1Container:
+    return client.V1Container(
+        name='agent-logs-materialize',
+        image=_resolve_image(agent),
+        image_pull_policy=agent.image_pull_policy,
+        command=['bash', '-lc'],
+        args=[FLEET_AGENT_LOGS_INIT_SCRIPT],
+        volume_mounts=[
+            client.V1VolumeMount(name='workspace', mount_path='/home/agent/.shizuha'),
+        ],
+        security_context=client.V1SecurityContext(
+            run_as_non_root=False,
+            run_as_user=0,
+            run_as_group=0,
+            allow_privilege_escalation=False,
+            capabilities=client.V1Capabilities(drop=['ALL'], add=['CHOWN', 'FOWNER', 'DAC_OVERRIDE']),
+        ),
+        resources=client.V1ResourceRequirements(
+            requests={'cpu': '10m', 'memory': '32Mi'},
+            limits={'cpu': '100m', 'memory': '64Mi'},
+        ),
+    )
 
 
 # Single source of truth for the env var / init name in the cluster-plane
@@ -5773,6 +5898,18 @@ def _agent_container(agent: FleetAgent, has_broker: bool = False, has_dind: bool
         client.V1VolumeMount(name='workspace', mount_path=agent.workspace_mount_path),
         # PLAT-12035: writable reconnect-state snapshots (see constant note).
         client.V1VolumeMount(name=MCP_RECONNECT_STATE_VOLUME, mount_path=MCP_RECONNECT_STATE_DIR),
+        # PLAT-9847 (PLAT-8958 regression): the agent's structured log
+        # (~/.config/shizuha/logs/shizuha.log, SCLI-410 file-only sink) was
+        # container-ephemeral on native seats — every Recreate rotation erased the
+        # failure window. Mount the workspace PVC at the log dir via the agent-logs
+        # subPath (same shape as the reviewed legacy controller lane,
+        # hive-runtime k8s-backend.ts) so the log survives the restart that ends
+        # it. Growth is bounded by the logger's own RotatingFileStream
+        # (SHIZUHA_LOG_MAX_BYTES x SHIZUHA_LOG_MAX_FILES, 5MiB x 5 default).
+        client.V1VolumeMount(
+            name='workspace', mount_path='/home/agent/.config/shizuha/logs',
+            sub_path='agent-logs',
+        ),
     ]
     if agent.shared_workspace:
         # PLAT-1056: fleet-wide RWX PVC for cross-agent file handoff
@@ -6089,7 +6226,11 @@ def _build_pod_spec(agent: FleetAgent, *, forgejo_secret_name: str | None = None
             }),
         ),
         init_containers=(
-            ([_docker_cli_init_container()] if has_dind else [])
+            # PLAT-9847: unconditional — every native seat's log dir must be
+            # materialized before the agent starts, not only on dind/ssh/
+            # clusterplane seats.
+            [_agent_logs_init_container(agent)]
+            + ([_docker_cli_init_container()] if has_dind else [])
             + ([_fleet_ssh_init_container(agent)] if agent.hostplane_ssh else [])
             + ([_fleet_kubeconfig_init_container(agent)] if agent.clusterplane_kubeconfig else [])
         ) or None,

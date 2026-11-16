@@ -379,8 +379,13 @@ Follow the security review workflow.
     def test_workspace_mounted_from_longhorn_pvc(self):
         dep = _build_deployment()
         agent_c = _container(dep, 'agent')
-        mounts = {m.name: m for m in agent_c.volume_mounts}
-        self.assertEqual(mounts['workspace'].mount_path, '/home/agent/.shizuha')
+        # PLAT-9847: the workspace PVC legitimately appears twice — the
+        # primary .shizuha mount AND the agent-logs subPath backing the
+        # persistent agent log (PLAT-8958 regression fix).
+        workspace_mounts = {m.mount_path: m for m in agent_c.volume_mounts if m.name == 'workspace'}
+        self.assertIn('/home/agent/.shizuha', workspace_mounts)
+        log_mount = workspace_mounts['/home/agent/.config/shizuha/logs']
+        self.assertEqual(log_mount.sub_path, 'agent-logs')
         vol = next(v for v in dep.spec.template.spec.volumes if v.name == 'workspace')
         self.assertEqual(vol.persistent_volume_claim.claim_name, 'agent-testagent-workspace')
 
@@ -1673,7 +1678,16 @@ class FleetBrokerWiringTests(SimpleTestCase):
     def test_without_dind_no_privileged_container_or_docker_wiring(self):
         dep = _build_deployment()
         spec = dep.spec.template.spec
-        self.assertIsNone(spec.init_containers)
+        # PLAT-9847: the ONLY init without dind is the unconditional
+        # agent-logs materializer — root but privilege-escalation-fenced with
+        # ownership-only capabilities; no docker wiring of any kind.
+        self.assertEqual(
+            [c.name for c in (spec.init_containers or [])],
+            ['agent-logs-materialize'],
+        )
+        init = spec.init_containers[0]
+        self.assertFalse(init.security_context.allow_privilege_escalation)
+        self.assertNotIn('docker-cli', [c.name for c in (spec.init_containers or [])])
         self.assertNotIn('dind', [c.name for c in spec.containers])
         self.assertNotIn('docker-run', [v.name for v in spec.volumes])
         agent_c = _container(dep, 'agent')
