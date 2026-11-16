@@ -58,10 +58,16 @@ class KubeconfigPathParityRenderTests(TestCase):
         init = self._init_container(spec)
         agent_container = self._agent_container(spec)
 
-        # the init mounts the workspace PVC at the SAME path the agent does
+        # the init mounts the workspace PVC at the SAME path the agent does.
+        # Scoped to the workspace_mount_path mount: PLAT-9847 adds a second
+        # workspace-PVC mount on the agent container (the agent-logs subPath
+        # at /home/agent/.config/shizuha/logs) that the kubeconfig init has
+        # no reason to mount — the parity contract is about the path the
+        # KUBECONFIG materialization targets.
         agent_workspace_mounts = [
             m.mount_path for m in agent_container.volume_mounts
             if m.name == 'workspace'
+            and m.mount_path == agent.workspace_mount_path
         ]
         self.assertTrue(agent_workspace_mounts, 'agent container must mount workspace')
         init_mounts = [

@@ -217,6 +217,13 @@ class NativeWakeFailureTests(TestCase):
                             provisioner.NATIVE_RUNTIME_LABEL_VALUE,
                     }),
                     spec=SimpleNamespace(
+                        # PLAT-9847: a true no-op snapshot includes the full
+                        # persistent-log contract — the workspace PVC volume and
+                        # the materialize init — exactly as a converged seat is
+                        # captured from the apiserver.
+                        init_containers=[
+                            provisioner._agent_logs_init_container(agent),
+                        ],
                         containers=[container, broker],
                         volumes=[
                             # PLAT-12035: the no-op snapshot must carry the
@@ -226,6 +233,14 @@ class NativeWakeFailureTests(TestCase):
                             provisioner.client.V1Volume(
                                 name=provisioner.MCP_RECONNECT_STATE_VOLUME,
                                 empty_dir=provisioner.client.V1EmptyDirVolumeSource(),
+                            ),
+                            provisioner.client.V1Volume(
+                                name='workspace',
+                                persistent_volume_claim=(
+                                    provisioner.client.V1PersistentVolumeClaimVolumeSource(
+                                        claim_name=agent.workspace_pvc_name,
+                                    )
+                                ),
                             ),
                             provisioner.client.V1Volume(
                                 name='broker-sock',
