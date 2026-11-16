@@ -475,3 +475,33 @@ def decode_and_verify_for_test(compact_jws: str, public_key: Ed25519PublicKey):
     header = json.loads(base64.urlsafe_b64decode(pad(header_b64)))
     payload = json.loads(base64.urlsafe_b64decode(pad(payload_b64)))
     return header, payload
+
+
+def active_generation_document(signing: SigningIdentity | None = None) -> dict:
+    """PLAT-13818: the signed active producer-generation document Pulse fetches.
+
+    GET /internal/v1/fleet/capability-evidence/active-generation returns six
+    fields: kid, producer_generation_id, producer_generation_digest,
+    activated_at, source_sha, signature. The first five are canonicalized with
+    the same canonical_json_bytes used for evidence claims (sort_keys=True,
+    separators=(',', ':'), UTF-8) and signed with the capability-evidence
+    Ed25519 key; the detached base64url (unpadded) signature is appended as
+    the sixth field and excluded from the signing input. activated_at keeps
+    Django's isoformat() (explicit +00:00 offset, no Z rewrite) — Pulse
+    verifies over the received bytes, so only stability matters.
+
+    Pulse verifies the signature against its pinned
+    PULSE_HIVE_EVIDENCE_PUBLIC_JWKS (same kid) and falls back to the env pin
+    on any failure; this endpoint therefore fails closed by construction when
+    current_generation() cannot produce a validated identity.
+    """
+    generation, signing = current_generation(signing)
+    document = {
+        'kid': signing.kid,
+        'producer_generation_id': generation.generation_id,
+        'producer_generation_digest': generation.generation_digest,
+        'activated_at': generation.activated_at.isoformat(),
+        'source_sha': generation.source_sha,
+    }
+    document['signature'] = _b64url(signing.private_key.sign(canonical_json_bytes(document)))
+    return document

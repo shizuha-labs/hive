@@ -1,7 +1,10 @@
 from django.contrib import admin
 from django.urls import path, include
 from claws import metering_read_views, metering_views
-from fleet.capability_evidence_views import CapabilityEvidenceView
+from fleet.capability_evidence_views import (
+    CapabilityEvidenceActiveGenerationView,
+    CapabilityEvidenceView,
+)
 from fleet import views as fleet_views
 
 urlpatterns = [
@@ -105,6 +108,8 @@ urlpatterns = [
     ),
     path('internal/v1/fleet/capability-evidence', CapabilityEvidenceView.as_view()),
     path('internal/v1/fleet/capability-evidence/', CapabilityEvidenceView.as_view()),
+    path('internal/v1/fleet/capability-evidence/active-generation', CapabilityEvidenceActiveGenerationView.as_view()),
+    path('internal/v1/fleet/capability-evidence/active-generation/', CapabilityEvidenceActiveGenerationView.as_view()),
     path('api/internal/company-state/fleet/v1', fleet_views.FleetCompanyStateView.as_view()),
     path('api/internal/company-state/fleet/v1/', fleet_views.FleetCompanyStateView.as_view()),
     path(
