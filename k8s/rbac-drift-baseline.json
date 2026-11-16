@@ -1142,29 +1142,6 @@
       },
       {
         "binding": "RoleBinding",
-        "bindingName": "origin-ci-plat6638-netpol-create",
-        "bindingNamespace": "origin",
-        "roleKind": "Role",
-        "roleName": "origin-ci-plat6638-netpol-create",
-        "rules": [
-          {
-            "resourceNames": [],
-            "resources": [
-              "networkpolicies"
-            ],
-            "verbs": [
-              "create",
-              "delete",
-              "get",
-              "list",
-              "patch",
-              "update"
-            ]
-          }
-        ]
-      },
-      {
-        "binding": "RoleBinding",
         "bindingName": "hive-ci-deployer-shizuha-home-rollout",
         "bindingNamespace": "shizuha",
         "roleKind": "Role",
