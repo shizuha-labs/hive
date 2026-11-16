@@ -68,6 +68,24 @@ MAX_DEFER_AGE_SECONDS = 24 * 3600
 # this same bound.
 RECONCILE_MAX_GRANTS_PER_PASS = 8
 
+# PLAT-13371: age-based grant raise. A defer outstanding past this age is
+# STARVATION-CLASS, not queue-position: its per-pass grant budget is raised
+# (it may consume from the aged budget beyond the caller's ``max_grants``
+# cap, bounded by AGED_GRANTS_PER_PASS) because a 27-seat aged cohort drains
+# one seat per reconcile tick under a tight budget while holding 399 assigned
+# tasks (~1,667 failover unassigns/day). The lease board remains the REAL
+# capacity limiter — the raise cannot conjure a slot a full pool doesn't
+# have; it only stops the budget from throttling a grant the pool can serve.
+GRANT_RAISE_AGE_SECONDS = 30 * 60
+AGED_GRANTS_PER_PASS = 8
+
+# PLAT-13371 companion registry: per-seat first epoch at which a reconcile
+# pass observed ``lease unavailable`` for an outstanding defer. Cleared when
+# the seat is granted, cleared, or observed lease-available. Feeds the
+# aged-lease-unavailable paging series (a defer old AND lease-fenced is the
+# silent-skip shape the relay audit three-for-three'd on).
+WAKE_LEASE_UNAVAILABLE_KEY = 'hive:wake-defers-lease-unavailable:v1'
+
 
 def _load() -> dict:
     data = cache.get(WAKE_DEFERRED_KEY)
@@ -125,6 +143,59 @@ def outstanding_wake_defers(*, now: float | None = None) -> dict:
     return defers
 
 
+def _load_lease_unavailable() -> dict:
+    data = cache.get(WAKE_LEASE_UNAVAILABLE_KEY)
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _save_lease_unavailable(data: dict) -> None:
+    cache.set(WAKE_LEASE_UNAVAILABLE_KEY, data, None)
+
+
+def _clear_lease_unavailable(email: str, ckey: str | None = None) -> None:
+    data = _load_lease_unavailable()
+    changed = False
+    for key in (email, ckey):
+        if key and key in data:
+            del data[key]
+            changed = True
+    if changed:
+        _save_lease_unavailable(data)
+
+
+def _mark_lease_unavailable(email: str, *, now: float) -> bool:
+    """Record lease-unavailable persistence for ``email``; True when this is
+    the FIRST observation past the page threshold (edge for the paged log)."""
+    data = _load_lease_unavailable()
+    entry = data.get(email)
+    if not isinstance(entry, dict) or 'first' not in entry:
+        data[email] = {'first': now, 'paged': False}
+        _save_lease_unavailable(data)
+        return False
+    first = float(entry.get('first') or now)
+    paged = bool(entry.get('paged'))
+    if not paged and now - first > GRANT_RAISE_AGE_SECONDS:
+        entry['paged'] = True
+        _save_lease_unavailable(data)
+        return True
+    return False
+
+
+def aged_lease_unavailable_count(*, now: float | None = None) -> int:
+    """Seats whose defer is past the raise age AND lease-fenced (paged class)."""
+    stamp = float(now) if now is not None else time.time()
+    defers = outstanding_wake_defers(now=stamp)
+    data = _load_lease_unavailable()
+    count = 0
+    for email, epoch in defers.items():
+        entry = data.get(email)
+        if isinstance(entry, dict) and stamp - float(entry.get('first') or stamp) > GRANT_RAISE_AGE_SECONDS:
+            count += 1
+    return count
+
+
 def _escape_label(value: str) -> str:
     return value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
 
@@ -162,6 +233,13 @@ def wake_defers_to_prometheus(*, now: float | None = None) -> str:
         '# HELP hive_wake_deferred_info Outstanding deferred-wake identity (one series per seat, only while outstanding).',
         '# TYPE hive_wake_deferred_info gauge',
     ]
+    # PLAT-13371: aged + lease-fenced seats — the silent-skip class. Unlabeled
+    # and always present (0 when none) per the house alerting-series rule.
+    lines.extend([
+        '# HELP hive_wake_deferred_lease_unavailable_aged Seats deferred past the grant-raise age whose latest reconcile observed lease unavailable.',
+        '# TYPE hive_wake_deferred_lease_unavailable_aged gauge',
+        f'hive_wake_deferred_lease_unavailable_aged {aged_lease_unavailable_count(now=stamp)}',
+    ])
     for email in sorted(defers):
         lines.append(f'hive_wake_deferred_info{{email="{_escape_label(email)}"}} 1')
     return '\n'.join(lines) + '\n'
@@ -186,7 +264,19 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
     `RECONCILE_MAX_GRANTS_PER_PASS`): the lease board is the real capacity
     limiter, the budget only bounds one pass's fan-out so a deep backlog
     converges over successive passes instead of a single thundering scale-up.
-    An explicit ``max_grants=1`` keeps the legacy one-grant-per-call shape.
+    An explicit ``max_grants=1`` keeps the legacy one-grant-per-call shape
+    for fresh defers.
+
+    A defer outstanding past ``GRANT_RAISE_AGE_SECONDS`` (30 minutes) is
+    starvation-class and may consume from the raised aged budget beyond the
+    caller's ``max_grants`` cap, bounded by ``AGED_GRANTS_PER_PASS``. Fresh
+    defers keep the caller's budget shape exactly. ``aged_granted`` counts
+    aged grants made inside the normal budget too, so the extra headroom
+    past a spent budget is at most ``AGED_GRANTS_PER_PASS`` and is somewhat
+    smaller than 8 — conservative by design. The raise only stops the budget
+    from throttling a grant the pool can serve. A full pool still refuses
+    every grant, and the seat then waits with a page instead of silently
+    starving.
 
     Semantics mirror ConnectWakeAgentView exactly (same fences, same
     fail-closed direction): archived / operator-stopped / already-running
@@ -195,7 +285,8 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
     starvation clock keeps running. Never raises — a reconciliation fault
     must not break the stop path that invoked it.
     """
-    defers = outstanding_wake_defers(now=now)
+    now_value = float(now) if now is not None else time.time()
+    defers = outstanding_wake_defers(now=now_value)
     if not defers:
         return {'considered': 0, 'granted': [], 'skipped': {}}
     granted: list[str] = []
@@ -225,8 +316,16 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
     except (TypeError, ValueError):
         pass_budget = RECONCILE_MAX_GRANTS_PER_PASS
 
+    aged_granted = 0
+
     for email, epoch in sorted(defers.items(), key=lambda kv: (kv[1], kv[0])):
-        if len(granted) >= pass_budget:
+        aged = (now_value - epoch) > GRANT_RAISE_AGE_SECONDS
+        # PLAT-13371: aged defers may consume from the raised budget beyond the
+        # caller's ``max_grants`` cap (bounded by AGED_GRANTS_PER_PASS); fresh
+        # defers keep the caller's budget exactly as before.
+        if len(granted) >= pass_budget and not (
+            aged and aged_granted < AGED_GRANTS_PER_PASS
+        ):
             skipped[email] = 'grant budget exhausted this pass'
             continue
         try:
@@ -246,18 +345,21 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
                 clear_wake_defer(email)
                 if ckey != email:
                     clear_wake_defer(ckey)
+                _clear_lease_unavailable(email, ckey)
                 skipped[email] = 'archived'
                 continue
             if _agent_enabled(agent):
                 clear_wake_defer(email)
                 if ckey != email:
                     clear_wake_defer(ckey)
+                _clear_lease_unavailable(email, ckey)
                 skipped[email] = 'already_running'
                 continue
             if not _agent_eligible_to_start(agent):
                 clear_wake_defer(email)
                 if ckey != email:
                     clear_wake_defer(ckey)
+                _clear_lease_unavailable(email, ckey)
                 skipped[email] = 'operator_stopped'
                 continue
             wake_ok, wake_reason = lease_wake_available(agent=agent)
@@ -265,12 +367,26 @@ def reconcile_deferred_wakes(*, max_grants: int | None = None, now: float | None
                 # Pool still full (or authority unconfirmable): leave the
                 # entry — the starvation clock keeps running.
                 skipped[email] = f'lease unavailable ({wake_reason})'
+                # PLAT-13371: persistence tracking + edge-triggered page.
+                if _mark_lease_unavailable(email, now=now_value):
+                    logger.error(
+                        'connect-wake: LEASE-UNAVAILABLE PAGED %s — deferred '
+                        'since epoch %s (age %.0fs > %ss) and lease_wake_available '
+                        'has been false across reconcile passes for >%ss; the seat '
+                        'holds assigned work at replicas=0 and needs a slot or '
+                        'operator intervention.',
+                        email, epoch, now_value - epoch,
+                        GRANT_RAISE_AGE_SECONDS, GRANT_RAISE_AGE_SECONDS,
+                    )
                 continue
             ok, detail = set_lifecycle_agent_enabled(str(agent.get('id') or ''), True)
             if ok:
                 clear_wake_defer(email)
                 if ckey != email:
                     clear_wake_defer(ckey)
+                _clear_lease_unavailable(email, ckey)
+                if aged:
+                    aged_granted += 1
                 granted.append(email)
                 logger.info(
                     'connect-wake: RECONCILE-GRANT %s (deferred since epoch %s)',

@@ -225,3 +225,135 @@ class ReconcileDeferredWakesTests(TestCase):
         wake_defers.record_wake_defer('kai@shizuha.com', now=NOW - MAX_DEFER_AGE_SECONDS - 10)
         result = reconcile_deferred_wakes(now=NOW)
         self.assertEqual(result['considered'], 0)
+
+
+class AgedDeferGrantRaiseTests(TestCase):
+    """PLAT-13371: age-based grant raise + persistent-lease-unavailable page."""
+
+    def setUp(self):
+        wake_defers._save({'defers': {}})
+        wake_defers._save_lease_unavailable({})
+
+    def tearDown(self):
+        wake_defers._save({'defers': {}})
+        wake_defers._save_lease_unavailable({})
+
+    def _agents(self, emails):
+        return [_agent(e.split('@')[0], e) for e in emails]
+
+    def test_aged_defer_bypasses_tight_budget(self):
+        # A 40m-old defer must NOT be dropped by an explicit max_grants=1
+        # budget once the budget is spent — the raise exists because
+        # budget-throttled aged cohorts drain one seat per tick. The fresh
+        # defer keeps the legacy budget shape exactly (skipped).
+        wake_defers.record_wake_defer('old@shizuha.com', now=NOW - 40 * 60)
+        wake_defers.record_wake_defer('fresh@shizuha.com', now=NOW - 60)
+        agents = self._agents(['old@shizuha.com', 'fresh@shizuha.com'])
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=agents), \
+             mock.patch('fleet.lifecycle_fleet.set_lifecycle_agent_enabled',
+                               return_value=(True, 'ok')), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(True, 'ok')):
+            result = reconcile_deferred_wakes(max_grants=1, now=NOW)
+        self.assertEqual(result['granted'], ['old@shizuha.com'])
+        self.assertEqual(result['skipped']['fresh@shizuha.com'],
+                         'grant budget exhausted this pass')
+
+    def test_two_aged_defers_both_bypass_tight_budget(self):
+        # Two aged defers under max_grants=1: both grant in one pass — the
+        # budget cap does not throttle the aged cohort seat-by-seat.
+        wake_defers.record_wake_defer('old1@shizuha.com', now=NOW - 80 * 60)
+        wake_defers.record_wake_defer('old2@shizuha.com', now=NOW - 40 * 60)
+        agents = self._agents(['old1@shizuha.com', 'old2@shizuha.com'])
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=agents), \
+             mock.patch('fleet.lifecycle_fleet.set_lifecycle_agent_enabled',
+                               return_value=(True, 'ok')), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(True, 'ok')):
+            result = reconcile_deferred_wakes(max_grants=1, now=NOW)
+        self.assertEqual(result['granted'], ['old1@shizuha.com', 'old2@shizuha.com'])
+
+    def test_fresh_defer_still_respects_tight_budget(self):
+        # Only-fresh defers keep the legacy budget shape exactly.
+        wake_defers.record_wake_defer('a@shizuha.com', now=NOW - 600)
+        wake_defers.record_wake_defer('b@shizuha.com', now=NOW - 300)
+        agents = self._agents(['a@shizuha.com', 'b@shizuha.com'])
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=agents), \
+             mock.patch('fleet.lifecycle_fleet.set_lifecycle_agent_enabled',
+                               return_value=(True, 'ok')), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(True, 'ok')):
+            result = reconcile_deferred_wakes(max_grants=1, now=NOW)
+        self.assertEqual(result['granted'], ['a@shizuha.com'])
+        self.assertEqual(result['skipped']['b@shizuha.com'],
+                         'grant budget exhausted this pass')
+
+    def test_aged_grants_bounded_per_pass(self):
+        # The raise is bounded by AGED_GRANTS_PER_PASS — an aged backlog
+        # converges over passes instead of one thundering scale-up.
+        emails = [f'seat{i:02d}@shizuha.com' for i in range(wake_defers.AGED_GRANTS_PER_PASS + 3)]
+        for i, email in enumerate(emails):
+            wake_defers.record_wake_defer(email, now=NOW - (40 + i) * 60)
+        agents = self._agents(emails)
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=agents), \
+             mock.patch('fleet.lifecycle_fleet.set_lifecycle_agent_enabled',
+                               return_value=(True, 'ok')), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(True, 'ok')):
+            result = reconcile_deferred_wakes(max_grants=1, now=NOW)
+        self.assertEqual(len(result['granted']), wake_defers.AGED_GRANTS_PER_PASS)
+
+    def test_lease_unavailable_page_fires_once_past_threshold(self):
+        # 10m-old defer + lease unavailable: below threshold, no page, entry
+        # tracked. 40m later the page fires exactly once (edge-triggered).
+        wake_defers.record_wake_defer('kai@shizuha.com', now=NOW - 600)
+        agent = _agent()
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=[agent]), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(False, 'pool full')):
+            result = reconcile_deferred_wakes(now=NOW)
+        self.assertEqual(result['granted'], [])
+        self.assertEqual(wake_defers.aged_lease_unavailable_count(now=NOW), 0)
+
+        # Age past the threshold, lease still unavailable → paged, tracked.
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=[agent]), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(False, 'pool full')):
+            reconcile_deferred_wakes(now=NOW + 40 * 60)
+        self.assertEqual(wake_defers.aged_lease_unavailable_count(now=NOW + 40 * 60), 1)
+        self.assertEqual(
+            wake_defers._load_lease_unavailable()['kai@shizuha.com']['paged'], True)
+
+        # Subsequent passes do NOT re-page (edge-triggered).
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=[agent]), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(False, 'pool full')):
+            reconcile_deferred_wakes(now=NOW + 50 * 60)
+        self.assertEqual(
+            wake_defers._load_lease_unavailable()['kai@shizuha.com']['paged'], True)
+
+    def test_grant_clears_lease_unavailable_tracking(self):
+        wake_defers.record_wake_defer('kai@shizuha.com', now=NOW - 40 * 60)
+        wake_defers._save_lease_unavailable(
+            {'kai@shizuha.com': {'first': NOW - 40 * 60, 'paged': True}})
+        agent = _agent()
+        with mock.patch('fleet.lifecycle_fleet.list_lifecycle_agents',
+                               return_value=[agent]), \
+             mock.patch('fleet.lifecycle_fleet.set_lifecycle_agent_enabled',
+                        return_value=(True, 'ok')), \
+             mock.patch('fleet.model_lease.lease_wake_available',
+                        return_value=(True, 'ok')):
+            reconcile_deferred_wakes(now=NOW)
+        self.assertEqual(wake_defers._load_lease_unavailable(), {})
+        self.assertEqual(wake_defers.aged_lease_unavailable_count(now=NOW), 0)
+
+    def test_prometheus_aged_lease_series_always_present(self):
+        text = wake_defers.wake_defers_to_prometheus(now=NOW)
+        self.assertIn('hive_wake_deferred_lease_unavailable_aged 0', text)
