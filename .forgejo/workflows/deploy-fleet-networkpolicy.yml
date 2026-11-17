@@ -170,10 +170,17 @@ jobs:
             }
           }
           require_yes 'create bounded Job' create jobs.batch -n shizuha-fleet
-          for verb in get list watch; do
+          # PLAT-13755 / SCLI-553 / SCLI-716 floor: watch on fleet pods is
+          # reserved for the dedicated discovery identity. This canary (and the
+          # deploy lane it fronts) polls with get-based reads like the rest of
+          # the repo — it must hold get+list and must NOT hold watch. The
+          # require_no below asserts that floor so a future over-grant fails
+          # here instead of silently re-opening the PREPULL_ISOLATION break.
+          for verb in get list; do
             require_yes "${verb} canary Pod metadata" "$verb" pods -n shizuha-fleet
           done
           require_yes 'read canary Pod logs' get pods --subresource=log -n shizuha-fleet
+          require_no 'watch on fleet pods must stay reserved for the discovery identity (SCLI-553/716 floor, PLAT-13755)' watch pods -n shizuha-fleet
           require_no 'fleet Pod exec must stay forbidden' create pods --subresource=exec -n shizuha-fleet
           require_no 'fleet Secret reads must stay forbidden' get secrets -n shizuha-fleet
           # PLAT-5354 intentionally grants cluster-wide read-only PVC discovery
