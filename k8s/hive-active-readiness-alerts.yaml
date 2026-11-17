@@ -1,0 +1,44 @@
+# HIVE-2624: alert on active-desired-but-0-ready-replicas persistence.
+#
+# During the HIVE-2595 incident the on-demand provisioner wedge ran three
+# consecutive BackoffLimitExceeded episodes with NO detection signal: every
+# desired-vs-actual comparison looked satisfied while the Deployment sat at
+# spec.replicas>=1 with ready_replicas==0 for days. The detection sweep
+# (fleet.provisioner.reconcile_active_agent_readiness, called from the
+# fleet-agent-liveness-reconciler CronJob) stamps
+# hive_fleet_active_desired_zero_ready{agent}=1 while the state persists and
+# drives the same series to 0 on recovery; this rule routes it to the DevOps
+# owner group with the workload identity in the payload.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hive-active-readiness
+  namespace: shizuha-hive
+  labels:
+    app.kubernetes.io/name: hive
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: hive-active-readiness
+      rules:
+        - alert: HiveActiveDesiredZeroReady
+          expr: hive_fleet_active_desired_zero_ready == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: devops
+            owner_group: devops
+            service: shizuha-hive
+          annotations:
+            summary: "Agent {{ $labels.agent }} is desired-active with 0 ready replicas (HIVE-2624)"
+            description: >
+              The agent Deployment for {{ $labels.agent }} has spec.replicas>=1
+              with ready_replicas==0 persisting beyond the bounded window
+              (detection sweep fires at 15m default; this alert debounces 5m).
+              This is the HIVE-2595 wedge class: provisioner Job
+              BackoffLimitExceeded / CrashLoop / image-pull / ENOSPC — urgent
+              work assigned to the seat stalls silently. Inspect the
+              Deployment's pod events and the on-demand provisioner Job status;
+              the detection leg is detection-only by design, so repair is
+              manual (or via the owning lane's break-glass).
+            runbook_url: "https://wiki.shizuha.com/501362a3-4633-4218-8ccf-b0f4e15f37ce"

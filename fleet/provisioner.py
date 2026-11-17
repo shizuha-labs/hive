@@ -2081,6 +2081,101 @@ def emergency_scale(agent: FleetAgent, replicas: int) -> bool:
     return _scale(agent, replicas)
 
 
+def reconcile_active_agent_readiness(*, dry_run: bool = False) -> dict:
+    """HIVE-2624: detect active-desired-but-0-ready-replicas persistence.
+
+    The PLAT-4722 sweep above converges the desired=0 direction (Hive says
+    stopped, k8s still runs it). The REVERSE state was blind: an agent Hive
+    intends ACTIVE whose Deployment sits at ``spec.replicas>=1`` with
+    ``ready_replicas==0`` for an extended window — the HIVE-2595 incident ran
+    three consecutive BackoffLimitExceeded episodes with no detection signal,
+    stranding the saki/shion seats for days while every desired-vs-actual
+    comparison looked satisfied.
+
+    This leg is DETECTION-ONLY (no actuation): repairing a wedged provisioner
+    from inside another sweep would loop the same failure class. It stamps the
+    per-agent gauge ``hive_fleet_active_desired_zero_ready{agent}`` (1 while
+    firing, 0 on recovery) which ``k8s/hive-active-readiness-alerts.yaml``
+    routes to the DevOps owner group with the workload identity in the payload.
+
+    Bounded window is k8s-authoritative: the Deployment's own ``Available``
+    condition ``lastTransitionTime`` (Available==False), so persistence
+    survives Hive restarts and does not depend on Hive's own — possibly
+    wedged — write path. Threshold via ``HIVE_ACTIVE_UNREADY_ALERT_SECONDS``
+    (default 900s); rollouts complete in minutes, this failure mode ran for
+    days.
+    """
+    import os
+    from datetime import timedelta
+
+    from django.utils import timezone as tz
+
+    from . import fleet_readiness_metrics
+
+    try:
+        threshold = int(os.environ.get('HIVE_ACTIVE_UNREADY_ALERT_SECONDS', '900'))
+    except (TypeError, ValueError):
+        threshold = 900
+
+    _, apps_v1, _ = get_k8s_client()
+    summary = {'checked': 0, 'unready': 0, 'fired': 0, 'errors': 0}
+    firing: dict[str, int] = {}
+    active_agents = FleetAgent.objects.filter(status=FleetAgent.Status.RUNNING)
+    for agent in active_agents:
+        summary['checked'] += 1
+        try:
+            ns = _live_ns(agent)
+            dep = apps_v1.read_namespaced_deployment(agent.deployment_name, ns)
+            spec_replicas = int(getattr(getattr(dep, 'spec', None), 'replicas', 0) or 0)
+            ready = int(getattr(getattr(dep, 'status', None), 'ready_replicas', 0) or 0)
+            if spec_replicas < 1 or ready >= 1:
+                continue  # healthy, or scaled-to-zero (a different lifecycle state)
+            summary['unready'] += 1
+            # Bounded window: Available==False since lastTransitionTime. A
+            # missing/true Available condition with 0 ready replicas still
+            # fires (conservative) — the replica facts alone are the signal.
+            unready_since = None
+            for cond in getattr(getattr(dep, 'status', None), 'conditions', None) or []:
+                if getattr(cond, 'type', '') == 'Available' and getattr(cond, 'status', '') == 'False':
+                    unready_since = getattr(cond, 'last_transition_time', None)
+                    break
+            dwell_ok = True
+            if unready_since is not None:
+                dwell = (tz.now() - unready_since).total_seconds()
+                dwell_ok = dwell >= threshold
+            if not dwell_ok:
+                continue  # inside the bounded window — rollout transient
+            summary['fired'] += 1
+            firing[agent.agent_username] = 1
+            logger.error(
+                'HIVE-2624 active-desired-zero-ready: agent %s Deployment %s/%s '
+                'spec.replicas=%s ready_replicas=%s persists beyond %ss — '
+                'provisioner wedge / CrashLoop / image-pull / ENOSPC class; '
+                'owner route: devops (gauge hive_fleet_active_desired_zero_ready)',
+                agent.agent_username, ns, agent.deployment_name,
+                spec_replicas, ready, threshold,
+            )
+            if not dry_run:
+                _log_event(
+                    agent,
+                    'active_desired_zero_ready',
+                    f'Deployment {ns}/{agent.deployment_name} desired-active with '
+                    f'0/{spec_replicas} ready replicas beyond the bounded window '
+                    f'({threshold}s) — HIVE-2624 detection leg',
+                )
+        except ApiException as e:
+            if e.status == 404:
+                continue  # no Deployment — nothing to observe
+            summary['errors'] += 1
+            logger.error('HIVE-2624 readiness check failed for %s: %s', agent.agent_username, e)
+        except Exception as exc:  # noqa: BLE001 — never let one agent break the sweep
+            summary['errors'] += 1
+            logger.error('HIVE-2624 readiness check failed for %s: %s', agent.agent_username, exc)
+    if not dry_run:
+        fleet_readiness_metrics.record_active_zero_ready(firing)
+    return summary
+
+
 # Kubernetes returns HTTP 409 when another writer races the Deployment between
 # our read and patch (on-demand wake vs stop, harness stage, etc.). Retry with a
 # fresh read rather than sticky-failing the Agents UI with an operator-hostile

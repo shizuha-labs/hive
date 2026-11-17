@@ -301,6 +301,18 @@ data:
     except Exception as exc:
         print(f'DRIFT-ERROR {type(exc).__name__}: {exc}')
 
+    # HIVE-2624: the reverse drift direction was blind — an agent Hive intends
+    # ACTIVE whose Deployment sits at spec.replicas>=1 with ready_replicas==0
+    # past the bounded window (the HIVE-2595 wedge ran 3x BackoffLimitExceeded
+    # undetected). Detection-only leg: stamps the per-agent gauge that
+    # k8s/hive-active-readiness-alerts.yaml routes to DevOps.
+    try:
+        readiness = provisioner.reconcile_active_agent_readiness(dry_run=DRY_RUN)
+        print(f'READINESS-SUMMARY dry_run={DRY_RUN} checked={readiness["checked"]} '
+              f'unready={readiness["unready"]} fired={readiness["fired"]} errors={readiness["errors"]}')
+    except Exception as exc:
+        print(f'READINESS-ERROR {type(exc).__name__}: {exc}')
+
     if vip_failed:
         # Existing KubeJobFailed alerting now becomes the runtime-specific alarm;
         # every failure line carries the exact agent/namespace/pod for first response.
