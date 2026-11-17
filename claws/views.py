@@ -3952,11 +3952,16 @@ class InternalConnectDeliveryMetricsView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
         from . import connect_delivery_metrics as _metrics
-        from fleet import grok_provider_metrics, runtime_contract_metrics
+        from fleet import (
+            fleet_readiness_metrics,
+            grok_provider_metrics,
+            runtime_contract_metrics,
+        )
         return HttpResponse(
             _metrics.to_prometheus()
             + runtime_contract_metrics.to_prometheus()
-            + grok_provider_metrics.to_prometheus(),
+            + grok_provider_metrics.to_prometheus()
+            + fleet_readiness_metrics.to_prometheus(),
             content_type='text/plain; version=0.0.4; charset=utf-8',
         )
 
