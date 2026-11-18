@@ -11,11 +11,11 @@ asserts the sweep fires (gauge stamped, event logged), stays silent inside
 the bounded window, and never misfires on healthy / scaled-to-zero /
 missing-Deployment workloads.
 """
+import datetime
 from datetime import timedelta
 from unittest import mock
 
 from django.test import TestCase
-from django.utils import timezone as tz
 
 from fleet import fleet_readiness_metrics, provisioner
 from fleet.models import FleetAgent
@@ -54,7 +54,7 @@ class ActiveDesiredZeroReadyDetectionTests(TestCase):
 
     def test_fires_on_hive2595_state_beyond_bounded_window(self):
         """spec.replicas=1, ready=0, Available=False for >15m — the incident state."""
-        since = tz.now() - timedelta(seconds=1800)
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=1800)
         summary, log_event = self._run(_deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
         self.assertEqual(summary['fired'], 1)
         self.assertEqual(summary['unready'], 1)
@@ -66,14 +66,14 @@ class ActiveDesiredZeroReadyDetectionTests(TestCase):
 
     def test_silent_inside_bounded_window(self):
         """0 ready for 5 minutes is a rollout transient, not a wedge."""
-        since = tz.now() - timedelta(seconds=300)
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=300)
         summary, log_event = self._run(_deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
         self.assertEqual(summary['fired'], 0)
         log_event.assert_not_called()
         self.assertNotIn('wedgevictim', fleet_readiness_metrics.snapshot())
 
     def test_silent_when_ready(self):
-        since = tz.now() - timedelta(seconds=1800)
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=1800)
         summary, _ = self._run(_deployment(spec_replicas=1, ready_replicas=1, available_false_since=since))
         self.assertEqual(summary['fired'], 0)
 
@@ -90,7 +90,7 @@ class ActiveDesiredZeroReadyDetectionTests(TestCase):
         self.assertEqual(summary['fired'], 1)
 
     def test_recovery_drives_same_series_to_zero(self):
-        since = tz.now() - timedelta(seconds=1800)
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=1800)
         self._run(_deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
         self.assertEqual(fleet_readiness_metrics.snapshot().get('wedgevictim'), 1)
         # Next sweep observes a ready Deployment → same series to 0 in place.
@@ -100,7 +100,7 @@ class ActiveDesiredZeroReadyDetectionTests(TestCase):
         self.assertIn('hive_fleet_active_desired_zero_ready{agent="wedgevictim"} 0', fleet_readiness_metrics.to_prometheus())
 
     def test_dry_run_stamps_nothing(self):
-        since = tz.now() - timedelta(seconds=1800)
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=1800)
         dep = _deployment(spec_replicas=1, ready_replicas=0, available_false_since=since)
         with mock.patch.object(provisioner, 'get_k8s_client') as client, \
                 mock.patch.object(provisioner, '_log_event') as log_event:
@@ -121,3 +121,63 @@ class ActiveDesiredZeroReadyDetectionTests(TestCase):
             summary = provisioner.reconcile_active_agent_readiness()
         self.assertEqual(summary['fired'], 0)
         self.assertEqual(summary['errors'], 0)
+
+
+class ReadinessClockNormalizationTests(TestCase):
+    """HIVE-2624 follow-up (reconciler-29915960): the dwell computation
+    subtracted Django's naive clock from the k8s client's offset-aware
+    condition timestamp and raised ``TypeError: can't subtract offset-naive
+    and offset-aware datetimes`` — erroring the sweep on the first agent
+    record it met (jun) every tick. Both sides must normalize to aware UTC;
+    neither wire format may fail the sweep.
+    """
+
+    def setUp(self):
+        self.agent = FleetAgent.objects.create(
+            agent_username='tzvictim',
+            status=FleetAgent.Status.RUNNING,
+        )
+        fleet_readiness_metrics.record_active_zero_ready({})
+
+    def _run(self, dep):
+        with mock.patch.object(provisioner, 'get_k8s_client') as client, \
+                mock.patch.object(provisioner, '_log_event') as log_event:
+            client.return_value = (mock.Mock(), mock.Mock(read_namespaced_deployment=lambda n, ns: dep), mock.Mock())
+            summary = provisioner.reconcile_active_agent_readiness()
+        return summary, log_event
+
+    def test_aware_condition_timestamp_does_not_error_the_sweep(self):
+        """The production wire format: k8s returns offset-aware UTC."""
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=1800)
+        summary, log_event = self._run(
+            _deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
+        self.assertEqual(summary['errors'], 0)
+        self.assertEqual(summary['fired'], 1)
+        log_event.assert_called_once()
+
+    def test_naive_condition_timestamp_is_normalized_as_utc(self):
+        """A naive value from any source is UTC by the k8s wire convention —
+        normalized, never a TypeError, and still judged against the window."""
+        since = datetime.datetime.utcnow() - timedelta(seconds=1800)
+        assert since.tzinfo is None
+        summary, _ = self._run(
+            _deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
+        self.assertEqual(summary['errors'], 0)
+        self.assertEqual(summary['fired'], 1)
+
+    def test_non_utc_aware_timestamp_is_converted(self):
+        """An aware non-UTC offset converts before the dwell comparison."""
+        since = (datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=1800)
+                 ).astimezone(datetime.timezone(datetime.timedelta(hours=5, minutes=30)))
+        summary, _ = self._run(
+            _deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
+        self.assertEqual(summary['errors'], 0)
+        self.assertEqual(summary['fired'], 1)
+
+    def test_inside_window_with_aware_timestamp_stays_silent(self):
+        since = datetime.datetime.now(datetime.timezone.utc) - timedelta(seconds=300)
+        summary, log_event = self._run(
+            _deployment(spec_replicas=1, ready_replicas=0, available_false_since=since))
+        self.assertEqual(summary['errors'], 0)
+        self.assertEqual(summary['fired'], 0)
+        log_event.assert_not_called()
