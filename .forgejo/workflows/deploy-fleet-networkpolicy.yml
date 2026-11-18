@@ -183,13 +183,14 @@ jobs:
           require_no 'watch on fleet pods must stay reserved for the discovery identity (SCLI-553/716 floor, PLAT-13755)' watch pods -n shizuha-fleet
           require_no 'fleet Pod exec must stay forbidden' create pods --subresource=exec -n shizuha-fleet
           require_no 'fleet Secret reads must stay forbidden' get secrets -n shizuha-fleet
-          # PLAT-5354 intentionally grants cluster-wide read-only PVC discovery
-          # to the backup-tier reconciler. Preserve that contract while proving
-          # the network-policy canary cannot mutate fleet claims.
-          for verb in get list; do
-            require_yes "${verb} fleet PVC metadata for backup discovery" \
-              "$verb" persistentvolumeclaims -n shizuha-fleet
-          done
+          # ADR-0067 / PLAT-5354 boundary: canonical deploy RBAC (PLAT-8879,
+          # commit 7c7e3868) grants origin-ci-deployer ONLY jobs:create,
+          # pods:get,list, pods/log:get in shizuha-fleet — PVC read belongs to
+          # the backup-tier reconciler, a different identity, and PVC access
+          # expansion for CI is explicitly Forbidden. Run 4228's exit-20
+          # ("get fleet PVC metadata for backup discovery") was this precheck
+          # asking for a permission the RBAC contract deliberately withholds.
+          # Assert only the negative: the canary cannot mutate fleet claims.
           for verb in patch delete; do
             require_no "${verb} fleet PVCs must stay forbidden" \
               "$verb" persistentvolumeclaims -n shizuha-fleet
