@@ -94,9 +94,13 @@ class VipProbeErrorClassificationTests(SimpleTestCase):
         # The typed classification lives in the INDETERMINATE branch and the
         # source-probe error paths; the vip_failed increment (real refusal)
         # must stay outside the reachable-is-None branch.
+        # HIVE-2624 follow-up: the refusal branch is now the identity check
+        # (`reachable is False`) — the falsiness form also matched None and
+        # violated this very contract (reconciler-29915960). The boundary
+        # splits on the identity form.
         none_branch = (
             self.script.split('if reachable is None:', 1)[1]
-            .split('if not reachable:', 1)[0]
+            .split('if reachable is False:', 1)[0]
         )
         self.assertIn('vip_transport_errors += 1', none_branch)
         self.assertNotIn('vip_failed += 1', none_branch)

@@ -2106,9 +2106,8 @@ def reconcile_active_agent_readiness(*, dry_run: bool = False) -> dict:
     days.
     """
     import os
+    import datetime
     from datetime import timedelta
-
-    from django.utils import timezone as tz
 
     from . import fleet_readiness_metrics
 
@@ -2141,7 +2140,20 @@ def reconcile_active_agent_readiness(*, dry_run: bool = False) -> dict:
                     break
             dwell_ok = True
             if unready_since is not None:
-                dwell = (tz.now() - unready_since).total_seconds()
+                # HIVE-2624 follow-up (fleet-agent-liveness-reconciler-29915960):
+                # k8s condition timestamps arrive offset-aware while Django's
+                # own helpers are naive under USE_TZ=False (see
+                # fleet/timeutils) — the mixed subtraction raised
+                # ``TypeError: can't subtract offset-naive and offset-aware
+                # datetimes`` and failed the sweep on the first agent record
+                # it met (jun, KubeJobFailed every tick). Normalize both
+                # sides to aware UTC before subtraction; a naive value is
+                # already UTC by the k8s wire convention.
+                if unready_since.tzinfo is None:
+                    unready_since = unready_since.replace(tzinfo=datetime.timezone.utc)
+                elif unready_since.utcoffset() != datetime.timedelta(0):
+                    unready_since = unready_since.astimezone(datetime.timezone.utc)
+                dwell = (datetime.datetime.now(datetime.timezone.utc) - unready_since).total_seconds()
                 dwell_ok = dwell >= threshold
             if not dwell_ok:
                 continue  # inside the bounded window — rollout transient

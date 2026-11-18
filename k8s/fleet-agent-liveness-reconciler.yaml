@@ -183,17 +183,31 @@ data:
             ns = a.namespace or provisioner.agent_namespace(a)
             dep = f'agent-{a.agent_username}'
             pods = []
+            listed_ok = False
             try:
                 pods = core_v1.list_namespaced_pod(
                     ns, label_selector=f'shizuha.io/agent={a.agent_username}').items
+                listed_ok = True
             except ApiException:
                 pass
             if not pods:
                 try:
                     pods = [p for p in core_v1.list_namespaced_pod(ns).items
                             if p.metadata.name.startswith(dep + '-')]
+                    listed_ok = True
                 except ApiException:
                     pods = []
+            # HIVE-2624 companion fix: the seat ledger must not pin dissolved
+            # pods. A DB-pinned pod_name absent from a SUCCESSFULLY listed
+            # live pod set is a stale reference (the dissolved-seat class: a
+            # hibernated 0/0 seat still carrying its last pod name) — prune
+            # it, typed, so it cannot persist tick over tick and feed
+            # phantom probes/alerts downstream. Never prune on a list
+            # failure (indeterminate, not evidence of dissolution).
+            if listed_ok and a.pod_name and a.pod_name not in {p.metadata.name for p in pods}:
+                FleetAgent.objects.filter(pk=a.pk).exclude(pod_name='').update(pod_name='')
+                print(f'LEDGER-PRUNE {a.agent_username} stale pod_name={a.pod_name} '
+                      f'(absent from live pod set; dissolved-seat reference pruned)')
             run_pods = [p for p in pods if (p.status.phase == 'Running')]
             if not run_pods:
                 nopod += 1
@@ -212,7 +226,16 @@ data:
                 print(f'VIP-TRANSPORT-ERROR {a.agent_username} ns={ns} '
                       f'pod={pod.metadata.name} detail={vip_detail} '
                       f'(fail-open; probe never ran, not evidence of a dead runtime)')
-            if not reachable:
+            if reachable is False:
+                # PLAT-9950 contract: an INDETERMINATE probe (None — transport
+                # crash, exec denial, or an exec against a dissolved pod) is
+                # fail-open and only counts as vip_transport_errors. Only a
+                # positively-observed refusal (False) is the page-class
+                # signal. The former falsiness guard (`not reachable`)
+                # matched None too, so any exec failure SystemExit-ed the
+                # whole Job (reconciler-29915960: a vip_probe_error line
+                # against a dissolved-seat reference red-lighted the run as
+                # KubeJobFailed).
                 vip_failed += 1
                 print(f'VIP-REFUSED {a.agent_username} ns={ns} '
                       f'pod={pod.metadata.name} detail={vip_detail}')
