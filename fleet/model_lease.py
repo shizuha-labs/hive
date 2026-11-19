@@ -2206,6 +2206,25 @@ def release_leases_for_agent(
         else:
             errors.append(f'{model}: revoke failed')
 
+    # PLAT-13883: reconcile deferred connect-wakes whenever a slot may have
+    # freed. Hooking the reconcile at the RELEASE PRIMITIVE (not at each
+    # stop/hibernate caller) closes the starvation window on every free
+    # path: the periodic ghost-lease reaper, lease revocations, and any
+    # future release caller freed slots without firing the event-path
+    # reconcile hooks, so deferred seats stayed at replicas=0 until someone
+    # sent ANOTHER connect_dm (21-24h deferrals, chika/sara/shin/ren cohort
+    # 2026-11-17). reconcile_deferred_wakes is never-raises and returns
+    # immediately when nothing is outstanding, so this is cheap on the
+    # healthy path. Failures inside are logged there, not raised here.
+    if released or yielded:
+        try:
+            from .wake_defers import reconcile_deferred_wakes
+            reconcile_deferred_wakes()
+        except Exception as exc:  # noqa: BLE001 — release must never raise
+            logger.warning(
+                'model-lease: post-release wake-defer reconcile failed: %s', exc,
+            )
+
     return {
         'released': released,
         'yielded': yielded,
