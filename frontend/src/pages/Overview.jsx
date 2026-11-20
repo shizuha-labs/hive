@@ -97,7 +97,7 @@ function pulseFirstTaskHref(orgSlug = '') {
   return `/pulse/tasks?${orgParam}onboarding=first-task`
 }
 
-function EmptyFleetStage({ isStaff, orgSlug, hasOrgMembership, membershipUnresolved }) {
+function EmptyFleetStage({ isStaff, orgSlug, hasOrgMembership, membershipUnresolved, previewOnly = false }) {
   // HIVE-1630: a non-staff user who already belongs to orgs must never be
   // funneled into a false "Create org" empty state. Drive the CTA from the
   // JWT membership claim (the member-scoped orgs endpoint is admin-gated and
@@ -117,8 +117,8 @@ function EmptyFleetStage({ isStaff, orgSlug, hasOrgMembership, membershipUnresol
       <div className="pointer-events-none absolute -right-20 -top-24 h-64 w-64 rounded-full bg-amber-400/10 blur-3xl" />
       <div className="relative grid gap-8 lg:grid-cols-[minmax(0,1.25fr)_minmax(280px,0.75fr)] lg:items-center">
         <div>
-          <div className="hv-kicker mb-2">Autonomous organization · ready</div>
-          <h2 className="text-2xl font-semibold tracking-tight text-gray-950 dark:text-white">Your Hive is ready. Give it something real to move.</h2>
+          <div className="hv-kicker mb-2">{previewOnly ? 'Autonomous organization · preview' : 'Autonomous organization · ready'}</div>
+          <h2 className="text-2xl font-semibold tracking-tight text-gray-950 dark:text-white">{previewOnly ? 'This is a preview. Nothing has been provisioned yet.' : 'Your Hive is ready. Give it something real to move.'}</h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500 dark:text-gray-400">
             The overview becomes a live operations theater as agents take ownership, report progress, and hand work across teams.
           </p>
@@ -126,6 +126,7 @@ function EmptyFleetStage({ isStaff, orgSlug, hasOrgMembership, membershipUnresol
             <QuickActionChip to={isStaff || !createOrg ? '/agents' : '/create-organization'} icon={isStaff || !createOrg ? Bot : Building2} primary>
               {isStaff || !createOrg ? 'Add an agent' : 'Create your organization'}
             </QuickActionChip>
+            {!previewOnly && (
             <a
               href={pulseFirstTaskHref(orgSlug)}
               className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-white/70 px-3.5 py-2 text-sm font-medium text-gray-700 transition-all hover:-translate-y-px hover:border-primary-400/50 dark:border-white/10 dark:bg-white/[0.035] dark:text-gray-300"
@@ -133,6 +134,7 @@ function EmptyFleetStage({ isStaff, orgSlug, hasOrgMembership, membershipUnresol
               <Workflow className="h-4 w-4" aria-hidden="true" />
               Open Pulse
             </a>
+            )}
           </div>
         </div>
         <ol className="space-y-2.5" aria-label="Get started">
@@ -571,7 +573,9 @@ export default function Overview() {
         <div>
           <div><div className="hv-kicker mb-1">Hive · overview</div><h1 className="hv-page-title">Fleet Command Center</h1></div>
           <p className="mt-1 text-gray-500 dark:text-gray-400">
-            {counts.running > 0
+            {previewDashboard
+              ? `Preview only, ${username}. This organization is not provisioned yet.`
+              : counts.running > 0
               ? `${counts.running} agent${counts.running === 1 ? '' : 's'} working now · your organization is moving.`
               : `Your organization is ready, ${username}. Live work will appear here.`}
           </p>
@@ -660,6 +664,7 @@ export default function Overview() {
                       New events will appear here as work moves. Current team state remains visible.
                     </p>
                   </div>
+                  {!previewDashboard && (
                   <a
                     href="/pulse/"
                     className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-white/70 px-3.5 py-1.5 text-xs font-medium text-gray-700 transition-all hover:-translate-y-px hover:border-primary-400/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500/50 dark:border-white/10 dark:bg-white/[0.035] dark:text-gray-300"
@@ -667,6 +672,7 @@ export default function Overview() {
                     <Workflow className="h-3.5 w-3.5" aria-hidden="true" />
                     Open Pulse
                   </a>
+                  )}
                 </div>
               )}
             </div>
@@ -708,7 +714,7 @@ export default function Overview() {
         </div>
 
         {recentCards.length === 0 && !loading ? (
-          <EmptyFleetStage isStaff={isStaff} orgSlug={requestedOrg} hasOrgMembership={hasOrgMembership} membershipUnresolved={membershipUnresolved} />
+          <EmptyFleetStage isStaff={isStaff} orgSlug={requestedOrg} hasOrgMembership={hasOrgMembership} membershipUnresolved={membershipUnresolved} previewOnly={previewDashboard} />
         ) : (
           <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
             {recentCards.map((agent) => (
